@@ -1,0 +1,3 @@
+# 让 clangd 按 CMake 实际使用的标准解析（否则默认 C++98，会报一堆假错误）
+CompileFlags:
+  Add: [-std=c++17, -Wall, -Wextra, -Isrc, -Isrc/raft]
