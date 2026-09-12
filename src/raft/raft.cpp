@@ -66,6 +66,29 @@ bool RequestVoteReply::Deserialize(const std::string& s) {
   return d.Int(term) && d.Bool(vote_granted) && d.Ok();
 }
 
+std::string RequestPreVoteArgs::Serialize() const {
+  labrpc::Encoder e;
+  e.Int(term).Int(candidate_id).Int(last_log_index).Int(last_log_term);
+  return e.Take();
+}
+
+bool RequestPreVoteArgs::Deserialize(const std::string& s) {
+  labrpc::Decoder d(s);
+  return d.Int(term) && d.Int(candidate_id) && d.Int(last_log_index) &&
+         d.Int(last_log_term) && d.Ok();
+}
+
+std::string RequestPreVoteReply::Serialize() const {
+  labrpc::Encoder e;
+  e.Int(term).Bool(vote_granted);
+  return e.Take();
+}
+
+bool RequestPreVoteReply::Deserialize(const std::string& s) {
+  labrpc::Decoder d(s);
+  return d.Int(term) && d.Bool(vote_granted) && d.Ok();
+}
+
 std::string AppendEntriesArgs::Serialize() const {
   labrpc::Encoder e;
   e.Int(term)
@@ -252,6 +275,7 @@ void Raft::ConvertToFollowerLocked(int new_term) {
   state_ = ServerState::kFollower;
   current_term_ = new_term;
   voted_for_ = -1;
+  num_prevotes_ = 0;
   // TODO(2C)：term 和 votedFor 变了，要持久化
   PersistLocked();
 }
@@ -346,16 +370,81 @@ void Raft::ElectionTimerLoop() {
 }
 
 void Raft::StartElection() {
-  RequestVoteArgs args;
-
+  // ===================== 阶段 1:预投票 Pre-Vote =====================
+  // 目的:在自增 term 之前先探测"我能不能拿到多数派支持",
+  //       避免落后/分区的节点自增 term 去打断正常集群(治你见过的 term 暴涨)。
+  // 铁律:本阶段【绝不】改 current_term_、【绝不】写 voted_for_、【绝不】持久化。
+  RequestPreVoteArgs pargs;
   {
     std::lock_guard<std::mutex> lk(mu_);
     if (killed_.load()) return;
     if (state_ == ServerState::kLeader) return;
-    // 兜底的二次确认：调用方（ElectionTimerLoop）已经在锁内做过一次
-    // "窗口内是否有人续命"的判定了，这里再挡一道，防止其他调用路径漏判。
-    // 【关键】"判定 + 自提"必须在同一个临界区里完成，
-    // 否则会自提出一个比刚选出的 leader 更高的任期，把它挤掉 → 反复选举。
+    // 候选超时：本轮真实选举没拿到多数派（典型是 2 节点分区下两候选在旧 term
+    // 各自投自己、永远 split vote）。不能原地重发【同 term】的 RequestVote——
+    // 那样 term 永远不前进、对方永远因 voted_for_!=自己 拒投，活锁。
+    // 正确做法：退回 follower（清 voted_for_/num_prevotes_/state_），让下面
+    // "follower 预投票"流程重走一遍；预投票成功会经 StartRealElection 自增 term，
+    // 于是 term 前进一格，对方收到更高 term 的 RequestVote 会退位让票，集群收敛。
+    // ConvertToFollowerLocked 是 Locked 函数，必须在持锁时调用（内部不自加锁）。
+    if (state_ == ServerState::kCandidate) {
+      ConvertToFollowerLocked(current_term_);
+    }
+    if (!(last_heartbeat_ < raftcpp::Now())) return;  // 兜底二次确认,沿用原逻辑
+
+    pargs.term = current_term_;            // 关键:用【当前】term,不 ++
+    pargs.candidate_id = me_;
+    pargs.last_log_index = LastLogIndexLocked();
+    pargs.last_log_term = LastLogTermLocked();
+    num_prevotes_ = 1;                     // 自己给自己一票（退位清 0 后重新发起预投票）
+  }
+
+  std::shared_ptr<Raft> self = shared_from_this();
+  for (size_t i = 0; i < peers_.size(); i++) {
+    if (static_cast<int>(i) == me_) continue;
+    peers_[i]->CallAsyncTyped<RequestPreVoteArgs, RequestPreVoteReply>(
+        "Raft.RequestPreVote", pargs,
+        [self, pargs](bool ok, const RequestPreVoteReply& reply) {
+          if (!ok) return;  // 丢包 / 对方挂了
+
+          bool start_real = false;
+          {
+            std::lock_guard<std::mutex> lk(self->mu_);
+            if (self->killed_.load()) return;
+
+            // 预投票期间发现更高 term → 退位(学到新 term,停止捣乱)
+            if (reply.term > self->current_term_) {
+              self->ConvertToFollowerLocked(reply.term);
+              self->last_heartbeat_ = raftcpp::Now();
+              self->tick_cv_.notify_all();
+              return;
+            }
+
+            // 只有仍是 follower(还没进入真实选举)才累计,避免重复触发
+            // + pargs.term 校验:丢弃本轮之前的旧轮次预投票回复(逻辑重置)
+            if (pargs.term == self->current_term_ &&
+                self->state_ == ServerState::kFollower && reply.vote_granted) {
+              self->num_prevotes_++;
+              if (self->num_prevotes_ > static_cast<int>(self->peers_.size()) / 2) {
+                start_real = true;
+              }
+            }
+          }  // 锁在此释放,避免调用 StartRealElection 时重复加锁死锁
+          if (start_real) self->StartRealElection();
+        },
+        &cancel_rpcs_);
+  }
+}
+
+void Raft::StartRealElection() {
+  // ===================== 阶段 2:真实投票 Real Vote =====================
+  // 走到这里说明已拿到多数派预投票。此刻才【真正自增 term + 写 votedFor + 持久化】。
+  RequestVoteArgs args;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    num_prevotes_ = 0;  // 预投票使命结束,清理(与 num_votes_ 无关)
+
+    if (killed_.load()) return;
+    if (state_ == ServerState::kLeader) return;
     if (!(last_heartbeat_ < raftcpp::Now())) return;
 
     Trace("S%d 自提: term %d -> %d (state=%s)", me_, current_term_, current_term_ + 1, StateName(state_));
@@ -373,45 +462,49 @@ void Raft::StartElection() {
     PersistLocked();
   }
 
-  // 拉票是"发射后不管"的：CallAsync 立刻返回，回信到了再跑回调。
-  // 绝不能同步等 —— 往断连节点发的 RPC 会被模拟网络拖住最多 7 秒，
-  // 同步等就会把选举线程卡死（Go 版用 `go func(){}()` 就是为了避免这个）。
-  //
-  // 回调里通过 self（shared_ptr）访问自己，保证对象活到回调执行完。
+  SendRequestVoteRPCs();
+}
+
+// ===================== 真实投票 RPC 发送 =====================
+// 被 StartRealElection(刚成为 candidate)与 candidate 超时重发共用。
+// 只发送 RequestVote RPC,【不】修改 state_/current_term_/num_votes_(否则会重复自增 term)。
+void Raft::SendRequestVoteRPCs() {
+  RequestVoteArgs args;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (killed_.load()) return;
+    if (state_ != ServerState::kCandidate) return;
+    args.term = current_term_;
+    args.candidate_id = me_;
+    args.last_log_index = LastLogIndexLocked();
+    args.last_log_term = LastLogTermLocked();
+  }
+
   std::shared_ptr<Raft> self = shared_from_this();
   for (size_t i = 0; i < peers_.size(); i++) {
     if (static_cast<int>(i) == me_) continue;
     peers_[i]->CallAsyncTyped<RequestVoteArgs, RequestVoteReply>(
         "Raft.RequestVote", args,
         [self, args](bool ok, const RequestVoteReply& reply) {
-          if (!ok) return;  // 丢包 / 对方挂了
+          if (!ok) return;
 
           std::lock_guard<std::mutex> lk(self->mu_);
           if (self->killed_.load()) return;
 
           if (reply.term > self->current_term_) {
-            // 世上已有更高任期，退位，并续命避免立刻又自提
             self->ConvertToFollowerLocked(reply.term);
             self->last_heartbeat_ = raftcpp::Now();
             self->tick_cv_.notify_all();
             return;
           }
 
-          // 只收本轮的票：用 args.term（发请求时的任期）过滤掉迟到的旧票
           if (self->state_ == ServerState::kCandidate &&
               args.term == self->current_term_ && reply.vote_granted) {
             self->num_votes_++;
             if (self->num_votes_ > static_cast<int>(self->peers_.size()) / 2) {
               Trace("S%d 当选 leader term=%d lastIdx=%d", self->me_, self->current_term_, self->LastLogIndexLocked());
               self->state_ = ServerState::kLeader;
-              // Figure 8 限制：新 leader 不能直接提交旧 term 的日志条目，
-              // 必须先提交一条"本任期"的条目才能连带确认旧尾巴。
-              // Go 版（raft.go:522-528）条件追加 no-op，但那会把全新集群的
-              // 第一条客户端命令挤到 index 2，TestBasicAgree2B 直接挂
-              // （已实测 Go 版 FAIL：got index 2 but expected 1）。
-              // 这里改成条件追加：只有当选时存在未提交条目
-              // （LastLogIndex > commitIndex，可能带旧 term 尾巴）才补 no-op。
-              // 空日志当选（如 TestBasicAgree2B）不追加，第一条命令仍在 index 1。
+              // 条件补 no-op(沿用原 415-423 逻辑,满足 Figure 8)
               if (self->LastLogIndexLocked() > self->commit_index_) {
                 Trace("S%d 当选补 no-op: term=%d idx=%d (commitIndex=%d, 有未提交旧尾巴)",
                       self->me_, self->current_term_,
@@ -421,18 +514,13 @@ void Raft::StartElection() {
                              self->LastLogIndexLocked() + 1, Command("")});
                 self->PersistLocked();
               }
-              // 新 leader 必须重置 nextIndex / matchIndex，
-              // 否则"当选→被废→再当选"时残留旧值，会误以为 follower 已跟上，
-              // 既不发日志也不提交，客户端命令永远卡住。
               int last = self->LastLogIndexLocked();
               for (size_t k = 0; k < self->peers_.size(); k++) {
                 self->next_index_[k] = last + 1;
                 self->match_index_[k] = 0;
               }
-              // 自增心跳计数，让所有复制线程立刻发一轮 AppendEntries 宣告上位
               self->heartbeat_seq_++;
               self->last_heartbeat_ = raftcpp::Now();
-              // 唤醒选举定时器：让它立刻从"等超时"切到"发心跳"的分支
               self->tick_cv_.notify_all();
               self->replicator_cv_.notify_all();
             }
@@ -481,6 +569,30 @@ void Raft::RequestVote(const RequestVoteArgs& args, RequestVoteReply& reply) {
   last_heartbeat_ = raftcpp::Now();
   tick_cv_.notify_all();
   PersistLocked();
+}
+
+void Raft::RequestPreVote(const RequestPreVoteArgs& args,
+                          RequestPreVoteReply& reply) {
+  std::lock_guard<std::mutex> lk(mu_);
+
+  reply.term = current_term_;
+  reply.vote_granted = false;
+  if (killed_.load()) return;
+
+  // ===== 与 RequestVote 的唯一区别:本函数【绝不】改变任何持久/任期状态 =====
+  // - 即使 args.term < current_term_ 也不退位、不拒绝(探测是 probe,放行才能夺回领导)
+  // - 绝不写 voted_for_、绝不 PersistLocked()、绝不 current_term_ = args.term
+  // 只做一件事:比较日志新旧(沿用 RequestVote 的 up_to_date 规则)。
+  int my_last_term = LastLogTermLocked();
+  int my_last_index = LastLogIndexLocked();
+  bool up_to_date = (args.last_log_term > my_last_term) ||
+                    (args.last_log_term == my_last_term &&
+                     args.last_log_index >= my_last_index);
+  if (!up_to_date) return;   // 对方日志比我还旧 → 不给预投票(否则可能产生落后 leader)
+
+  // 授予预投票,但不改任何状态、不刷新 last_heartbeat_(避免无限推迟自己的选举)
+  reply.vote_granted = true;
+
 }
 
 void Raft::AppendEntries(const AppendEntriesArgs& args,
@@ -636,7 +748,7 @@ void Raft::ReplicateLoop(int server) {
                       std::chrono::milliseconds(kMinSendIntervalMs);
       auto wake = std::max(earliest, raftcpp::Now() +
                                          std::chrono::milliseconds(5));
-      // ⚠️ macOS libc++ 兼容性：绝对 time_point 的 wait_until 在 wake 已过期时
+      // macOS libc++ 兼容性：绝对 time_point 的 wait_until 在 wake 已过期时
       // 会转出负 tv_sec → EINVAL 崩溃。改用相对 wait_for（过期时 remain 夹到 0，
       // wait_for(lk, 0, pred) 立即检查一次谓词后返回，等价 wait_until(过期 tp)）。
       auto remain = wake - raftcpp::Now();
@@ -1032,6 +1144,7 @@ void Raft::InstallSnapshot(const InstallSnapshotArgs& args,
 
 bool Raft::CondInstallSnapshot(int index, int term,
                                const std::string& snapshot) {
+  (void)snapshot;
   std::lock_guard<std::mutex> lk(mu_);
   // 单相设计后，本函数【只做"是否已接受过这个 snap"的查询】——所有 raft state
   // 修改已经在 InstallSnapshot 内完成（截断 + 推进 + 持久化）。

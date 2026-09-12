@@ -135,6 +135,25 @@ struct RequestVoteReply {
   bool Deserialize(const std::string& s);
 };
 
+// ---- 预投票 RPC（lab 增强：治 term 暴涨）----
+struct RequestPreVoteArgs {
+  int term = 0;
+  int candidate_id = 0;
+  int last_log_index = 0;
+  int last_log_term = 0;
+
+  std::string Serialize() const;
+  bool Deserialize(const std::string& s);
+};
+
+struct RequestPreVoteReply {
+  int term = 0;
+  bool vote_granted = false;
+
+  std::string Serialize() const;
+  bool Deserialize(const std::string& s);
+};
+
 struct AppendEntriesArgs {
   int term = 0;
   int leader_id = 0;
@@ -260,7 +279,9 @@ class Raft : public std::enable_shared_from_this<Raft> {
 
   // TODO(2A)：实现投票逻辑
   void RequestVote(const RequestVoteArgs& args, RequestVoteReply& reply);
-
+  void RequestPreVote(const RequestPreVoteArgs& args, RequestPreVoteReply& reply);
+  void StartRealElection();  // 预投票拿到多数派后，真正自增 term 发起真实投票
+  void SendRequestVoteRPCs();  // 真实投票 RPC 发送(StartRealElection 与 candidate 超时重发共用)
   // TODO(2A)：实现心跳；TODO(2B)：追加日志冲突检测
   void AppendEntries(const AppendEntriesArgs& args, AppendEntriesReply& reply);
 
@@ -325,6 +346,7 @@ class Raft : public std::enable_shared_from_this<Raft> {
   int current_term_ = 0;
   int voted_for_ = -1;    // 本任期把票投给了谁，-1 = 还没投
   int num_votes_ = 0;     // 本轮选举收到的票数
+  int num_prevotes_ = 0;  // 预投票
 
   // 最近一次"听到合法 leader / 给别人投了票"的时刻。
   // 选举超时是相对它来算的。
@@ -396,6 +418,13 @@ inline std::shared_ptr<labrpc::Service> MakeRaftService(
     rf->RequestVote(a, r);
     return r.Serialize();
   };
+  Service::Handler request_prevote = [rf](const std::string& args) -> std::string {
+    RequestPreVoteArgs a;
+    a.Deserialize(args);
+    RequestPreVoteReply r;
+    rf->RequestPreVote(a, r);
+    return r.Serialize();
+  };
   Service::Handler append_entries =
       [rf](const std::string& args) -> std::string {
     AppendEntriesArgs a;
@@ -415,6 +444,7 @@ inline std::shared_ptr<labrpc::Service> MakeRaftService(
   return std::make_shared<Service>(
       "Raft", std::unordered_map<std::string, Service::Handler>{
                   {"RequestVote", request_vote},
+                  {"RequestPreVote", request_prevote},
                   {"AppendEntries", append_entries},
                   {"InstallSnapshot", install_snapshot},
               });

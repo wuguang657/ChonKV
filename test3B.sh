@@ -63,7 +63,7 @@ run_one() {
       ok=$((ok + 1))
     else
       fail=$((fail + 1))
-      echo "  [FAIL] $name 第 $i/$COUNT 轮（种子与现场见 $log）"
+      echo "  [FAIL] $name 第 $i/$COUNT 轮（种子与现场见 ${log}）"
     fi
   done
   echo "RESULT $name: $ok/$COUNT 通过, $fail 失败" | tee -a "$log"
@@ -83,7 +83,10 @@ for name in "${TESTS[@]}"; do
     for p in "${pids[@]}"; do
       kill -0 "$p" 2>/dev/null && alive+=("$p")
     done
-    pids=("${alive[@]}")
+    # 注意：alive 可能为空（这轮 2s 内所有任务恰好都跑完）。bash 3.2 下
+    # 直接写 pids=("${alive[@]}") 在 set -u 时空数组展开会报 unbound variable，
+    # 必须用 ${arr[@]+...} 守卫（为空时展开成零个词）。
+    pids=("${alive[@]+"${alive[@]}"}")
   done
 done
 wait
