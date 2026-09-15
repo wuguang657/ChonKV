@@ -1,14 +1,13 @@
 // server.cpp —— KV 服务器实现（对应 Go 版 src/kvraft/server.go）
 //
 // ===========================================================================
-// 【本文件最重要的两处：T2/T3 窗口修复】
+// 【本文件最要紧的一处：快照 "raft 已装 / KV 未装" 窗口】
 // ===========================================================================
 //
-// 先回顾一下 Lab 2 里那个致命窗口是什么。Follower 收到 leader 的
-// InstallSnapshot 之后，要做两件【分属两把锁】的事：
+// Follower 收到 leader 的 InstallSnapshot 之后，要做两件【分属两把锁】的事：
 //
-//   ① raft 侧（raft 锁）：CondInstallSnapshot() 截断日志、推进
-//      last_applied_/snapshot_index_、PersistLocked() 落盘
+//   ① raft 侧（raft 锁）：截断日志、推进 last_applied_ / snapshot_index_、
+//      把 blob 与 raft state 落盘
 //   ② KV 侧（KV 锁）：把快照字节反序列化，灌进 kv_store_ 状态机
 //
 // 如果崩在 ① 之后、② 之前：
@@ -16,21 +15,21 @@
 //     再也不会重发这条 snapshot 消息
 //   * 但 kv_store_ 还是旧的 → 状态机永久缺数据
 //
-// 本文件用两层把这个窗口彻底闭合：
+// 本文件用两层把这个窗口闭合：
 //
 //   【第 1 层 · 顺序与幂等】（ApplierLoop 的 snapshot_valid 分支）
-//     让 raft 先裁决（CondInstallSnapshot 内部会拒绝任何"回退"的快照：
-//     index <= last_applied_ 或 index <= snapshot_index_ 直接返回 false），
-//     raft 说"可以"之后 KV 才装。这样绝不会出现"装了更旧的快照"，
-//     且 ApplySnapshotLocked 是幂等的（整体替换，重复装结果一样）。
+//     raft 侧已在 InstallSnapshot 内用 last_applied_ 守卫拦下陈旧快照，
+//     所以 KV 侧【无条件安装】，只用自身的 last_cmd_index_ 防回退；
+//     ApplySnapshotLocked 是幂等的（整体替换，重复装结果一样）。
 //
-//   【第 2 层 · 重启恢复】（构造函数末尾）
-//     启动时主动 persister_->ReadSnapshot() 把快照装回状态机。
-//     这是补刀：即便真的崩在 ① 和 ② 之间，重启时 KV 也能从磁盘上的
-//     blob 恢复出来 —— 因为 InstallSnapshot 的 RPC handler 在推消息给
-//     applier 【之前】就已经 SaveStateAndSnapshot() 落盘了。
-//     这一层正是 Go 版 server.go 的做法（StartKVServer 里的
-//     `if kv.persister.ReadSnapshot() != nil { kv.installSnapshot(...) }`）。
+//   【第 2 层 · 重启恢复】（构造函数）
+//     启动时经 rf_->GetSnapshotData() 把已提交的快照装回状态机。
+//     这是补刀：即便真的崩在 ① 和 ② 之间，重启时 KV 也能从磁盘恢复出来。
+//     ⚠️ 必须走 raft 的接口而不是直接读 persister —— 盘上存的是带
+//     index/term 头的磁盘格式，且可能是"阶段1 已落盘、阶段2 未提交"的 blob，
+//     只有 raft 剥头校验过才知道该不该采用。
+//     这一层对应 Go 版 StartKVServer 里的
+//     `if kv.persister.ReadSnapshot() != nil { kv.installSnapshot(...) }`。
 //
 // 两层叠加后，无论崩在哪一刻，重启后都是自洽的。
 // ===========================================================================
@@ -60,10 +59,20 @@ KVServer::KVServer(std::vector<std::shared_ptr<labrpc::ClientEnd>> peers, int me
   // 紧接着才用快照整体替换 kv_store_，把这批刚写进去的修改回滚掉，
   // 而 last_applied_ 已经推过去不会重放 → 表现为 key 消失 / got []。
   if (persister_) {
-    std::string snap = persister_->ReadSnapshot();
-    if (!snap.empty()) {
+    // ⚠️ 必须走 raft 的 GetSnapshotData()，不要再直接 persister_->ReadSnapshot()：
+    //   盘上存的是【带 index/term 头的磁盘格式】，而且可能是"阶段1 已落盘、
+    //   阶段2 未提交"的 blob。raft 已经剥头并校验过"是否已提交"，这里拿到
+    //   的才是可信的裸状态机数据。
+    std::string snap = rf_->GetSnapshotData();
+    int snap_idx = rf_->SnapshotIndex();
+    // 判据必须是 snap_idx > 0，不能是 snap 非空：
+    //   若 blob 被判为未提交而丢弃，snap 会是空，但 last_cmd_index_ 仍必须
+    //   推到 snap_idx —— 否则 ReadIndex 路径（等 last_cmd_index_ >= ri）
+    //   会永久卡住，因为快照覆盖的下标永远不会再被 apply 上来。
+    if (snap_idx > 0) {
       std::lock_guard<std::mutex> lk(mu_);
-      ApplySnapshotLocked(snap);
+      if (!snap.empty()) ApplySnapshotLocked(snap);
+      last_cmd_index_ = snap_idx;
     }
   }
 
@@ -94,7 +103,8 @@ void KVServer::Kill() {
   }
   apply_cv_.notify_all();
 
-  if (applier_.joinable()) applier_.join();  // 对非join,detach的线程可以join，否则会报错
+  // 只有既未 join 也未 detach 的线程才可 join，否则会抛异常。
+  if (applier_.joinable()) applier_.join();
   if (rf_) rf_->Kill();
 }
 
@@ -114,8 +124,7 @@ std::string KVServer::EncodeSnapshotLocked() const {
   for (const auto& p : last_seq_) {
     e.Int(p.first).Int(p.second);
   }
-  std::string blob = e.Take();
-  return blob;
+  return e.Take();
 }
 
 // 幂等：整体替换，重复 apply 同一个 blob 结果完全一样。
@@ -166,11 +175,6 @@ bool KVServer::PrepareSnapshotLocked(int index, int* snap_index,
   return true;
 }
 
-std::string KVServer::EncodeSnapshot() const {
-  std::lock_guard<std::mutex> lk(mu_);
-  return EncodeSnapshotLocked();
-}
-
 std::map<std::string, std::string> KVServer::SnapshotStore() const {
   std::lock_guard<std::mutex> lk(mu_);
   return kv_store_;
@@ -180,25 +184,55 @@ std::map<std::string, std::string> KVServer::SnapshotStore() const {
 // RPC handler
 // ---------------------------------------------------------------------------
 
-// Get 也要走一遍 raft（不能直读本地状态机）：
-// 否则会读到 stale 数据（leader 已经切走了，本地还没同步）。
+// Get 走 ReadIndex（线性一致读优化，不再为只读请求写一遍 raft 日志）：
+//   1) rf_->ReadIndex() 返回"已提交下标"的线性化点 ri。仅在 leader 且凑齐多数派时
+//      ri >= 0；非 leader / 凑不齐多数派返回 -1，让 Clerk 换台重试。
+//   2) 等状态机 apply 到那个下标（last_cmd_index_ >= ri），再【持锁直读】本地状态机。
+//   注意 value / err 必须在【持锁临界区】内拷出：释放锁后再读 kv_store_ 会被
+//   后续已提交的 Put 改写 → 读到比自身 linearization point 更晚的值 →
+//   porcupine 判 Illegal。
 void KVServer::Get(const GetArgs& args, GetReply& reply) {
-  Op op;
-  op.key = args.key;
-  op.method = "Get";
-  op.client_id = args.client_id;
-  op.seq_id = args.seq_id;
+  // 线性化点：ReadIndex 内部已保证"仅 leader 且凑齐多数派"才返回 >-1 的下标。
+  // 非 leader / 凑不齐多数派返回 -1，让 Clerk 换台。
+  int ri = rf_->ReadIndex();
+  if (ri < 0) { reply.err = Err::kWrongLeader; return; }
 
-  // value / err 在 WaitOp 内部由 ApplierLoop 在持锁的临界区捕获并拷出，
-  // 本函数【不要】在 WaitOp 返回后再读 kv_store_，否则中间窗口可能被
-  // 后续已提交的 Put 改写，Get 会读到比它自身 linearization point 更晚的值
-  // → porcupine 判 Illegal（见 server.h NotifyMsg 注释）。
-  Err e = WaitOp(op, &reply.value, &reply.err);
-  if (e != Err::kOK) {
-    reply.err = e;
-    return;
+  std::unique_lock<std::mutex> lk(mu_);
+
+  const auto kPoll = std::chrono::milliseconds(100);
+  // ⚠️ 总超时：被隔离在少数派的旧 leader 仍认为自己是 leader，但 ReadIndex 永远
+  // 凑不齐多数派 → ri 之后的状态机永不推进 → Get 会死等，客户端 RPC 永不返回。
+  // 1s 超时即视为"我不是有效 leader"，返回 WrongLeader 让 Clerk 换台机器重试。
+  const auto kWaitTimeout = std::chrono::milliseconds(1000);
+  auto wait_start = std::chrono::steady_clock::now();
+
+  while (true) {
+    // ★ 状态机已追上线性化点：持锁直读并拷出（坑1：临界区内拷，防并发改写）
+    if (last_cmd_index_ >= ri) {
+      auto it = kv_store_.find(args.key);
+      if (it != kv_store_.end()) {
+        reply.value = it->second;
+        reply.err = Err::kOK;
+      } else {
+        reply.value.clear();
+        reply.err = Err::kNoKey;
+      }
+      return;
+    }
+
+    if (dead_.load()) { reply.err = Err::kWrongLeader; return; }
+
+    // 等 applier 推进 last_cmd_index_：wait_for 期间自动释放 mu_，
+    // 被 notify 或 100ms 到点都会醒来重新检查条件。
+    apply_cv_.wait_for(lk, kPoll, [&] {
+      return last_cmd_index_ >= ri || dead_.load();
+    });
+
+    if (std::chrono::steady_clock::now() - wait_start > kWaitTimeout) {
+      reply.err = Err::kWrongLeader;
+      return;
+    }
   }
-  // reply.value / reply.err 已由 WaitOp 灌好（kNoKey / kOK + 对应 value）
 }
 
 void KVServer::PutAppend(const PutAppendArgs& args, PutAppendReply& reply) {
@@ -209,7 +243,7 @@ void KVServer::PutAppend(const PutAppendArgs& args, PutAppendReply& reply) {
   op.client_id = args.client_id;
   op.seq_id = args.seq_id;
 
-  reply.err = WaitOp(op, nullptr, nullptr);
+  reply.err = WaitOp(op);
 }
 
 // ---------------------------------------------------------------------------
@@ -220,13 +254,12 @@ void KVServer::PutAppend(const PutAppendArgs& args, PutAppendReply& reply) {
 //   一个少数派 leader 提交了日志但永远凑不齐多数派 → 这条日志永远不会被提交。
 //   如果 RPC handler 死等，客户端就永久挂住。Go 版的注释也写了这一点：
 //   "当Start发给少数派领导在分区修复后卸任时，阻塞的RPC处理器将永远无法解除阻塞"。
-//   所以每 100ms 醒一次，检查"我还是不是 leader"，不是就赶紧返回让客户端换台机器。
-Err KVServer::WaitOp(const Op& op, std::string* out_value, Err* out_err) {
+Err KVServer::WaitOp(const Op& op) {
   raft::StartResult r = rf_->Start(op.Serialize());
   if (!r.is_leader) return Err::kWrongLeader;
 
   std::unique_lock<std::mutex> lk(mu_);
-  msg_replies_[r.index] = NotifyMsg{false, false, op.client_id, op.seq_id, "", Err::kOK};
+  msg_replies_[r.index] = NotifyMsg{false, false, op.client_id, op.seq_id};
 
   const auto kPoll = std::chrono::milliseconds(100);
   // ⚠️ 总超时：被隔离在少数派的"旧 leader"仍认为自己是 leader（isLeader 一直
@@ -238,7 +271,6 @@ Err KVServer::WaitOp(const Op& op, std::string* out_value, Err* out_err) {
   auto wait_start = std::chrono::steady_clock::now();
 
   while (true) {
-    // & 按引用捕获 lambda 体内用到的所有外部变量，这里用到了r和msg_replies_
     apply_cv_.wait_for(lk, kPoll, [&] {
       auto it = msg_replies_.find(r.index);
       return it != msg_replies_.end() && it->second.done;
@@ -251,32 +283,19 @@ Err KVServer::WaitOp(const Op& op, std::string* out_value, Err* out_err) {
 
     auto it = msg_replies_.find(r.index);
     if (it != msg_replies_.end() && it->second.done) {
+      // ok=false 说明这个 index 上的命令已被新 leader 覆盖成别的内容，
+      // 返回 WrongLeader 让 Clerk 换台重试。
       bool ok = it->second.ok;
-      // ⚠️ 关键：在持锁临界区内把 value / err 拷出来，调用方收到后再用，
-      // 完全避免"WaitOp 释放锁后，调用方再读 kv_store_"这条有数据竞争的路径。
-      if (out_value) *out_value = it->second.value;
-      if (out_err) *out_err = it->second.err;
       msg_replies_.erase(it);
       return ok ? Err::kOK : Err::kWrongLeader;
     }
 
-    // 超时：确认自己还是不是 leader。
-    // ⚠️ GetState() 要抢 raft 的锁 —— 必须先释放 mu_ 再调，
-    //    绝不能"持 KV 锁跨进 raft 锁"。
-    lk.unlock();
-    bool still_leader = rf_->GetState().second;
-    lk.lock();
-
-    if (!still_leader) {
-      msg_replies_.erase(r.index);
-      return Err::kWrongLeader;
-    }
     // ⚠️ 总超时（见上方说明）：被隔离的旧 leader 上 WaitOp 不能无限等。
     if (std::chrono::steady_clock::now() - wait_start > kWaitTimeout) {
       msg_replies_.erase(r.index);
       return Err::kWrongLeader;
     }
-    // 还是 leader 且没超时，继续等下一轮
+    // 没超时，继续等下一轮
   }
 }
 
@@ -287,11 +306,23 @@ void KVServer::ApplierLoop() {
   raft::ApplyMsg m;
   while (apply_ch_->Pop(m)) {
     if (m.command_valid) {
+      // no-op 空条目：raft 新 leader 上任提交的占位命令，本身不写状态机，
+      // 只用来推进 commitIndex。
+      // ⚠️ 但必须照样推进 last_cmd_index_：ReadIndex() 返回的线性化点 ri 可能
+      // 正好落在 no-op 的下标上，若这里直接跳过，Get 的"等 last_cmd_index_ >= ri"
+      // 就会永远差 1 卡死（实测 lci=836 / ri=837，恰好差一个 no-op）。
+      // 安全性：no-op 不写状态机，不存在"下标已推进但 kv_store_ 还没改"的窗口。
+      if (m.command.empty()) {
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+          last_cmd_index_ = m.command_index;
+        }
+        apply_cv_.notify_all();
+        continue;
+      }
+
       Op op;
-      // raft 新 leader 上任可能提交 no-op 空条目（Command 为空字符串），
-      // 这是占位条目，只用来推进 commitIndex，绝不能当真实命令执行。
-      // 先显式跳过空命令，避免依赖 Deserialize 失败这个隐式副作用（更稳健）。
-      if (m.command.empty()) continue;
+      // 真实命令：空命令已在上面处理。
       if (!op.Deserialize(m.command)) continue;
 
       bool need_snap = false;
@@ -310,31 +341,8 @@ void KVServer::ApplierLoop() {
           } else if (op.method == "Append") {
             kv_store_[op.key] += op.value;
           }
-          // "Get" 不改状态机，走 raft 只是为了线性读
+          // 只有 Put / Append 两种：Get 走 ReadIndex 直读，不会进这个分支。
           last_seq_[op.client_id] = op.seq_id;
-        }
-
-        // ---- 给 Get waiter 准备返回值（修复 porcupine 抓到的 Illegal）----
-        //
-        // 必须在持锁临界区把 value/err 灌进 msg_replies_，
-        // 因为 WaitOp 释放锁后调用方读 kv_store_ 的窗口里，另一个已 apply 的 op
-        // 可能已经把状态改了 —— Get 就会读到比它自身 linearization point 更晚的值。
-        // 这里先把状态固化进 NotifyMsg，WaitOp 再原样拷给调用方。
-        //
-        // 注意：哪怕是 dedup（seq_id <= last_seq_）也要做，
-        // 因为这是一个新 index 的新 waiter，需要"此刻 K 的值"作为返回值。
-        {
-          auto reply_it = msg_replies_.find(m.command_index);
-          if (reply_it != msg_replies_.end() && op.method == "Get") {
-            auto it_state = kv_store_.find(op.key);
-            if (it_state != kv_store_.end()) {
-              reply_it->second.value = it_state->second;
-              reply_it->second.err = Err::kOK;
-            } else {
-              reply_it->second.value.clear();
-              reply_it->second.err = Err::kNoKey;
-            }
-          }
         }
 
         // ---- 通知等待者 ----
@@ -351,7 +359,9 @@ void KVServer::ApplierLoop() {
         need_snap =
             PrepareSnapshotLocked(m.command_index, &snap_index, &snap_blob);
 
-        last_cmd_index_ = m.command_index;  // 排错用
+        // ⚠️ 必须放在状态机突变【之后】：ReadIndex 路径靠它判定"已追上线性化点"，
+        // 顺序反了会让 Get 读到旧值。
+        last_cmd_index_ = m.command_index;
       }  // ---- 释放 KV 锁 ----
 
       apply_cv_.notify_all();
@@ -362,19 +372,20 @@ void KVServer::ApplierLoop() {
       }
 
     } else if (m.snapshot_valid) {
-      // ======== 对齐 Go 版 kvraft（raft.go:239-244）========
-      // InstallSnapshot 已在 raft 锁内用 last_applied_ 守卫拦下陈旧快照
-      // （raft.cpp:980），所以这里【必须】无条件安装——否则会出现
-      // 「raft 已把 last_applied_ 推进到 idx，但 CondInstallSnapshot 的门控把
-      // 快照拒了 → 被快照覆盖的 [last_cmd+1, idx] 那段 entry 再无来源 →
+      // InstallSnapshot 已在 raft 侧用 last_applied_ 守卫拦下陈旧快照，
+      // 所以 KV 这里【必须】安装 —— 否则会出现「raft 已把 last_applied_ 推进到
+      // idx，但 KV 拒装 → 被快照覆盖的 [last_cmd+1, idx] 那段 entry 再无来源 →
       // 整键空 / got []」的丢数据。
-      // 仅用 KV 自身的 last_cmd_index_ 防回退：快照比已应用过的更旧才跳过
-      // （不会出现「装旧 snap 覆盖新状态」）。
-      if (m.snapshot_index >= last_cmd_index_) {
+      // 防回退只靠 KV 自身的 last_cmd_index_：比已应用过的更旧才跳过。
+      {
         std::lock_guard<std::mutex> lk(mu_);
-        ApplySnapshotLocked(m.snapshot);
-        last_cmd_index_ = m.snapshot_index;
+        if (m.snapshot_index >= last_cmd_index_) {
+          ApplySnapshotLocked(m.snapshot);
+          last_cmd_index_ = m.snapshot_index;
+        }
       }
+      // 与 no-op / command 分支保持一致：装快照同样可能让某条 ReadIndex 读成立。
+      apply_cv_.notify_all();
     }
   }
 }

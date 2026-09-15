@@ -50,6 +50,22 @@ class Persister {
     snapshot_ = snapshot;
   }
 
+  // 【新增】只写快照 blob，不动 raft state。
+  //
+  // 存在的意义：把「大 blob 的落盘 I/O」从 raft 主锁里挪出去。
+  //   - 旧路径只有 SaveStateAndSnapshot（state + blob 一起原子写），
+  //     意味着 blob 的 write()+fsync() 必然发生在 raft 持锁期间。
+  //     真盘上一个几百 MB 的快照 fsync 要几百 ms～几秒，会把心跳、
+  //     读心跳、选举全部饿死（etcd 踩过的生产事故）。
+  //   - 有了本接口后，raft 可以「锁外先落 blob → 锁内再提交 state」两阶段走。
+  //
+  // 真实磁盘实现里，这个函数就是 open + write + fsync + rename，
+  // 是整条快照路径上唯一允许慢的地方。
+  void SaveSnapshotOnly(const std::string& snapshot) {
+    std::lock_guard<std::mutex> lk(mu_);
+    snapshot_ = snapshot;
+  }
+
   std::string ReadSnapshot() {
     std::lock_guard<std::mutex> lk(mu_);
     return snapshot_;

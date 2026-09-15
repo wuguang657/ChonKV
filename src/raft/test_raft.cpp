@@ -1,11 +1,6 @@
 // test_raft.cpp —— 所有测试用例（Go 版 src/raft/test_test.go 的移植）
 //
 // ===========================================================================
-// 这个文件【原则上不用改】。它是你的验收标准。
-//
-// 想自己加测试？看 doc/05-如何写C++测试.md，末尾也留了两个
-// TODO 空位（TestMyOwnScenario）供你练手。
-//
 // 注：Lab 2D 的 4 个快照测试（TestSnapshot*2D）已并入本文件，登记在 kTests[]
 // 末尾；用 `./raft_test 2D` 可单独跑快照组，`./raft_test -count 10 2D` 可压偶发。
 // ===========================================================================
@@ -1178,13 +1173,784 @@ void TestSnapshotStateMachine2D() {
 }
 
 // ===========================================================================
-// TODO(练手)：自己写一个场景测试
-// ---------------------------------------------------------------------------
-// 照着上面随便一个抄，改改参数就行。比如：
-//   - 5 台机器，随机断 1 台，同时持续提交命令，最后检查所有日志一致
-//   - 只留 2 台，确认提交不了；再连回 3 台，确认能提交
-// 写好后加进下面的 kTests 数组就能跑。
+// 生产级扩展 ①：CheckQuorum / Leader Lease / ReadIndex
 // ===========================================================================
+// 这三个测试验证的是"论文 §6.4 只读优化"的正确性。
+// 它们考的不是"能不能选出 leader"，而是"选出来的 leader 到底可不可信"。
+
+// ---------------------------------------------------------------------------
+// CheckQuorum：被隔离到少数派的旧 leader 必须【主动退位】。
+//
+// 没有 CheckQuorum 会怎样？旧 leader 被分区隔离后，既收不到多数派心跳回包，
+// 也不会收到新 leader 的消息（它被隔离了），于是它会一直以为自己还是 leader，
+// 继续用手里那份【已经过期】的数据应答客户端 —— 这就是脏读。
+// ---------------------------------------------------------------------------
+void TestCheckQuorum() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+
+  cfg->Begin("Test (Ext): CheckQuorum 让被隔离的旧 leader 主动退位");
+  // 等到恰好选出一个leader
+  int leader = cfg->CheckOneLeader();
+  // 先提交一条，确认集群此刻是健康的
+  cfg->One("x1", servers, true);
+
+  // 把 leader 与外界彻底隔离：它发不出去，也收不到
+  cfg->Disconnect(leader);
+
+  // 等超过 CheckQuorum 的自查间隔(150ms) —— 给 1 秒足够它发现自己被孤立
+  raftcpp::SleepMs(1000);
+
+  auto st = cfg->GetRaft(leader)->GetState();
+  if (st.second) {
+    cfg->Fatal(
+        "CheckQuorum 没生效：被隔离的旧 leader 仍认为自己是 leader"
+        "（它会继续用旧数据应答客户端 → 脏读）");
+  }
+  // 隔离期间：多数派必须继续工作（可用性未被牺牲）
+  cfg->One("majority-still-works", servers - 1, true);
+  // 旧 leader 退位后必须拒绝新写入（单写者；注意须在退位之后调用）
+  auto r = cfg->GetRaft(leader)->Start("zombie");
+  if (r.is_leader) cfg->Fatal("被隔离 leader 仍在接受写入 → 脑裂风险");
+
+  // 恢复网络后集群应当自愈：重新选出 leader 并继续工作
+  cfg->Connect(leader);
+  cfg->CheckOneLeader();
+  cfg->One("x2", servers, true);
+
+  cfg->End();
+}
+
+// ===== CheckQuorum 反向：健康 leader 绝不能被误退位（最该有的一条）=====
+void TestCheckQuorumNoSpuriousDemote() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test (Ext): CheckQuorum 反向 —— 健康 leader 绝不被误退位");
+  int leader = cfg->CheckOneLeader();
+  // 关键：不断开任何人。健康 leader 的 last_ack_time_ 持续被心跳回包刷新，
+  // 在 150ms 自查窗口内永远能联系上多数派，CheckQuorum 绝不该触发退位。
+  // 跑 2 秒覆盖多个自查周期；配合 -count 5 抓偶发。
+  auto st0 = cfg->GetRaft(leader)->GetState();   // 记下初始 (term, isLeader)
+  raftcpp::SleepMs(2000);
+  auto st = cfg->GetRaft(leader)->GetState();
+  if (!st.second) {
+    cfg->Fatal("CheckQuorum 误杀健康 leader：窗口太短 / 计票写反 / "
+               "last_ack_time_ 没在心跳回包处刷新");
+  }
+  // ★ 补牙（关键）：只查 isLeader 会被"误退位后又被重新选中"掩盖 —— 它退位后
+  //   follower 超时重选，最 up-to-date 的它多半再次当选，isLeader 又变回 true。
+  //   实测：把 CheckQuorum 改成无条件退位，这条用例【照样通过】。
+  //   只有断言【term 没涨】才能证明这 2 秒里真没发生过退位+重选。
+  if (st.first != st0.first) {
+    cfg->Fatal("CheckQuorum 误杀后节点被重新选中：term " +
+               std::to_string(st0.first) + " -> " + std::to_string(st.first) +
+               "（健康集群 2 秒内绝不该发生退位+重选）");
+  }
+  // 健康期间集群必须还能正常提交
+  cfg->One("health", servers, true);
+  cfg->End();
+}
+
+// ===== 不可靠网络 + 不断开：leader 偶发丢包也不该误退位 =====
+void TestCheckQuorumUnreliableNoFlap() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, true);   // 不可靠网络（仅 0~27ms 随机延迟，不丢包）
+  cfg->Begin("Test (Ext): CheckQuorum 不可靠网络下不脑裂/不误杀到失活");
+  // 重要：不可靠网络下 Raft 本就会发生【正常 leader 切换】——随机延迟偶尔让
+  // follower 在选举超时窗口内没及时收到心跳，触发它重新选举，原 leader 变成
+  // follower。这是 Raft 的正常工作，【不是 CheckQuorum 误杀】。
+  // 所以这里【不能】断言"原 leader 仍是 leader"（那样会偶发 Fatal，即之前的 flaky）。
+  // CheckQuorum 在不可靠网络下的正确契约是：无分区时集群始终能选出【唯一】leader
+  // 并正常提交，绝不会因 CheckQuorum 把健康 leader 误杀到"无 leader 卡死"或"脑裂"。
+  // 跑多轮"选 leader + 提交"，抓"CheckQuorum 太激进导致集群失活/脑裂"的真 bug。
+  for (int i = 0; i < 5; i++) {
+    int leader = cfg->CheckOneLeader();    // 约 5s 内能选出唯一 leader（无脑裂才返回）
+    (void)leader;                          // 不要求"还是原来的那个"
+    cfg->One("u", servers, true);          // 能正常提交 = 集群健康
+  }
+  cfg->End();
+}
+
+// ===== 不可靠网络 + 真分区：仍必须退位（验证不会太宽松）=====
+void TestCheckQuorumUnreliableIsolated() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, true);   // 不可靠网络
+  cfg->Begin("Test (Ext): CheckQuorum 在丢包网络下真分区仍退位");
+  int leader = cfg->CheckOneLeader();
+  cfg->One("x1", servers, true);
+  cfg->Disconnect(leader);                // 彻底隔离
+  raftcpp::SleepMs(1000);                 // 远超 150ms 自查间隔
+  auto st = cfg->GetRaft(leader)->GetState();
+  if (st.second) {
+    cfg->Fatal("不可靠网络下被隔离 leader 仍自称 leader：CheckQuorum 太宽松");
+  }
+  cfg->Connect(leader);
+  cfg->CheckOneLeader();                  // 集群自愈
+  cfg->One("x2", servers, true);
+  cfg->End();
+}
+
+// ===== CheckQuorum 反向（有牙版）：只丢少数派时 leader 必须留任 =====
+// 与 NoSpuriousDemote 互补：那条验"全员健康"，这条验"仍联系得上多数派"。
+void TestCheckQuorumMinorityPartitionKeepsLeadership() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test (Ext): CheckQuorum 只丢少数派时 leader 必须留任");
+  int leader = cfg->CheckOneLeader();
+  cfg->One("x1", servers, true);
+  auto st0 = cfg->GetRaft(leader)->GetState();
+
+  // 只断一个 follower：leader 还能收到另一个的回包，
+  // live = 自己 + 1 = 2 >= majority(2)，CheckQuorum 绝不该退位。
+  int victim = (leader + 1) % servers;
+  cfg->Disconnect(victim);
+  raftcpp::SleepMs(1000);   // 覆盖 ~6 个自查周期
+
+  auto st = cfg->GetRaft(leader)->GetState();
+  if (!st.second) {
+    cfg->Fatal("只丢了 1 个 follower（仍有多数派）却退位了：CheckQuorum 太激进");
+  }
+  if (st.first != st0.first) {
+    cfg->Fatal("只丢少数派期间 term 从 " + std::to_string(st0.first) + " 涨到 " +
+               std::to_string(st.first) + "：说明发生过误退位 + 重选");
+  }
+  // 剩 2 个节点仍应能继续提交（majority = 2）
+  cfg->One("x2", servers - 1, true);
+  cfg->Connect(victim);
+  cfg->CheckOneLeader();
+  cfg->End();
+}
+
+// ===== CheckQuorum 反向：5 节点丢 2 follower（仍是少数派）leader 必须留任 =====
+void TestCheckQuorumMinorityPartitionKeepsLeadership5() {
+  int servers = 5;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test (Ext): CheckQuorum 5 节点丢 2 follower（仍 majority）leader 留任");
+  int leader = cfg->CheckOneLeader();
+  cfg->One("x1", servers, true);
+  auto st0 = cfg->GetRaft(leader)->GetState();
+
+  // 断 2 个 follower（都不是 leader）：online = leader + 2 = 3 >= majority(3)，
+  // CheckQuorum 绝不该退位。这条专门在更大集群规模上兜底 MemberCountLocked()
+  // 的多数派计数 / off-by-one —— 3 节点版只验证了 majority=2 的特例。
+  int v1 = (leader + 1) % servers;
+  int v2 = (leader + 2) % servers;
+  cfg->Disconnect(v1);
+  cfg->Disconnect(v2);
+  raftcpp::SleepMs(1000);   // 覆盖 ~6 个自查周期
+
+  auto st = cfg->GetRaft(leader)->GetState();
+  if (!st.second) {
+    cfg->Fatal("5 节点丢 2 follower（仍 majority）却退位：CheckQuorum 多数派计数有误");
+  }
+  if (st.first != st0.first) {
+    cfg->Fatal("5 节点少数派分区期间 term 从 " + std::to_string(st0.first) +
+               " 涨到 " + std::to_string(st.first) + "：误退位 + 重选");
+  }
+  // 剩 3 个节点（leader + 2 在线 follower）仍应能继续提交（majority = 3）
+  cfg->One("x2", servers - 2, true);
+  cfg->Connect(v1);
+  cfg->Connect(v2);
+  cfg->CheckOneLeader();
+  cfg->End();
+}
+
+// ===== CheckQuorum 反向（采样强化版）：少数派分区期间 leader 必须【持续】稳定 =====
+// 这是 TestCheckQuorumMinorityPartitionKeepsLeadership 的【采样强化】版：那条只在
+// 断开 ~1s 后采【一次】 isLeader/term。若实现有"leader 间歇性退位又重选"或
+// "term 偶发抖动"的闪烁 bug，单次采样可能正好落在稳定窗口而漏掉。这条改为每
+// ~300ms 采样一次（共 5 次，约 1.5s），断言【每次】都 isLeader 且 term == st0.first。
+// ★ 关键修正：必须是【少数派分区】（leader 仍连多数派）。全分区下被隔离节点收不到
+//   票会合法地反复自荐、term 一直涨 —— 那种场景断言 term 不变是错的。term 稳定
+//   只在"leader 仍能联系多数派"时成立，所以本用例用断 1 follower 的少数派分区。
+void TestCheckQuorumSustainedMinorityStable() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test (Ext): CheckQuorum 少数派分区期间 leader 持续稳定（采样版）");
+  int leader = cfg->CheckOneLeader();
+  cfg->One("x1", servers, true);
+  auto st0 = cfg->GetRaft(leader)->GetState();
+
+  // 只断 1 个 follower：leader 仍连 majority(2)，CheckQuorum 应永远满意。
+  int victim = (leader + 1) % servers;
+  cfg->Disconnect(victim);
+
+  // 重复采样 ~5 次（覆盖多个 150ms 自查周期）：每次都必须仍是 leader 且 term 没抖。
+  // 抓"闪烁式退位 / term 抖动"这类单次采样抓不到的边界 bug。
+  for (int i = 0; i < 5; i++) {
+    raftcpp::SleepMs(300);
+    auto st = cfg->GetRaft(leader)->GetState();
+    if (!st.second) {
+      cfg->Fatal("少数派分区期间 leader 第 " + std::to_string(i + 1) +
+                 " 次采样掉位：CheckQuorum 在仍有多数派时闪烁退位");
+    }
+    if (st.first != st0.first) {
+      cfg->Fatal("少数派分区期间第 " + std::to_string(i + 1) +
+                 " 次采样 term 从 " + std::to_string(st0.first) + " 涨到 " +
+                 std::to_string(st.first) + "：leader 选举计时器/CheckQuorum 反复触发");
+    }
+  }
+  // 剩 2 节点（leader + 另一 follower）仍应能继续提交（majority = 2）
+  cfg->One("x2", servers - 1, true);
+  cfg->Connect(victim);
+  cfg->CheckOneLeader();
+  cfg->End();
+}
+
+// ===== 退位后不再服务线性一致读（CheckQuorum 的生产目标：防脏读）=====
+// 【已删除 TestCheckQuorumStaleReadPrevented】
+// 原用例与本文件里的 TestReadIndexNoStale 完全重复：两者都是
+//   「Disconnect(leader) → sleep(1000) → ReadIndex() 必须返回 -1」。
+// 而 sleep 1000ms 之后 CheckQuorum（150ms 自查一次）早已把它退位，走的是
+// "不是 leader → 返回 -1" 这条平凡分支，readIndex 的多数派确认根本没被走到
+// （变异测试实证：把 ReadIndex 改成直接返回 commit_index_，两条照样全过）。
+// 保留 TestReadIndexNoStale 一份即可：它还多了"隔离之前读必须成功"的前提断言。
+// 真正有牙的是 TestReadIndexPartitionImmediate（断开后不 sleep 立刻读）。
+
+// ---------------------------------------------------------------------------
+// ReadIndex：线性一致读的基本契约。
+//   * leader 上能拿到合法 readIndex，且它必须【不落后于】最新提交的下标
+//   * follower 上必须失败 —— follower 的日志可能落后，不能服务线性一致读
+// ---------------------------------------------------------------------------
+void TestReadIndex() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+
+  cfg->Begin("Test (Ext): ReadIndex 线性一致读");
+
+  int leader = cfg->CheckOneLeader();
+
+  // (1) leader 上读成功，且 readIndex 至少追平最新提交的下标
+  int idx = cfg->One("v1", servers, true);
+  int ri = cfg->GetRaft(leader)->ReadIndex();
+  if (ri < 0) {
+    cfg->Fatal("leader 上 ReadIndex 应当成功（返回 >= 0）");
+  }
+  if (ri < idx) {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+                  "ReadIndex=%d 落后于最新已提交下标 %d —— 照它读会读到旧值",
+                  ri, idx);
+    cfg->Fatal(buf);
+  }
+
+  // (2) follower 上必须失败
+  int follower = (leader + 1) % servers;
+  if (cfg->GetRaft(follower)->ReadIndex() >= 0) {
+    cfg->Fatal(
+        "follower 上 ReadIndex 应当返回 -1"
+        "（follower 的日志可能落后，不能保证线性一致）");
+  }
+
+  cfg->End();
+}
+
+// ---------------------------------------------------------------------------
+// 脏读检测（ReadIndex 最核心的价值）：
+// 把 leader 隔离之后，它的读必须失败。
+// 没有 ReadIndex 的话，旧 leader 会把过期数据堂而皇之地返回给客户端。
+// ---------------------------------------------------------------------------
+void TestReadIndexNoStale() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+
+  cfg->Begin("Test (Ext): ReadIndex 阻止被隔离旧 leader 的脏读");
+
+  int leader = cfg->CheckOneLeader();
+  cfg->One("v1", servers, true);
+
+  // 在隔离之前，读一定要是成功的（否则测试本身没意义）
+  if (cfg->GetRaft(leader)->ReadIndex() < 0) {
+    cfg->Fatal("前提不成立：隔离之前 leader 上的 ReadIndex 就失败了");
+  }
+
+  cfg->Disconnect(leader);
+  // 等 CheckQuorum 让它退位（每 150ms 自查一次，给 1 秒足够）
+  raftcpp::SleepMs(1000);
+
+  // 此刻它必须读失败 —— 要么已退位（不是 leader），
+  // 要么还挂着 leader 名头但心跳确认攒不够多数派，超时返回 -1。
+  int ri = cfg->GetRaft(leader)->ReadIndex();
+  if (ri >= 0) {
+    cfg->Fatal("被隔离的旧 leader 竟然还能提供读服务 —— 这就是脏读！");
+  }
+
+  cfg->Connect(leader);
+  cfg->End();
+}
+
+// ===== 并发 ReadIndex：证明 per-request ctx 设计下多条读互不踩踏 =====
+// 旧的单槽位设计（read_index_/read_ack_count_/read_index_term_ 全局共享）在并发下
+// 会把多条读的票混在一起：后到的读覆盖 read_index_、重置 read_ack_count_，导致先到的
+// 读永远凑不齐多数派 → 超时返回 -1；或者计票泄漏、term 戳错位。新设计每条读独立 ctx，
+// 回包按 reply.read_ctx 精确归因，应全部成功、互不干扰。
+void TestReadIndexConcurrent() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test (Ext): 并发 ReadIndex 互不踩踏（per-request ctx）");
+
+  int leader = cfg->CheckOneLeader();
+  cfg->One("x1", servers, true);
+
+  // 多个线程并发反复调用 ReadIndex，模拟高并发线性一致读。
+  const int nthreads = 8;
+  const int ncalls = 50;
+  std::vector<std::thread> ts;
+  std::atomic<int> ok{0}, fail{0};
+  for (int t = 0; t < nthreads; t++) {
+    ts.emplace_back([&]() {
+      for (int i = 0; i < ncalls; i++) {
+        int ri = cfg->GetRaft(leader)->ReadIndex();
+        if (ri >= 0)
+          ok.fetch_add(1);
+        else
+          fail.fetch_add(1);
+      }
+    });
+  }
+  for (auto& t : ts) t.join();
+
+  // 【阈值 = 100%，fail 必须为 0】
+  // 健康集群（可靠网络、全员连通、无分区）里并发读没有任何理由失败：
+  // 旧的单槽位设计会踩踏（后到的读覆盖 read_index_、重置 ack 计数），
+  // 新设计每条读独立 ctx、回包按 reply.read_ctx 精确归因，应当【全部成功】。
+  // 之前这里给的是 90% 余量，等于容忍 40 次失败 —— 那会把踩踏 bug 放过去。
+  // 实测（正确实现）多轮 fail 恒为 0，故收紧到 0；若哪天偶发非 0，
+  // 先怀疑 ReadIndex 的 ctx 归因/唤醒逻辑，而不是回来放宽阈值。
+  // 注意：断言必须放在 cfg->End() 【之前】——End() 会拆掉集群、回收 Raft 实例，
+  // 之后再 Fatal 就只剩报错、拿不到现场了。
+  int total = nthreads * ncalls;
+  if (fail.load() != 0) {
+    std::string msg = "并发 ReadIndex 出现失败：ok=" + std::to_string(ok.load()) +
+                      " fail=" + std::to_string(fail.load()) + " / total=" +
+                      std::to_string(total) +
+                      "（健康集群应当 100% 成功；旧单槽位设计会踩踏，"
+                      "若新设计仍失败，说明 ctx 归因/唤醒仍有问题）";
+    cfg->Fatal(msg);
+  }
+
+  cfg->End();
+}
+
+// ===== ReadIndex 核心契约：分区后【立刻】读必须失败（不等 CheckQuorum 帮忙）=====
+// 这是整套里最该有的一条。TestReadIndexNoStale 与 TestCheckQuorumStaleReadPrevented
+// 都在 Disconnect 后 sleep 1000ms 才读 —— 那时 CheckQuorum(150ms) 早已把它退位，
+// ReadIndex 走的是"不是 leader → 返回 -1"这条平凡分支，【多数派确认根本没被走到】。
+// 实测：把 ReadIndex 改成"不验身份直接返回 commit_index_"，那两条照样全过。
+void TestReadIndexPartitionImmediate() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test (Ext): ReadIndex 分区后立刻读必须失败（多数派确认真契约）");
+  int leader = cfg->CheckOneLeader();
+  cfg->One("v1", servers, true);
+
+  cfg->Disconnect(leader);
+  // ★ 故意【不 sleep】：此刻它多半仍是 leader（CheckQuorum ~150ms 才自查一次），
+  //   但心跳已收不到多数派回包。真做了多数派确认 → 等超时返回 -1；
+  //   偷懒直接返回 commit_index_ → 返回 >= 0，被这条抓住。
+  int ri = cfg->GetRaft(leader)->ReadIndex();
+  if (ri >= 0) {
+    cfg->Fatal("分区后 ReadIndex 仍返回 " + std::to_string(ri) +
+               " —— 它根本没做多数派确认，只是把旧 commitIndex 给了调用方（脏读）");
+  }
+  cfg->Connect(leader);
+  cfg->CheckOneLeader();
+  cfg->End();
+}
+
+// ===== ReadIndex 正向：只要还有多数派就该成功（不能傻等所有节点回包）=====
+void TestReadIndexMajorityToleratesMinorityFailure() {
+  int servers = 5;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test (Ext): ReadIndex 只要求多数派，少数派宕机照样可读");
+  int leader = cfg->CheckOneLeader();
+  cfg->One("v1", servers, true);
+
+  // 断掉两个 follower：5 节点 majority=3，leader + 剩下 2 个 follower 仍够 3 票
+  int down1 = -1, down2 = -1;
+  for (int i = 0; i < servers; i++) {
+    if (i == leader) continue;
+    if (down1 < 0)
+      down1 = i;
+    else if (down2 < 0) {
+      down2 = i;
+      break;
+    }
+  }
+  cfg->Disconnect(down1);
+  cfg->Disconnect(down2);
+
+  // 立刻读：验证它不会傻等那两个失联节点（否则会拖到超时返回 -1）
+  int ri = cfg->GetRaft(leader)->ReadIndex();
+  if (ri < 0) {
+    cfg->Fatal("5 节点挂了 2 个（仍有 3 票多数派）时 ReadIndex 应当成功，却返回 " +
+               std::to_string(ri) + " —— 多半是傻等所有节点回包");
+  }
+  cfg->Connect(down1);
+  cfg->Connect(down2);
+  cfg->End();
+}
+
+// ---------------------------------------------------------------------------
+// ReadIndex × InstallSnapshot：落后 follower 的那一票只能靠快照回包送回来
+//
+// 覆盖点：ReplicateLoop 发现 follower 落后到快照点之前时改发 InstallSnapshot，
+// 并把 active_read_ctx_ 塞进 snap_args.read_ctx；follower 原样回显；leader 在
+// 快照回包里调 RecordReadAckLocked —— 这是 AppendEntries 心跳之外的【第二条
+// 读确认通道】。
+//
+// 【变异实证：这一条"无牙"，别把它当安全网】
+// 把快照通道的 ctx 掐掉（发端 snap_args.read_ctx=0 / 收端 reply.read_ctx=0），
+// 本条照样全绿 —— 因为落后者对 leader 的广播心跳也会回包，而且 AppendEntries
+// handler 是无条件回显 read_ctx 的（raft.cpp:646），一致性检查失败也回。
+// 也就是说：在当前实现下，落后者的那一票【不依赖】快照通道，快照通道是冗余补充。
+// 想让快照票成为"唯一票源"必须让 follower 只回快照不回心跳，labrpc 下构造不出来。
+// 所以这条的定位是【集成回归】：证明"装快照 + 并发读"两条路径互不破坏，
+// 而不是"少了快照 ctx 就会挂"。快照通道真正有牙的验收在下面 NoDoubleCount。
+// ---------------------------------------------------------------------------
+
+// 正向：健康 3 节点里，follower 装快照期间的并发读必须全部成功。
+// 两个follower installsnapshot handler 本身只改 raft state + 落盘，落盘很慢是不是就会失败，因为follower snapshot rpc占用锁时间太长了，导致轮询下一次接不住BroadcastReadHeartbeat发来的心跳
+void TestReadIndexSnapshotCatchUp() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->EnableSnapshotCompaction();
+  cfg->Begin("Test (Ext): 落后节点装快照期间并发 ReadIndex 全部成功");
+
+  int leader = cfg->CheckOneLeader();
+  for (int i = 1; i <= 40; i++)
+    cfg->One("put k" + std::to_string(i) + " v" + std::to_string(i), servers, true);
+
+  leader = cfg->CheckOneLeader();
+  auto lrf = GetRaftOrFatal(cfg, leader);
+
+  // 前提：leader 必须真的做过快照，否则整条用例压根走不到快照路径，
+  // 会退化成一次普通并发读（假绿）。
+  bool has_snap = false;
+  for (int t = 0; t < 100; t++) {
+    if (lrf->SnapshotIndex() > 0) { has_snap = true; break; }
+    raftcpp::SleepMs(50);
+  }
+  if (!has_snap) cfg->Fatal("前提不成立：leader 始终没生成快照，用例退化成普通读");
+
+  // 把一个 follower 打到快照点之前 → 它只能靠 InstallSnapshot 追上来
+  int laggard = (leader + 1) % servers;
+  cfg->Crash1(laggard);
+  for (int i = 41; i <= 110; i++)
+    cfg->One("put b" + std::to_string(i) + " v" + std::to_string(i),
+             servers - 1, true);
+
+  // 重启落后节点：此刻 leader 给它发的是 InstallSnapshot，而不是普通心跳/日志
+  cfg->Start1(laggard);
+
+  // 与此同时并发读 —— 其中 laggard 那一票只能来自快照回包
+  const int nthreads = 8;
+  const int ncalls = 20;
+  std::vector<std::thread> ts;
+  std::atomic<int> ok{0}, fail{0};
+  for (int t = 0; t < nthreads; t++) {
+    ts.emplace_back([&]() {
+      for (int i = 0; i < ncalls; i++) {
+        int ri = cfg->GetRaft(leader)->ReadIndex();
+        if (ri >= 0)
+          ok.fetch_add(1);
+        else
+          fail.fetch_add(1);
+      }
+    });
+  }
+  for (auto& t : ts) t.join();
+
+  // 断言放在 End() 之前：End() 会拆集群、回收 Raft 实例
+  if (fail.load() != 0) {
+    cfg->Fatal("装快照期间并发 ReadIndex 出现失败：ok=" + std::to_string(ok.load()) +
+               " fail=" + std::to_string(fail.load()) +
+               "（说明 InstallSnapshot 这条读确认通道没把票送回来）");
+  }
+
+  // 事后确认：laggard 确实是【通过快照】追上的，否则上面的读可能压根没跟快照重叠
+  bool caught = false;
+  for (int t = 0; t < 150; t++) {
+    if (lrf->SnapshotIndex() > 0 &&
+        GetRaftOrFatal(cfg, laggard)->SnapshotIndex() >= lrf->SnapshotIndex()) {
+      caught = true;
+      break;
+    }
+    raftcpp::SleepMs(100);
+  }
+  if (!caught)
+    cfg->Fatal("落后者没通过 InstallSnapshot 追上：这条用例没真正覆盖到快照路径");
+  cfg->End();
+}
+
+// 反向（安全、有牙）：同一个 follower 的【快照回包 + 心跳回包】绝不能双计。好像没啥用了
+//
+// leader 给落后 follower 发 InstallSnapshot 的同时，ReadIndex 的广播心跳也会发给它，
+// 于是它在同一个 ctx 下会回【两个】包：InstallSnapshotReply 和 AppendEntriesReply。
+// 若计票不按 server 去重，它一个人就贡献 2 票 —— 5 节点 majority = 3，
+// leader(1) + 它(2) = 3，于是"只有两个活着的节点"也能凑出假多数派，
+// 已被分区的旧 leader 照样返回读成功 → 这正是 ReadIndex 要防的脏读。
+// RecordReadAckLocked 里的 r.acked 去重就是为它准备的。
+// 【变异实证：有牙】把 `if (r.acked.count(server)) return;` 短路掉之后，
+// 本条 5/5 轮 FAILED（"只剩 2 个活着节点却有 N 次读成功"）——
+// 它是整套用例里唯一能抓住"双通道重复计票 → 假多数派"的一条。
+void TestReadIndexSnapshotNoDoubleCount() {
+  int servers = 5;
+  auto cfg = MakeConfig(servers, false);
+  cfg->EnableSnapshotCompaction();
+  cfg->Begin("Test (Ext): 快照+心跳双通道不得双计（防假多数派脏读）");
+
+  int leader = cfg->CheckOneLeader();
+  int laggard = (leader + 1) % servers;
+
+  // 让 laggard 掉队到快照点之前：它重启后只能靠 InstallSnapshot 追
+  cfg->Crash1(laggard);
+  for (int i = 1; i <= 120; i++)
+    cfg->One("put k" + std::to_string(i) + " v" + std::to_string(i),
+             servers - 1, true);
+  auto lrf = GetRaftOrFatal(cfg, leader);
+  if (lrf->SnapshotIndex() <= 0)
+    cfg->Fatal("前提不成立：leader 没生成快照，laggard 不会走 InstallSnapshot");
+
+  // 把其余 3 个 follower 全部隔离 → 集群里只剩 leader 与 laggard，
+  // 真实票数 = 2 < majority(3)：任何一次"读成功"都只能来自重复计票（假多数派）。
+  for (int i = 0; i < servers; i++) {
+    if (i == leader || i == laggard) continue;
+    cfg->Disconnect(i);
+  }
+
+  cfg->Start1(laggard);   // 落后节点上线，leader 开始给它装快照
+
+  // 疯狂并发读，覆盖"装快照"那几十毫秒的窗口：
+  // 只要有一次拿到 >= 0，就说明某个 follower 被计了两票。
+  const int nthreads = 8;
+  const int ncalls = 15;
+  std::vector<std::thread> ts;
+  std::atomic<int> succ{0};
+  for (int t = 0; t < nthreads; t++) {
+    ts.emplace_back([&]() {
+      for (int i = 0; i < ncalls; i++) {
+        if (cfg->GetRaft(leader)->ReadIndex() >= 0) succ.fetch_add(1);
+      }
+    });
+  }
+  for (auto& t : ts) t.join();
+
+  if (succ.load() != 0) {
+    cfg->Fatal("只剩 2 个活着节点（majority=3）却有 " + std::to_string(succ.load()) +
+               " 次 ReadIndex 成功 —— 同一个 follower 的快照回包与心跳回包被重复计票，"
+               "凑出了假多数派（脏读）");
+  }
+
+  for (int i = 0; i < servers; i++) {
+    if (i == leader || i == laggard) continue;
+    cfg->Connect(i);
+  }
+  cfg->End();
+}
+
+// ---------------------------------------------------------------------------
+// ReadIndex × 不可靠网络（丢包）：补齐 7 条 ReadIndex 用例里唯一缺失的"黑盒压力"缺口
+//
+// 前面 7 条全跑在可靠网络（MakeConfig(servers, false)）。这里用 MakeConfig(servers, true)
+// 让 labrpc 随机丢包/乱序，验两件事：
+//   (a) 安全性（硬，绝不妥协）：只要 ReadIndex 返回 >= 0，返回的 readIndex 就必须 >=
+//       当时已提交的下标，绝不能把"过期的 commitIndex"当成线性化点吐给调用方（脏读）。
+//       这把"ctx 归因错乱 / 超时后仍把旧 commitIndex 返回 / 跨读混票"这类回归挡在门外。
+//   (b) 可用性（软，liveness 守门）：丢包会让一部分读超时返回 -1，但多数派心跳回包仍应
+//       能在 150ms 窗口内凑齐，所以成功次数必须 > 失败次数——证明 ReadIndex 在丢包环境
+//       里不是"永久不可用"。一旦某次改动让它在丢包下恒返回 -1，这里会抓到。
+// 不构造快照/分区等特例（那两条已在 CatchUp / NoDoubleCount 覆盖），只做最朴素的
+// "丢包压力下的线性一致读"黑盒回归。成功率按 3 节点不可靠网估算（单心跳 ~97% 能凑齐
+// 多数派）→ 50 次里 ok≈48、fail≈2，ok>fail 是极端安全的阈值，不会误杀。
+// ---------------------------------------------------------------------------
+void TestReadIndexUnreliable() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, true);   // ★ 不可靠网络（随机丢包/乱序）
+  cfg->Begin("Test (Ext): 不可靠网络下 ReadIndex 不脏读且基本可用");
+
+  // 先提交一个已知下标，作为"已提交"的硬基准（commit_index 只增不减）
+  int idx = cfg->One("prime", servers, true);
+  int leader = cfg->CheckOneLeader();
+
+  const int n = 50;
+  int ok = 0, fail = 0, stale = 0;
+  for (int i = 0; i < n; i++) {
+    int ri = cfg->GetRaft(leader)->ReadIndex();
+    if (ri < 0) {
+      fail++;            // 丢包超时 / 瞬态退位，保守返回 -1，可接受
+    } else {
+      ok++;
+      // 安全性：返回的 readIndex 必须覆盖我们已知已提交的下标 idx
+      // （正确实现 ri == 当前 commitIndex >= idx；ri < idx 即把旧值当线性化点 → 脏读）
+      if (ri < idx) stale++;
+    }
+  }
+
+  // (a) 永远不允许返回低于已提交下标的"脏" readIndex
+  if (stale > 0) {
+    cfg->Fatal("不可靠网下 ReadIndex 返回了低于已提交下标的 readIndex（stale=" +
+               std::to_string(stale) +
+               "）—— 线性一致读被破坏，可能读到过期数据（ctx 归因/超时吐旧值回归）");
+  }
+
+  // (b) 可用性：丢包环境下多数派心跳仍能凑齐，成功数应多于失败数
+  if (ok <= fail) {
+    cfg->Fatal("不可靠网下 ReadIndex 成功(" + std::to_string(ok) +
+               ") 未超过失败(" + std::to_string(fail) +
+               ") —— 线性一致读在丢包环境基本不可用（liveness 回归）");
+  }
+
+  cfg->End();
+}
+
+// ---------------------------------------------------------------------------
+// ReadIndex × 飞行中 leader 易主：补齐"读发起后 leader 被挤下台"这个未覆盖路径
+// （前 7 条只验"易主后新发起的读"，没撞过"在途读撞上易主"）。
+// 关键安全不变量：旧 leader 一旦失去领导权，它在途/新发起的 ReadIndex 必须返回 -1，
+// 绝不允许把过期 commitIndex 当线性化点吐出去（否则就是脏读 / 线性一致破坏）。
+void TestReadIndexDuringReelection() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, false);   // 可靠网：确定性地控制分区时序
+  cfg->Begin("Test (Ext): 读在飞行中 leader 易主 —— 旧 leader 的读必须返回 -1");
+
+  // 先提交一条命令，确保集群健康、leader 已选出且 commit_index > 0
+  cfg->One("prime", servers, true);
+  int leader = cfg->CheckOneLeader();
+
+  // 后台线程：对旧 leader 持续发起 ReadIndex（覆盖"飞行中易主"窗口）
+  std::atomic<bool> disconnected{false};
+  std::atomic<bool> stop{false};
+  std::vector<int> results;
+  std::vector<int> epoch;   // 0 = 易主前发起，1 = 易主后发起/在途
+  std::thread reader([&]() {
+    while (!stop.load()) {
+      int ri = cfg->GetRaft(leader)->ReadIndex();
+      results.push_back(ri);
+      epoch.push_back(disconnected.load() ? 1 : 0);
+    }
+  });
+
+  // 阶段一：易主前，旧 leader 合法，读应成功
+  raftcpp::SleepMs(100);
+
+  // 隔离旧 leader：它再也凑不齐多数派，且会看到更高任期 → 被废
+  cfg->Disconnect(leader);
+
+  // 缓冲：等网络真正切断 + 易主完成 + 在途读排空，避免"断开瞬间仍在途的连着网的读"
+  //       被误标成"易主后"而产生竞态假阳性。
+  raftcpp::SleepMs(250);
+
+  // 确认易主真的发生了（新 leader 在另两台之间选出）
+  int new_leader = cfg->CheckOneLeader();
+  if (new_leader == leader) {
+    cfg->Fatal("易主未发生：断开旧 leader 后仍未选出新 leader（网络隔离未生效？）");
+  }
+
+  // 从此刻起，读结果标为"易主后"
+  disconnected.store(true);
+
+  // 阶段二：易主后的稳定窗口内持续读（旧 leader 已是 candidate，任何 ReadIndex 必须返回 -1）
+  raftcpp::SleepMs(300);
+
+  stop.store(true);
+  reader.join();
+
+  // 断言 (a)：旧 leader 被废之后发起/在途的读，绝不允许返回"成功"（任何 >=0 的值）
+  //   —— 否则就是旧 leader 把过期 commitIndex 当线性化点吐出（脏读回归）
+  int post_ok = 0, pre_ok = 0;
+  for (size_t i = 0; i < results.size(); i++) {
+    if (epoch[i] == 1) {
+      if (results[i] >= 0) post_ok++;
+    } else {
+      if (results[i] >= 0) pre_ok++;
+    }
+  }
+  if (post_ok > 0) {
+    cfg->Fatal("旧 leader 易主后仍有 " + std::to_string(post_ok) +
+               " 次 ReadIndex 返回了成功值（>=0）—— 飞行中读未随领导权失效而作废，" +
+               "可能把过期 commitIndex 当线性化点吐出（脏读回归）");
+  }
+
+  // 断言 (b)：易主之前确实成功过，证明这个测试真的压到了读路径
+  //   （不是从头到尾全 -1 的空壳）
+  if (pre_ok == 0) {
+    cfg->Fatal("易主前旧 leader 的 ReadIndex 一次都没成功，测试未真正覆盖读路径（pre_ok=0）");
+  }
+
+  cfg->Connect(leader);   // 收尾：恢复网络，End() 会统一拆集群
+  cfg->End();
+}
+
+// ---------------------------------------------------------------------------
+// ReadIndex × 不可靠网络 × 装快照：补齐缺口②"丢包下装快照时的读"
+// （TestReadIndexUnreliable 只压普通读，两条快照用例仅可靠网）。
+// 断言：① ri 永远 >= 已提交基准 idx（不可靠网也绝不脏读）；
+//       ② 丢包环境下多数派心跳仍能凑齐，成功数 > 失败数（基本可用）。
+void TestReadIndexSnapshotUnreliable() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, true);   // ★ 不可靠网络（随机丢包/乱序）
+  cfg->EnableSnapshotCompaction();
+  cfg->Begin("Test (Ext): 不可靠网络下装快照期间并发读不脏读且基本可用");
+
+  // 先写一批，确保 leader 真的生成过快照（否则退化成普通读）
+  for (int i = 1; i <= 40; i++)
+    cfg->One("put k" + std::to_string(i) + " v" + std::to_string(i), servers, true);
+  int leader = cfg->CheckOneLeader();
+  auto lrf = GetRaftOrFatal(cfg, leader);
+  bool has_snap = false;
+  for (int t = 0; t < 100; t++) {
+    if (lrf->SnapshotIndex() > 0) { has_snap = true; break; }
+    raftcpp::SleepMs(50);
+  }
+  if (!has_snap) cfg->Fatal("前提不成立：leader 始终没生成快照，用例退化成普通读");
+
+  // 把一个 follower 打到快照点之前 → 它只能靠 InstallSnapshot 追上来
+  int laggard = (leader + 1) % servers;
+  cfg->Crash1(laggard);
+  for (int i = 41; i <= 110; i++)
+    cfg->One("put b" + std::to_string(i) + " v" + std::to_string(i), servers - 1, true);
+  int idx = cfg->One("boundary", servers - 1, true);   // 已知已提交下标硬基准
+
+  // 重启落后节点：此刻 leader 给它发的是 InstallSnapshot，而不是普通心跳/日志
+  cfg->Start1(laggard);
+
+  // 与此同时在不可靠网下并发读 —— 覆盖"丢包下装快照时的读"
+  const int nthreads = 8, ncalls = 20;
+  std::vector<std::thread> ts;
+  std::atomic<int> ok{0}, fail{0}, stale{0};
+  for (int t = 0; t < nthreads; t++) {
+    ts.emplace_back([&]() {
+      for (int i = 0; i < ncalls; i++) {
+        int ri = cfg->GetRaft(leader)->ReadIndex();
+        if (ri < 0) {
+          fail++;
+        } else {
+          ok++;
+          // 安全性：返回的 readIndex 必须覆盖已提交基准 idx
+          if (ri < idx) stale++;
+        }
+      }
+    });
+  }
+  for (auto& t : ts) t.join();
+
+  // (a) 永远不允许返回低于已提交下标的"脏" readIndex（丢包也不行）
+  if (stale > 0) {
+    cfg->Fatal("不可靠网装快照期间 ReadIndex 返回了低于已提交下标的 readIndex（stale=" +
+               std::to_string(stale) +
+               "）—— 线性一致读被破坏（ctx 归因/超时吐旧值回归）");
+  }
+
+  // (b) 可用性：丢包 + 装快照环境下多数派心跳仍能凑齐，成功数应多于失败数
+  if (ok <= fail) {
+    cfg->Fatal("不可靠网装快照期间 ReadIndex 成功(" + std::to_string(ok) +
+               ") 未超过失败(" + std::to_string(fail) +
+               ") —— 线性一致读基本不可用（liveness 回归）");
+  }
+
+  cfg->End();
+}
 
 // ===========================================================================
 // 测试主程序
@@ -1221,7 +1987,35 @@ static const TestCase kTests[] = {
     {"TestInstallSnapshotCatchUp2D", TestInstallSnapshotCatchUp2D},
     {"TestSnapshotRestart2D", TestSnapshotRestart2D},
     {"TestSnapshotStateMachine2D", TestSnapshotStateMachine2D},
-};
+
+    // ./build/raft_test CheckQuorum     # 精确命中 TestCheckQuorum（唯一含 CheckQuorum 的）
+    // ./build/raft_test ReadIndex       # 同时命中 TestReadIndex + TestReadIndexNoStale
+    {"TestCheckQuorum", TestCheckQuorum},
+    {"TestCheckQuorumNoSpuriousDemote", TestCheckQuorumNoSpuriousDemote},
+    {"TestCheckQuorumUnreliableNoFlap", TestCheckQuorumUnreliableNoFlap},
+    {"TestCheckQuorumUnreliableIsolated", TestCheckQuorumUnreliableIsolated},
+    {"TestCheckQuorumMinorityPartitionKeepsLeadership", TestCheckQuorumMinorityPartitionKeepsLeadership},
+    {"TestCheckQuorumMinorityPartitionKeepsLeadership5", TestCheckQuorumMinorityPartitionKeepsLeadership5},
+    {"TestCheckQuorumSustainedMinorityStable", TestCheckQuorumSustainedMinorityStable},
+
+    {"TestReadIndex", TestReadIndex},
+    {"TestReadIndexNoStale", TestReadIndexNoStale},
+    {"TestReadIndexConcurrent", TestReadIndexConcurrent},
+    {"TestReadIndexPartitionImmediate", TestReadIndexPartitionImmediate},
+    {"TestReadIndexMajorityToleratesMinorityFailure", TestReadIndexMajorityToleratesMinorityFailure},
+
+    // ReadIndex × InstallSnapshot：快照回包是 AppendEntries 之外的第二条读确认通道
+    {"TestReadIndexSnapshotCatchUp", TestReadIndexSnapshotCatchUp},
+    {"TestReadIndexSnapshotNoDoubleCount", TestReadIndexSnapshotNoDoubleCount},
+
+    // ReadIndex × 不可靠网络（丢包）：补齐 7 条 ReadIndex 里唯一的黑盒压力缺口
+    {"TestReadIndexUnreliable", TestReadIndexUnreliable},
+
+    // ReadIndex × 飞行中 leader 易主：旧 leader 的读必须返回 -1（绝不吐过期 commitIndex）
+    {"TestReadIndexDuringReelection", TestReadIndexDuringReelection},
+    // ReadIndex × 不可靠网络 × 装快照：丢包下装快照时的读不脏读且基本可用
+    {"TestReadIndexSnapshotUnreliable", TestReadIndexSnapshotUnreliable},
+  };
 
 static void Usage(const char* argv0) {
   std::printf("\n用法: %s [过滤词] [-count N]\n\n", argv0);
@@ -1272,11 +2066,24 @@ int main(int argc, char** argv) {
   std::vector<std::string> failed_names;
   const auto t_all = raftcpp::Now();
 
+  // 过滤模式二选一：filter 与某个用例名【完全相等】→ 只精确跑这一条；
+  // 否则退回原有子串匹配（"2A"、"Initial"、"ReadIndex" 等惯用法不变）。
+  // 精确模式是给 test_part.sh 的并发压测用的：脚本按全名分进程跑，
+  // 而子串匹配下 "TestReadIndex" 会误伤其余 9 个 TestReadIndex* 用例
+  //（TestCheckQuorum 同理），每条进程就变成"跑一遍全家桶"了。
+  bool exact = false;
+  if (!filter.empty()) {
+    for (const auto& t : kTests) {
+      if (filter == t.name) { exact = true; break; }
+    }
+  }
+
   for (int round = 0; round < count; round++) {
     if (count > 1) std::printf("\n===== 第 %d/%d 轮 =====\n", round + 1, count);
     for (const auto& t : kTests) {
-      if (!filter.empty() && std::string(t.name).find(filter) ==
-                                 std::string::npos) {
+      if (!filter.empty() &&
+          (exact ? filter != t.name
+                 : std::string(t.name).find(filter) == std::string::npos)) {
         continue;
       }
       // 后台线程崩溃计数：跑完取差值，>0 就判失败

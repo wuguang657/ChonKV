@@ -562,7 +562,8 @@ bool Config::CheckLinearizability() {
       const char* m = op.input.op == kvraft::KV_OP_GET
                           ? "GET"
                           : (op.input.op == kvraft::KV_OP_PUT ? "PUT" : "APP");
-      // std::printf("      [%zu] client=%d seq=%lld %s key=%s val_in=\"%s\" val_out=\"%s\" "
+      (void)m;
+                          // std::printf("      [%zu] client=%d seq=%lld %s key=%s val_in=\"%s\" val_out=\"%s\" "
                   // "call=%lld ret=%lld\n",
                   // i, op.client_id, (long long)op.seq_id, m,
                   // op.input.key.c_str(),
@@ -658,6 +659,7 @@ bool Config::CheckConsistency(std::string* err) {
               if (!kvservers_[j]) continue;
               auto st = kvservers_[j]->SnapshotStore();
               auto vit = st.find(p.first);
+              (void)vit;
               // std::fprintf(stderr,
                             // "  server[%d]: snapIdx=%d lastApplied=%d "
                             // "%s=\"%s\"\n",

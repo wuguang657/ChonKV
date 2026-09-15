@@ -10,12 +10,16 @@
 //   3. exactly-once 语义：靠 (client_id, seq_id) 去重
 //   4. 日志压缩：raft 状态超过 maxraftstate 就生成快照
 //
-// 【和 Go 版的两处关键差异 —— 都是为了不踩 C++ 的坑】
+// 【和 Go 版的几处关键差异 —— 都是为了不踩 C++ 的坑】
 //   1. Go 版用 channel 做"等 apply 完成"的通知，配合 select + time.After 实现
-//      超时。C++ 的 Chan 没有超时 Pop，所以这里改用 mutex + condition_variable
-//      的 wait_for(100ms)，效果一样：既能被及时唤醒，又能定期查"我还是不是 leader"。
-//   2. 绝不在持有 mu_ 时调用 Raft 的方法（Snapshot / CondInstallSnapshot）。
-//      那两个函数内部会抢 raft 的锁，"持 KV 锁跨进 raft 锁"是死锁温床
+//      超时。C++ 的 Chan 没有超时 Pop，所以改用 mutex + condition_variable 的
+//      wait_for(100ms) 轮询唤醒。
+//      ⚠️ 注意：这里【不】再在轮询时探测"我还是不是 leader"——锁外探测拿到的
+//      只是一个会过期的快照，既不能保证正确性，也拦不住"被隔离却自认为仍是
+//      leader"的少数派旧 leader（它 isLeader 恒为 true，探测根本不触发）。
+//      真正兜底的是 Get / WaitOp 里的 1s 硬超时。
+//   2. 绝不在持有 mu_ 时调用 Raft 的方法（ReadIndex / Snapshot / GetState ...）。
+//      它们内部会抢 raft 的锁，"持 KV 锁跨进 raft 锁"是死锁温床
 //      （config.cpp:178-179 的注释也强调过这一点）。
 //      本实现一律先在锁内收集好数据，释放 mu_ 后再调 Raft。
 
@@ -38,21 +42,19 @@
 
 namespace kvraft {
 
-// 某个 index 上正在等待的客户端请求
+// 某个 index 上正在等待的客户端请求。
 //
-// ⚠️ value / err 字段是关键修复：
-//   Get 命令的 value 必须在 ApplyLoop 持有 KV 锁时被捕获进这个结构，
-//   WaitOp 再从这个结构读出来返回给调用方。
-//   如果照 Go 版 server.go 的写法（WaitOp 返回后再读 kv_store_），
-//   释放锁期间另一个 Put 可能已经改变状态，Get 就会读到比它自己的
-//   linearization point 更晚的值，破坏线性一致性 —— porcupine 会判 Illegal。
+// 注：Get 已改走 ReadIndex 直读（不写 raft 日志、不进 apply 流程），所以这里不再
+// 需要固化 value / err —— 只有 Put/Append 会创建 waiter。
+//
+// 身份校验（client_id/seq_id）是必需的：这个 index 上的命令可能已被新 leader
+// 覆盖成别的内容，此时 done=true 但 ok=false，WaitOp 便返回 WrongLeader 让
+// 客户端换台重试。
 struct NotifyMsg {
-  bool done = false;       // applier 已经处理过这个 index 了
-  bool ok = false;         // 且身份匹配（client_id/seq_id 对得上）→ 这条命令真的生效了
+  bool done = false;  // applier 已经处理过这个 index 了
+  bool ok = false;    // 身份匹配 → 这条命令确实生效了
   int client_id = 0;
   int seq_id = 0;
-  std::string value;       // Get 的返回值（在 apply 时刻从状态机读出，固化下来）
-  Err err = Err::kOK;      // Get 的 err（kNoKey 或 kOK）
 };
 
 class KVServer {
@@ -82,9 +84,6 @@ class KVServer {
     return persister_ ? persister_->RaftStateSize() : 0;
   }
   int SnapshotIndex() const { return rf_ ? rf_->SnapshotIndex() : 0; }
-  // 把当前状态机编码成快照字节（测试用来校验快照大小和 round-trip）
-  std::string EncodeSnapshot() const;
-
   // 直接读状态机（测试校验一致性用）。调用方需要自己保证并发安全，
   // 测试里只在"没有客户端在跑"的时候调。
   std::map<std::string, std::string> SnapshotStore() const;
@@ -100,16 +99,12 @@ class KVServer {
   // applier 后台线程：消费 applyCh，把已提交的命令应用到状态机
   void ApplierLoop();
 
-  // 把一条 Op 交给 raft，等它被 apply。返回 kWrongLeader 表示得换台机器重试。
+  // 把一条 Op 交给 raft，等它被 apply。
+  // 返回 kOK 表示这条命令确实生效了；kWrongLeader 表示得换台机器重试。
   //
-  // 【为什么 out_value / out_err 是指针】
-  //   Get 必须在线性一致意义上读到"apply 那一瞬间"的状态机值。
-  //   所以 apply 时刻 ApplierLoop 把 value + err 写入 msg_replies_[index]，
-  //   WaitOp 在自己的临界区内把这两个值拷给调用方。
-  //   调用方【禁止】在 WaitOp 返回后再去读 kv_store_，因为中间可能被并发 apply
-  //   改写（这正是 Go 版 server.go 的隐藏 bug，porcupine 抓得到）。
-  //   对 Put/Append 来说这两个参数 nullptr 即可，不关心。
-  Err WaitOp(const Op& op, std::string* out_value, Err* out_err);
+  // （早期版本有两个 out_value / out_err 出参，用来给 Get 回传"apply 那瞬间"
+  //  的状态机值。Get 改走 ReadIndex 直读后不再需要，已删除。）
+  Err WaitOp(const Op& op);
 
   // ---- 以下三个都要求调用方【持有 mu_】（名字以 Locked 结尾）----
   // 把状态机编码成快照字节：kv_store_ + last_seq_
@@ -132,9 +127,14 @@ class KVServer {
   std::map<std::string, std::string> kv_store_;
   std::map<int, int> last_seq_;  // clientId -> 已 apply 的最大 seqId
 
-  // ---- 排错用：applier 已应用到状态机的最高 cmd index ----
+  // applier 已应用到状态机的最高 cmd index。
   // 注意与 raft.last_applied_ 的区别：raft 的在【派发时】推进，
   // 这个在【KVServer 真正 apply 后】更新，两者差 = applyCh 积压。
+  //
+  // ⚠️ 它是 ReadIndex 读路径的关键：Get 拿到线性化点 ri 后，必须等到
+  // last_cmd_index_ >= ri 才允许读本地状态机（见 Get 的实现）。
+  // 因此 applier 的【每一个】分支（普通命令 / no-op / 装快照）都要推进它，
+  // 漏掉任何一个分支都会让 Get 永久卡在那个下标上。
   int last_cmd_index_ = 0;
 
   // index -> 正在等这个 index 被 apply 的请求

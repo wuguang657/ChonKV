@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# test_part.sh —— 并发压测某一 Lab 部分（2A/2B/2C/3A/3B）的【每一条】用例（TSan 版）
+# test_part.sh —— 并发压测某一 Lab 部分（2A/2B/2C/3A/3B/CheckQuorum/ReadIndex）
+# 的【每一条】用例（TSan 版）
 #
 # 这是 test2A.sh / test2B.sh / test2C.sh / test3A.sh / test3B.sh 的通用核心，
 # 逻辑与 test3B.sh 完全一致：只编译一次 → 每条用例各起独立测试进程并发跑
@@ -13,17 +14,21 @@
 #   ./test_part.sh 2A             2A 每条用例各 25 轮，最多 4 条同时跑
 #   COUNT=50 ./test_part.sh 2B    每条压 50 轮
 #   PARALLEL=2 ./test_part.sh 2C  TSan 吃 CPU/内存，机器卡就把并发调小
+#   ./test_part.sh CheckQuorum    生产级扩展：CheckQuorum 全部 7 条
+#   ./test_part.sh ReadIndex      生产级扩展：ReadIndex 全部 10 条
 #
 # 跑非 TSan 的日常版（快 5~15 倍）：
 #   BIN=./build/raft_test COUNT=100 ./test_part.sh 2B
 #   BIN=./build/kv_test   COUNT=100 ./test_part.sh 3A
 #
-# 固定复现某个种子：SEED=12345 ./build-tsan/raft_test <用例名>
+# 固定复现某个种子：SEED=12345 ./build-tsan/raft_test <用例全名>
+# （对 Ext 组务必用全名：main() 对"filter==全名"走精确匹配，
+#  否则子串 "TestReadIndex" 会误伤其余 9 个 TestReadIndex* 用例）
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
-PART="${1:?用法: ./test_part.sh 2A|2B|2C|3A|3B}"
+PART="${1:?用法: ./test_part.sh 2A|2B|2C|3A|3B|CheckQuorum|ReadIndex}"
 
 # 硬约束：Ctrl-C / kill / 退出时把所有后台测试子进程一起带走，不留孤儿
 trap 'kill 0 2>/dev/null' SIGINT SIGTERM EXIT
@@ -94,8 +99,37 @@ case "$PART" in
       TestSnapshotUnreliableRecoverConcurrentPartition3B
       TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable3B
     ) ;;
+  # ---- 生产级扩展（raft_test 的 Ext 用例）----
+  # 每条进程拿【全名】当过滤词，命中 main() 的精确匹配模式 —— 这些用例名
+  # 互为前缀（TestReadIndex vs TestReadIndexNoStale...），若走子串匹配
+  # 一条进程就会把整组都跑了，并发隔离失效。
+  CheckQuorum)
+    DEFAULT_BIN=./build-tsan/raft_test
+    TESTS=(
+      TestCheckQuorum
+      TestCheckQuorumNoSpuriousDemote
+      TestCheckQuorumUnreliableNoFlap
+      TestCheckQuorumUnreliableIsolated
+      TestCheckQuorumMinorityPartitionKeepsLeadership
+      TestCheckQuorumMinorityPartitionKeepsLeadership5
+      TestCheckQuorumSustainedMinorityStable
+    ) ;;
+  ReadIndex)
+    DEFAULT_BIN=./build-tsan/raft_test
+    TESTS=(
+      TestReadIndex
+      TestReadIndexNoStale
+      TestReadIndexConcurrent
+      TestReadIndexPartitionImmediate
+      TestReadIndexMajorityToleratesMinorityFailure
+      TestReadIndexSnapshotCatchUp
+      TestReadIndexSnapshotNoDoubleCount
+      TestReadIndexUnreliable
+      TestReadIndexDuringReelection
+      TestReadIndexSnapshotUnreliable
+    ) ;;
   *)
-    echo "未知 part: ${PART}（只支持 2A/2B/2C/3A/3B）" >&2
+    echo "未知 part: ${PART}（只支持 2A/2B/2C/3A/3B/CheckQuorum/ReadIndex）" >&2
     exit 2 ;;
 esac
 

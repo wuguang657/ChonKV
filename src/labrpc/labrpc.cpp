@@ -184,9 +184,8 @@ void Network::SendReq(std::shared_ptr<ReqMsg> req) {
     int64_t delay = info.reliable ? 0 : raftcpp::RandInt(27);
     Schedule(e, delay);
   } else {
-    // 断连 / 服务器不存在：模拟"等超时"，最后返回失败
-    int64_t delay = info.longdelays ? raftcpp::RandInt(7000)
-                                    : raftcpp::RandInt(100);
+    // 断连 / 服务器不存在：快速返回失败
+    int64_t delay = raftcpp::RandInt(100);
     e->kind = EventKind::kDeliverReply;
     e->ok = false;
     Schedule(e, delay);

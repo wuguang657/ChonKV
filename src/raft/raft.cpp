@@ -1,8 +1,8 @@
-// raft.cpp —— 你的主战场
+// raft.cpp —— Raft 核心实现（2A / 2B / 2C / 2D 均已完整实现）
 //
-// 只改这个文件。搜索 "TODO" 就能找到所有需要你填的地方。
+// 下方按"第 N 部分"分区：选举定时器、RPC handler、日志复制、持久化、快照。
 //
-// 建议顺序：
+// 验收顺序：
 //   1) 先只做 2A（RequestVote / AppendEntries 的心跳部分 / StartElection）
 //      → 跑 ./raft_test 2A
 //   2) 再做 2B（Start / AppendEntries 日志部分 / ReplicateLoop / ApplyLoop）
@@ -95,7 +95,8 @@ std::string AppendEntriesArgs::Serialize() const {
       .Int(leader_id)
       .Int(prev_log_index)
       .Int(prev_log_term)
-      .Int(leader_commit);
+      .Int(leader_commit)
+      .Int(read_ctx);
   e.Int(static_cast<int>(entries.size()));
   for (const LogEntry& en : entries) {
     e.Int(en.term).Int(en.index).Bytes(en.command);
@@ -106,7 +107,7 @@ std::string AppendEntriesArgs::Serialize() const {
 bool AppendEntriesArgs::Deserialize(const std::string& s) {
   labrpc::Decoder d(s);
   if (!(d.Int(term) && d.Int(leader_id) && d.Int(prev_log_index) &&
-        d.Int(prev_log_term) && d.Int(leader_commit)))
+        d.Int(prev_log_term) && d.Int(leader_commit) && d.Int(read_ctx)))
     return false;
   int n = 0;
   if (!d.Int(n) || n < 0) return false;
@@ -123,13 +124,13 @@ bool AppendEntriesArgs::Deserialize(const std::string& s) {
 
 std::string AppendEntriesReply::Serialize() const {
   labrpc::Encoder e;
-  e.Int(term).Bool(success).Int(next_index);
+  e.Int(term).Bool(success).Int(next_index).Int(read_ctx);
   return e.Take();
 }
 
 bool AppendEntriesReply::Deserialize(const std::string& s) {
   labrpc::Decoder d(s);
-  return d.Int(term) && d.Bool(success) && d.Int(next_index) && d.Ok();
+  return d.Int(term) && d.Bool(success) && d.Int(next_index) && d.Int(read_ctx) && d.Ok();
 }
 
 std::string InstallSnapshotArgs::Serialize() const {
@@ -181,7 +182,11 @@ Raft::Raft(std::vector<std::shared_ptr<labrpc::ClientEnd>> peers, int me,
   // 注意：next_index_ 不在这里用固定值 1 初始化，而是放在 ReadPersist 之后
   // 根据真实日志长度计算（见下方），以对齐 Go 版 Make 的 len(rf.log)。
   last_heartbeat_seq_.assign(peers_.size(), 0);   // 记录每个follower上次心跳的序号，变了就发心跳
+  last_ack_time_.assign(peers_.size(), raftcpp::TimePoint{});    // CheckQuorum/Lease：follower 最近一次成功回包时刻
+  cq_consec_fail_.assign(peers_.size(), 0);   // CheckQuorum：每 follower 连续 RPC 失败计数，初始化为 0（健康）
 
+  is_member_.assign(peers_.size(), true);  // 初始化所有节点都是正式成员
+  last_quorum_check_ = raftcpp::Now();
   // 下面三个 vector 必须按 peers_.size() 初始化，否则 ReplicateLoop 里
   // last_send_time_[s] / inflight_log_[s] / inflight_log_time_[s] 在空 vector
   // 上越界读 → 段错误（2A 一启动就崩）。
@@ -189,7 +194,7 @@ Raft::Raft(std::vector<std::shared_ptr<labrpc::ClientEnd>> peers, int me,
   inflight_log_.assign(peers_.size(), false);                    // 是否有带日志的 RPC 在途
   inflight_log_time_.assign(peers_.size(), raftcpp::TimePoint{});// 在途 RPC 发出时刻，用于超时重发
 
-  // TODO(2C)：重启后要从磁盘恢复状态，在这里调用 ReadPersist(...)
+  // 重启后从磁盘恢复 raft state（含快照边界，见 ReadPersist）。
   ReadPersist(persister_->ReadRaftState());
 
   // 对齐 Go 版 Make：nextIndex 初始化为"当前最后一条日志下标 + 1"。
@@ -197,16 +202,6 @@ Raft::Raft(std::vector<std::shared_ptr<labrpc::ClientEnd>> peers, int me,
   // 而不是固定 1（Go 原版用 len(rf.log)，也是读盘后的值）。
   // 实战中当选时会再被 become-leader 回调重置一次，这里只是更稳健的初值。
   next_index_.assign(peers_.size(), LastLogIndexLocked() + 1);
-
-  // ⚠️ 关键修复（对齐 Go 版 Make 里的 lastApplied = lastIncludedIndex）：
-  // ReadPersist() 已经把 commit_index_ / last_applied_ 设成 snapshot_index_。
-  // 这里【绝不能】再清零——否则会出现 snapshot_index_=1031 但 last_applied_=0
-  // 的不一致。后果：
-  //   1) InstallSnapshot 的过期守卫（last_included_index <= snapshot_index_）
-  //      本应拦下的「回退快照」被误接受，KV 状态被旧/空 blob 覆盖 → 丢数据；
-  //   2) ApplyLoop 对已被快照覆盖的 idx 反复「视为已 apply」，重放逻辑错乱。
-  // 新鲜启动（无持久化数据）时 ReadPersist 直接 return，commit/lastApplied
-  // 保持成员初值 0，行为不变。
 
 }
 
@@ -276,12 +271,13 @@ void Raft::ConvertToFollowerLocked(int new_term) {
   current_term_ = new_term;
   voted_for_ = -1;
   num_prevotes_ = 0;
-  // TODO(2C)：term 和 votedFor 变了，要持久化
+  // term / votedFor 变了，必须在应答 RPC 【之前】落盘：丢了它们就可能
+  // 在同一 term 投两次票 → 安全性崩塌。所以这里不能挪到锁外异步做。
   PersistLocked();
 }
 
 // ===========================================================================
-// 第三部分：TODO(2A) 选举定时器 + 拉票
+// 第三部分：选举定时器 + 拉票
 // ===========================================================================
 
 void Raft::ElectionTimerLoop() {
@@ -290,6 +286,8 @@ void Raft::ElectionTimerLoop() {
   //   * 我是 leader      → 每 kHeartbeatInterval 毫秒发一次心跳
   //   * 我不是 leader    → 随机等 150~300ms，没听到 leader 就发起选举
   //
+  // CheckQuorum 的自检节流：不需要每 50ms 都查一次，每 kCheckQuorumIntervalMs
+  // 查一次就够（150ms，正好是一个最短选举超时）。
   while (!killed_.load()) {
     ServerState st;
     {
@@ -312,6 +310,68 @@ void Raft::ElectionTimerLoop() {
           if (remain > std::chrono::milliseconds(0)) tick_cv_.wait_for(lk, remain);
         }
         if (killed_.load()) return;
+
+        // ===================================================================
+        // CheckQuorum（生产级扩展 ①）：leader 定期自查
+        // "最近一个选举超时窗口内，我还能联系上多数派吗？"
+        // ===================================================================
+        // 为什么必须自查？
+        //   网络分区把 leader 隔离到少数派之后，它发的心跳收不到多数派回包，
+        //   却仍然以为自己是 leader。后果有两个：
+        //     (1) 它继续以 leader 身份应答客户端 → 读到早就被新 leader 改过的
+        //         旧值（脏读 / stale read）；
+        //     (2) 它的 term 还挂在自己身上，会干扰新 leader 的选举。
+        //   有了 CheckQuorum，被隔离的 leader 会【主动退位】成 follower，
+        //   客户端随即被重定向到真正的新 leader 上。
+        //
+        // 为什么退位【不增 term】？
+        //   这里只是"放弃 leader 身份"，term 保持不变 —— 和预投票
+        //   "不随便涨 term"是同一个道理：涨 term 会打断正常集群的选举。
+        // 脏窗口 = 一个 CheckQuorum 间隔（~150ms）​。这 150ms 里如果有个客户端连着旧 leader 发读请求，拿到的值可能已经被新 leader 改过了 → 脏读。
+        // CheckQuorum：leader 每 ~150ms 自查一次（闸门 now_q - last_quorum_check_ >= 150ms），回顾最近 150ms 内自己是否收到了多数派（含自己）的回包；若某个 follower 的回包时间戳超过 150ms 没刷新（即收不到它的回复），且凑不齐 majority → 退位。而 leader 每 50ms 固定发一次 AppendEntries（空/带日志），落后太多时另发 InstallSnapshot——发是 leader 主动的，CheckQuorum 查的是"回包收没收到"​。
+        auto now_q = raftcpp::Now();
+        if (now_q - last_quorum_check_ >=
+            std::chrono::milliseconds(kCheckQuorumIntervalMs)) {
+          last_quorum_check_ = now_q;
+          const int majority = MemberCountLocked() / 2 + 1;
+          // 存活判定用 cq_consec_fail_（最近 RPC 成败），而不是 last_ack_time_（回包到达时刻）：
+          // 长重排下回包会延迟 200~2200ms 才到，last_ack_time_ 因此长期"陈旧"，
+          // 若按它数"窗口内联系上几个"会把【健康但因延迟暂时没收到回包】的 follower
+          // 判成失联 → leader 被反复误杀 → 集群选不出稳定 leader（TestFigure8Unreliable2C 挂死）。
+          // cq_consec_fail_ 在回包 ok=true（哪怕迟到）时清零、ok=false 时累加，
+          // 自然区分"延迟"与"真断连"；容忍连续 kCQMaxConsecFail 次失败以扛住 10% 丢包抖动。
+          int live = 1;  // 自己永远算一票（不会给自己发心跳）
+          for (size_t i = 0; i < cq_consec_fail_.size(); i++) {
+            if (i >= is_member_.size() || !is_member_[i]) continue;
+            if (static_cast<int>(i) == me_) continue;
+            // 两路存活信号取"或"：
+            //  (a) cq_consec_fail_[i] < kCQMaxConsecFail —— 最近收到过 ok=true
+            //      （哪怕迟到，长重排下回包会延迟 200~2200ms 但终会到达，容忍它）；
+            //  (b) now_q - last_ack_time_[i] < kCQStaleWindowMs —— 最近一个窗口内
+            //      收到过 ok=true。真断连时 ok=true 永远到不了、last_ack_time_ 被冻住
+            //      → 越过窗口即判死（不依赖回调计数的权威可达性判断，与 cq 互补）。
+            bool alive_by_recent =
+                cq_consec_fail_[i] < kCQMaxConsecFail;
+            bool alive_by_ack =
+                (last_ack_time_[i].time_since_epoch().count() != 0) &&
+                (now_q - last_ack_time_[i] <
+                 std::chrono::milliseconds(kCQStaleWindowMs));
+            if (alive_by_recent || alive_by_ack) live++;
+          }
+          if (live < majority) {
+            Trace("S%d CheckQuorum 失败: 只联系上 %d/%d 个, 主动退位 term=%d",
+                  me_, live, majority, current_term_);
+            // term 不变，只放弃 leader 身份 + 清空投票 + 落盘
+            ConvertToFollowerLocked(current_term_);
+            // 唤醒：选举循环（去等选举超时）、复制线程（停发心跳）、
+            // 以及正在等 ReadIndex 的读线程（让它赶紧失败返回 -1）
+            tick_cv_.notify_all();
+            replicator_cv_.notify_all();
+            read_cv_.notify_all();
+            continue;  // 下一轮它会走 follower 分支，乖乖等新 leader 的心跳
+          }
+        }
+
         heartbeat_seq_++;  // 复制线程看到计数变了就知道该发心跳了
       }
       replicator_cv_.notify_all();
@@ -503,8 +563,17 @@ void Raft::SendRequestVoteRPCs() {
             self->num_votes_++;
             if (self->num_votes_ > static_cast<int>(self->peers_.size()) / 2) {
               Trace("S%d 当选 leader term=%d lastIdx=%d", self->me_, self->current_term_, self->LastLogIndexLocked());
-              self->state_ = ServerState::kLeader;
-              // 条件补 no-op(沿用原 415-423 逻辑,满足 Figure 8)
+              // 【CheckQuorum 硬化】新当选 leader 给足一个自查周期的宽限：
+              // 重置自查时钟，否则 last_quorum_check 还是很久前(当 follower/
+              // candidate 时)的旧值，下一轮 CheckQuorum 零宽限、follower 还没
+              // 回心跳 ack 就可能被误退位(不可靠网络/高负载下尤其 flaky)。
+              self->last_quorum_check_ = raftcpp::Now();
+              // 条件补 no-op(沿用原 415-423 逻辑,满足 Figure 8)；
+              // 同时定下"本 term 读安全下标"read_safe_commit_：
+              //   - 有未提交旧尾巴 → 补 no-op 在 LastLogIndex+1，读安全点就是这条 no-op；
+              //     必须等它提交、commit_index_ 抬到覆盖上任前已提交 entry，ReadIndex 才安全。
+              //   - 无未提交尾巴 → commit_index_ 已是准确值（选举约束保证含全部已提交
+              //     entry），立即可安全读。
               if (self->LastLogIndexLocked() > self->commit_index_) {
                 Trace("S%d 当选补 no-op: term=%d idx=%d (commitIndex=%d, 有未提交旧尾巴)",
                       self->me_, self->current_term_,
@@ -513,6 +582,12 @@ void Raft::SendRequestVoteRPCs() {
                     LogEntry{self->current_term_,
                              self->LastLogIndexLocked() + 1, Command("")});
                 self->PersistLocked();
+                // 读安全点 = 这条 no-op 自身的下标（push 之后 LastLogIndexLocked()
+                // 就是它），不是它再 +1 —— 否则 no-op 提交后 commit_index_ 永远差 1，
+                // ReadIndex 会永久返回 -1，所有读都 WrongLeader → 60s 挂死。
+                self->read_safe_commit_ = self->LastLogIndexLocked();
+              } else {
+                self->read_safe_commit_ = self->commit_index_;
               }
               int last = self->LastLogIndexLocked();
               for (size_t k = 0; k < self->peers_.size(); k++) {
@@ -523,6 +598,13 @@ void Raft::SendRequestVoteRPCs() {
               self->last_heartbeat_ = raftcpp::Now();
               self->tick_cv_.notify_all();
               self->replicator_cv_.notify_all();
+              // ⚠️ 最后再置 leader：read_safe_commit_ 已先定好，避免 ReadIndex 在
+              // 读安全点设好前误判 commit_index_ >= read_safe_commit_(旧值0) 而提前放行读。
+              // （整段都在 mu_ 锁内，ReadIndex 也取锁，所以不存在真正并发；此处仅为语义清晰。）
+              self->state_ = ServerState::kLeader;
+              // 新身份 / 新任期，重新数起：别把上一任的"连续失败记忆"带到新 leader 上
+              // （否则旧任期里断过的 follower 在新任期头一轮就被误判死，要等它首个 ok=true 才恢复）。
+              self->cq_consec_fail_.assign(self->peers_.size(), 0);
             }
           }
         },
@@ -531,7 +613,7 @@ void Raft::SendRequestVoteRPCs() {
 }
 
 // ===========================================================================
-// 第四部分：TODO(2A/2B) RPC handler
+// 第四部分：RPC handler
 // ===========================================================================
 
 void Raft::RequestVote(const RequestVoteArgs& args, RequestVoteReply& reply) {
@@ -602,6 +684,7 @@ void Raft::AppendEntries(const AppendEntriesArgs& args,
   reply.term = current_term_;
   reply.success = false;
   reply.next_index = 0;
+  reply.read_ctx = args.read_ctx;
   if (killed_.load()) return;
 
   // 规则 1：任期比我小 → 拒绝
@@ -691,7 +774,7 @@ void Raft::AppendEntries(const AppendEntriesArgs& args,
 }
 
 // ===========================================================================
-// 第五部分：TODO(2B) Start / 日志复制 / 提交
+// 第五部分：Start / 日志复制 / 提交
 // ===========================================================================
 
 StartResult Raft::Start(const Command& command) {
@@ -825,9 +908,12 @@ void Raft::ReplicateLoop(int server) {
           "Raft.InstallSnapshot", snap_args,
           [self, server, snap_args](bool ok, const InstallSnapshotReply& reply) {
             const size_t s = static_cast<size_t>(server);
-            if (!ok) return;  // 丢包 / 对方挂了，下一轮重发
             std::lock_guard<std::mutex> lk(self->mu_);
             if (self->killed_.load()) return;
+            // CheckQuorum liveness：回包 ok=true（哪怕迟到）→ 清零连续失败计数；
+            // ok=false（丢包 / 真断连）→ 累加。据此区分"回包延迟"与"真失联"。
+            if (ok) self->cq_consec_fail_[s] = 0;
+            else { if (self->cq_consec_fail_[s] < kCQMaxConsecFail) self->cq_consec_fail_[s]++; return; }  // 丢包 / 对方挂了，下一轮重发（封顶防无界增长）
             if (reply.term > self->current_term_) {
               self->ConvertToFollowerLocked(reply.term);
               self->last_heartbeat_ = raftcpp::Now();
@@ -837,6 +923,8 @@ void Raft::ReplicateLoop(int server) {
             }
             // 快照已装好：把该 follower 的复制进度推到快照点之后，
             // 之后走普通 AppendEntries。
+            // 更新下CheckQuorum/Lease：follower 最近一次成功回包时刻
+            self->last_ack_time_[s] = raftcpp::Now();
             self->match_index_[s] =
                 std::max(self->match_index_[s], snap_args.last_included_index);
             self->next_index_[s] = snap_args.last_included_index + 1;
@@ -852,16 +940,18 @@ void Raft::ReplicateLoop(int server) {
     peers_[s]->CallAsyncTyped<AppendEntriesArgs, AppendEntriesReply>(
         "Raft.AppendEntries", args,
         [self, server, args](bool ok, const AppendEntriesReply& reply) {
-          const size_t s = static_cast<size_t>(server);          
-          if (!ok) {                              // 丢包 / 对方挂了
-            std::lock_guard<std::mutex> lk(self->mu_);
-            if (!self->killed_.load() && !args.entries.empty())
-              self->inflight_log_[s] = false;    // 立刻清标记
-            return;
-          }
-
+          const size_t s = static_cast<size_t>(server);
           std::lock_guard<std::mutex> lk(self->mu_);
           if (self->killed_.load()) return;
+          // CheckQuorum liveness：回包 ok=true（哪怕迟到）→ 清零连续失败计数；
+          // ok=false（丢包 / 真断连）→ 累加。据此区分"回包延迟"与"真失联"。
+          if (ok) self->cq_consec_fail_[s] = 0;
+          else {
+            if (self->cq_consec_fail_[s] < kCQMaxConsecFail) self->cq_consec_fail_[s]++;
+            if (!args.entries.empty())
+              self->inflight_log_[s] = false;    // 立刻清标记（丢包 / 对方挂了）
+            return;
+          }
 
           // 这一批在途日志已经有了结论（无论成败），可以再发下一批了
           if (!args.entries.empty()) self->inflight_log_[s] = false;
@@ -880,6 +970,17 @@ void Raft::ReplicateLoop(int server) {
             return;
           }
 
+          // ---- CheckQuorum / Leader Lease / ReadIndex：记下这次"联系" ----
+          // 位置很有讲究：刻意放在 if (reply.success) 【之前】。
+          // 因为 success=false 只表示"日志对不上、需要回退"，但这个 follower
+          // 确实收到了我的 AppendEntries 并且回了包 —— 这本身就证明它承认
+          // 我是这个 term 的 leader。只有 ok==false（丢包 / 超时）才真的算
+          // "联系不上它"。
+          // 如果只在 success 时才记，那么在日志冲突频繁的 Figure8Unreliable
+          // 场景里，leader 会误判自己"联系不上多数派"而反复退位，
+          // 集群永远提交不了任何东西。
+          self->last_ack_time_[s] = raftcpp::Now();
+
           if (reply.success) {
             int new_match =
                 args.prev_log_index + static_cast<int>(args.entries.size());
@@ -887,7 +988,13 @@ void Raft::ReplicateLoop(int server) {
               self->match_index_[s] = new_match;
             }
             self->next_index_[s] = self->match_index_[s] + 1;
-
+            // Leader Lease：只要多数派在最近一个选举超时窗口内确认过我，
+            // 就把租约往后推。租约 = "我确信这段时间里没人能选出新 leader"。
+            if (self->CountRecentAcksLocked(kElectionTimeoutMin) >
+                self->MemberCountLocked() / 2) {
+              self->lease_expire_ =
+                  raftcpp::Now() + std::chrono::milliseconds(kLeaderLeaseMs);
+            }
             // ---- 推进 commitIndex：取所有 matchIndex 的中位数 ----
             // 论文 §5.4 + Figure 8 的坑：只有【当前任期】的日志能靠多数派提交；
             // 旧任期的日志必须等当前任期的某条日志被提交后"顺带"提交。
@@ -986,26 +1093,134 @@ void Raft::ApplyLoop() {
 // 第六部分补充：快照（Lab 3 日志压缩）
 // ===========================================================================
 
+// ---------------------------------------------------------------------------
+// 磁盘上 snapshot blob 的格式：[magic(8B)][index(4B)][term(4B)][len(4B)][raw...]
+//
+// 为什么 blob 需要「自描述」的头？
+//   blob 与 raft state 现在是【两次独立落盘】（阶段1 落 blob / 阶段2 提交
+//   state），必须能判断"盘上这个 blob 到底对应哪个 index"：
+//     · 恢复时 blob.index == state.snapshot_index_  → 已提交，采用；
+//     · 恢复时 blob.index != state.snapshot_index_  → 崩在两阶段之间，
+//       blob 属于"写了一半"的未提交快照 → 丢弃，从完整的日志重放。
+//   没有这个头就无法区分，只能靠"猜测"，那正是丢数据的来源。
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr char kSnapMagic[] = "RAFTSNP1";
+constexpr size_t kSnapHeaderSize = 8 + 4 + 4 + 4;  // magic + index + term + len
+
+void PutInt32(std::string& s, int32_t v) {
+  uint32_t u = static_cast<uint32_t>(v);
+  for (int i = 0; i < 4; ++i) {
+    s.push_back(static_cast<char>((u >> (i * 8)) & 0xFFu));
+  }
+}
+
+int32_t GetInt32(const std::string& s, size_t off) {
+  uint32_t u = 0;
+  for (int i = 3; i >= 0; --i) {
+    u = (u << 8) | static_cast<unsigned char>(s[off + static_cast<size_t>(i)]);
+  }
+  return static_cast<int32_t>(u);
+}
+
+std::string EncodeSnapshotBlob(int index, int term, const std::string& raw) {
+  std::string out;
+  out.reserve(kSnapHeaderSize + raw.size());
+  out.append(kSnapMagic, 8);
+  PutInt32(out, index);
+  PutInt32(out, term);
+  PutInt32(out, static_cast<int32_t>(raw.size()));
+  out.append(raw);
+  return out;
+}
+
+// 返回 false：不是本格式（空 / 老格式 / 损坏）。
+bool DecodeSnapshotBlob(const std::string& blob, int* index, int* term,
+                        std::string* raw) {
+  if (blob.size() < kSnapHeaderSize) return false;
+  if (blob.compare(0, 8, kSnapMagic, 8) != 0) return false;
+  int32_t idx = GetInt32(blob, 8);
+  int32_t t = GetInt32(blob, 12);
+  int32_t len = GetInt32(blob, 16);
+  if (len < 0) return false;
+  if (blob.size() != kSnapHeaderSize + static_cast<size_t>(len)) return false;
+  if (index) *index = idx;
+  if (term) *term = t;
+  if (raw) raw->assign(blob, kSnapHeaderSize, static_cast<size_t>(len));
+  return true;
+}
+
+}  // namespace
+
+// Raft::SaveSnapshotBlob —— 见 raft.h 声明处的完整说明。
+//
+// 复述最关键的一点：真正慢的 I/O（真实磁盘上的 write + fsync）发生在
+// 【raft 主锁 mu_ 之外】。mu_ 只在两处被短暂持有，且都只做 O(1) 的整数
+// 比较/赋值，绝不会卡住心跳、读心跳或选举。
+bool Raft::SaveSnapshotBlob(int index, int term, const std::string& raw_blob) {
+  // snap_io_mu_ 串行化所有 blob 写：两个并发的快照（比如本地 Snapshot(100)
+  // 和 InstallSnapshot(150)）不会互相覆盖成更旧的那个。
+  std::lock_guard<std::mutex> io(snap_io_mu_);
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    // 单调保护：盘上已有 index >= 本次 index 的 blob，再写就是回退覆盖。
+    // 回退覆盖是致命的——若 state 已截断到更高的 index，恢复时这个更旧的
+    // blob 会被判"未提交"丢弃，而日志也被截断了，状态就重放不出来了。
+    if (index <= saved_blob_index_) return false;
+  }
+
+  // ★★★ 慢 I/O：这里是将来的 write() + fsync()，此刻不在 mu_ 内 ★★★
+  persister_->SaveSnapshotOnly(EncodeSnapshotBlob(index, term, raw_blob));
+
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (index > saved_blob_index_) saved_blob_index_ = index;
+  }
+  return true;
+}
+
 // 1.必须已 apply：快照本质是「状态机在 index=X 的物理快照」，所以 snap_idx = rafts_[i]->LastApplied()（config.cpp:211）
 // 2. lastApplied ≤ commitIndex 不变量：由 ApplyLoop（raft.cpp:782-797）逐条推进维护
-// 3. Raft::Snapshot 兜底拒绝 index > commit_index_（raft.cpp:821）——双保险
+// 3. Raft::Snapshot 兜底拒绝 index > commit_index_ —— 双保险
 void Raft::Snapshot(int index, const std::string& snapshot) {
+  // ========== 阶段 0：快检查（持 mu_，只读，不做 I/O）==========
+  // 目的：在动手落盘之前先确认这个快照值得做，并把 term 取出来
+  //      （term 只能在锁内从 logs_ 读）。
+  int snap_term = 0;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+
+    // 只能快照已提交的，否则未提交数据会被当已持久化。
+    if (index > commit_index_) {
+      Trace("S%d Snapshot 拒绝：index=%d > commit_index_=%d", me_, index,
+            commit_index_);
+      return;
+    }
+    // 已经覆盖到更靠后的快照了，无需重复截断。
+    if (index <= snapshot_index_) return;
+
+    // 在旧 logs_ 里定位 index 对应的下标：旧哨兵 index == 旧 snapshot_index_，
+    // 所以逻辑 index 在旧 logs_ 中的下标 = index - 旧 snapshot_index_。
+    size_t pos = static_cast<size_t>(index - snapshot_index_);
+    if (pos >= logs_.size()) return;  // 防御：index 不合法
+    snap_term = logs_[pos].term;
+  }
+
+  // ========== 阶段 1：blob 落盘（★ 慢 I/O，在 raft 主锁 mu_ 之外）==========
+  // 真实磁盘上这里是几百 MB 的 write + fsync（几百 ms～几秒）。放在锁内
+  // 会把心跳/读心跳/选举全饿死。详见 SaveSnapshotBlob 的说明。
+  SaveSnapshotBlob(index, snap_term, snapshot);
+
+  // ========== 阶段 2：持锁提交 raft state（快：只有元数据 + 日志截断）==========
   std::lock_guard<std::mutex> lk(mu_);
 
-  // 只能快照已提交的，否则未提交数据会被当已持久化。
-  if (index > commit_index_) {
-    Trace("S%d Snapshot 拒绝：index=%d > commit_index_=%d", me_, index,
-          commit_index_);
-    return;
-  }
-  // 已经覆盖到更靠后的快照了，无需重复截断。
+  // double-check：阶段 1 不占锁，期间状态可能已变（例如被装上了更新的快照），
+  // 三个条件必须重判，否则会拿一个已过期的 index 去做日志截断。
+  if (index > commit_index_) return;
   if (index <= snapshot_index_) return;
-
-  // 在旧 logs_ 里定位 index 对应的下标：旧哨兵 index == 旧 snapshot_index_，
-  // 所以逻辑 index 在旧 logs_ 中的下标 = index - 旧 snapshot_index_。
   size_t pos = static_cast<size_t>(index - snapshot_index_);
   if (pos >= logs_.size()) return;  // 防御：index 不合法
-  int snap_term = logs_[pos].term;
 
   // 截断 logs_：保留哨兵(index 对齐到快照点) + 快照点之后的条目。
   std::vector<LogEntry> new_logs;
@@ -1021,7 +1236,9 @@ void Raft::Snapshot(int index, const std::string& snapshot) {
   snapshot_index_ = index;
   snapshot_term_ = snap_term;
   snapshot_data_ = snapshot;
-  snapshot_dirty_ = true;
+  // 注意：blob 已在阶段 1 落盘，这里【只】持久化 raft state（PersistLocked
+  // 不再碰 blob）。落盘顺序恒为「先 blob 后 state」，靠 blob 头里的 index
+  // 做崩溃校验，见 DecodeSnapshotBlob / ReadPersist。
 
   PersistLocked();
   Trace("S%d 生成快照 index=%d term=%d 日志截断到 %zu 条", me_, snapshot_index_,
@@ -1030,36 +1247,9 @@ void Raft::Snapshot(int index, const std::string& snapshot) {
 
 void Raft::InstallSnapshot(const InstallSnapshotArgs& args,
                            InstallSnapshotReply& reply) {
-  // ⚠️ 单相设计（仿 Go 版 src/raft/raft.go:882-924）
-  //   立即在 raft 锁内做完所有 raft state 变更：
-  //     1) 更新 snapshot_index_ / snapshot_term_ / snapshot_data_
-  //     2) 截断 logs_（重建哨兵）
-  //     3) 推进 commit_index_ / last_applied_ 到 args.last_included_index
-  //     4) PersistLocked() 一次性落盘 raft state + snapshot blob
-  //   然后才把 snapMsg 挂 pending_snapshot_，由 ApplyLoop 统一派发给 KVServer。
-  //
-  // ⚠️ 修复 · applyCh 单发送者：与 v3 "minimal fix" 相同的处置——本函数【不再
-  // 直接 push 到 apply_ch_】，只挂 pending_snapshot_，由 ApplyLoop 统一派发。
-  //
-  // 为什么不能再保留两段式（handler 只挂 + CondInstallSnapshot 完成截断）？
-  //   v3 "minimal fix" 的实测表明，那设计有一个**必现**的窗口：
-  //     t0  InstallSnapshot 收到 args.last_included_index=888，挂 pending_snapshot_，返回。
-  //     t1  ApplyLoop 派发 snapMsg 给 KVServer。
-  //     t1' 与此同时，leader 又发来 AppendEntries(prev=869, entries=[870..904])
-  //          ——因为 snapshot_index_ 仍 = 869、logs_ 仍含 [869..904] 的旧条目，
-  //          AppendEntries 不会拒，这些 entries 全部进 logs_，并被 commit+派发出去。
-  //     t2  KVServer 终于处理 snapMsg、调用 CondInstallSnapshot(888) 截断 logs_。
-  //   而 idx=870..888 这段"先于 snap 应用"的旧条目，可能跟 idx>=889 的"新"
-  //   条目拼接起来形成前缀冲突的 logs_，且 KV state 已经被旧 entries 改过——
-  //   当 CondInstallSnapshot 完成重置 KV state 到 snap 时刻，idx=870..888 的旧
-  //   entries 不会"回滚"再 apply（已被 snap 取代），但 idx=889..904 的新 entries
-  //   已经 modify 过 KV state → 客户端发过来的 op 在 leader 上看到的"线性读"=
-  //   snap 之后状态，但 follower 此刻的 KV state 还残留 idx=870..888 的旧值。
-  //   TestSnapshotUnreliableRecover3B 的 "server[0] vs server[1] key=X" 就这样发散。
-  //
-  //   单相设计让这个窗口期归零：handler 返回前所有 raft state 已一致，
-  //   ApplyLoop 不会再派发 idx ≤ snap_index 的旧条目。
-  ApplyMsg msg;
+  // ========== 阶段 0：快判（持 mu_，只读 + O(1) 元数据更新，不做 I/O）==========
+  // 决定"这个快照值不值得落盘"。term 推进 / heartbeat 刷新也放在这里，
+  // 保证「收到更高 term 的（哪怕过期的）快照仍会退位」这一语义不丢失。
   {
     std::lock_guard<std::mutex> lk(mu_);
     reply.term = current_term_;
@@ -1072,6 +1262,30 @@ void Raft::InstallSnapshot(const InstallSnapshotArgs& args,
     }
     last_heartbeat_ = raftcpp::Now();
     tick_cv_.notify_all();
+
+    // 已经包含这个快照（或更新的）→ 连盘都不用落。
+    if (args.last_included_index <= last_applied_) return;
+  }
+
+  // ========== 阶段 1：blob 落盘（★ 慢 I/O，在 raft 主锁 mu_ 之外）==========
+  // 这里是 follower 侧真正的重活：几百 MB 的快照要 write + fsync。
+  // 旧实现在 mu_ 内做，会堵死本节点的 AppendEntries / 选举定时器；
+  // 若多数派 follower 同时装快照，leader 收不到 ack → 被 CheckQuorum 误退位。
+  SaveSnapshotBlob(args.last_included_index, args.last_included_term, args.data);
+
+  // ========== 阶段 2：持锁完成 raft state 变更（快）==========
+  // msg 在【锁外】构造：锁内不再做大 blob 的拷贝。
+  ApplyMsg msg;
+  msg.snapshot_valid = true;
+  msg.snapshot = args.data;
+  msg.snapshot_index = args.last_included_index;
+  msg.snapshot_term = args.last_included_term;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    reply.term = current_term_;
+
+    // double-check：阶段 1 未持锁，期间状态可能已变。
+    if (args.term < current_term_) return;  // 旧 leader 的快照，拒绝
 
     // 已经包含这个快照（或更新的），无需重复安装（idempotent）。
     // ⚠️ 改用 last_applied_ 判旧（对齐 Go 版 raft.go:904）：
@@ -1087,7 +1301,7 @@ void Raft::InstallSnapshot(const InstallSnapshotArgs& args,
     snapshot_index_ = args.last_included_index;
     snapshot_term_ = args.last_included_term;
     snapshot_data_ = args.data;
-    snapshot_dirty_ = true;
+    // 注意：blob 已在阶段 1 于锁外落盘，PersistLocked() 只写 raft state。
 
     // 截断 logs_：哨兵重建（index 对齐到快照点）；args.last_included_index+1 之后
     // 的旧条目保留，等 leader 重发覆盖即可（即使保留也可能错位，AppendEntries 的
@@ -1120,13 +1334,9 @@ void Raft::InstallSnapshot(const InstallSnapshotArgs& args,
     }
     apply_cv_.notify_all();
 
-    // 一次性落盘：raft state（含截断后的 logs_、新 snapshot 元数据）+ snap blob
+    // 落盘 raft state（含截断后的 logs_、新 snapshot 元数据）。
+    // ⚠️ blob 【不在这里写】—— 已在阶段 1 于锁外落盘。
     PersistLocked();
-
-    msg.snapshot_valid = true;
-    msg.snapshot = args.data;  // 锁内拷一份
-    msg.snapshot_index = args.last_included_index;
-    msg.snapshot_term = args.last_included_term;
 
     // 挂到 pending_snapshot_，由 ApplyLoop 统一派发。
     // 若已有待投递快照，只保留更新的那个（旧的已被新的完全覆盖，投它没有意义）。
@@ -1170,7 +1380,7 @@ bool Raft::CondInstallSnapshot(int index, int term,
 }
 
 // ===========================================================================
-// 第六部分：TODO(2C) 持久化
+// 第六部分：持久化
 // ===========================================================================
 
 void Raft::PersistLocked() {
@@ -1182,12 +1392,11 @@ void Raft::PersistLocked() {
     e.Int(en.term).Int(en.index).Bytes(en.command);
   }
 
-  if (snapshot_dirty_) {
-    persister_->SaveStateAndSnapshot(e.Take(), snapshot_data_);  // 冷路径：都写
-    snapshot_dirty_ = false;
-  } else {
-    persister_->SaveRaftState(e.Take());   // 热路径：只写状态，快照文件原样留着
-  }
+  // ⚠️ 这里【只写 raft state】，不再写 snapshot blob。
+  // blob 已由 SaveSnapshotBlob() 在锁外单独落盘（阶段 1）。
+  // 落盘顺序恒为「先 blob（带 index 头）→ 后 state」，崩溃一致性靠
+  // DecodeSnapshotBlob() 比对 blob.index 与 snapshot_index_ 来保证。
+  persister_->SaveRaftState(e.Take());
 }
 
 void Raft::ReadPersist(const std::string& data) {
@@ -1217,13 +1426,233 @@ void Raft::ReadPersist(const std::string& data) {
   commit_index_ = snap_idx;
   last_applied_ = snap_idx;
   snapshot_term_ = snap_term;
-  snapshot_data_ = persister_->ReadSnapshot();  // 不透明 blob，直接恢复
+  // ---- 恢复 snapshot blob：剥磁盘头 + 与 raft state 对齐 ----
+  //
+  // blob 与 state 是两次独立落盘，因此 blob 可能【领先】于 state：
+  // 崩溃若发生在「阶段1 落盘 blob」之后、「阶段2 提交 state」之前，盘上
+  // 就是 blob(index=X) + state(snapshot_index_ < X)。
+  //
+  // 这种"未提交"的 blob 必须【追认采用】，绝不能丢弃：
+  //   本节点的日志早被更早的快照截断过（logs 只保留上次快照点之后的条目），
+  //   0..X 的状态【只存在于 blob 里】——丢掉就永远重放不出来，状态机凭空
+  //   缺一大块 → "replicas did not converge / state diverged"。
+  //   （实测：TestSnapshotRecoverManyClients3B 就是这么发散的。）
+  //
+  // 安全性由「写 blob 时 last_applied_ 必然 >= index」保证：
+  //   · Snapshot() 由 applier 在 apply 之后触发（index <= 已 apply 位置）；
+  //   · InstallSnapshot() 在阶段2 就推进了 last_applied_ 到 index。
+  //   所以 blob 是自包含的真实状态，把边界抬到它不会"超前于实际"。
+  // （etcd 也是这个语义：恢复时以磁盘上最新的 snapshot 文件为准。）
+  {
+    std::string disk_blob = persister_->ReadSnapshot();
+    int b_idx = 0, b_term = 0;
+    std::string b_raw;
+    if (DecodeSnapshotBlob(disk_blob, &b_idx, &b_term, &b_raw)) {
+      if (b_idx > snapshot_index_) {
+        Trace("S%d 追认未提交的 snapshot blob：blob.index=%d > snapshot_index_=%d",
+              me_, b_idx, snapshot_index_);
+        // 同步把日志截断到 b_idx（哨兵对齐）——否则后续
+        // "index - snapshot_index_" 的定位会整体错位。
+        size_t pos = static_cast<size_t>(b_idx - snapshot_index_);
+        if (pos < logs.size()) {
+          std::vector<LogEntry> new_logs;
+          new_logs.reserve(logs.size() - pos);
+          for (size_t i = pos; i < logs.size(); ++i) {
+            new_logs.push_back(std::move(logs[i]));
+          }
+          new_logs[0] = LogEntry{b_term, b_idx, ""};
+          logs.swap(new_logs);
+        } else {
+          logs.clear();
+          logs.push_back(LogEntry{b_term, b_idx, ""});
+        }
+        snapshot_index_ = b_idx;
+        snapshot_term_ = b_term;
+        if (commit_index_ < b_idx) commit_index_ = b_idx;
+        if (last_applied_ < b_idx) last_applied_ = b_idx;
+      }
+      if (b_idx == snapshot_index_) {
+        snapshot_data_ = std::move(b_raw);  // 裸状态机数据
+      }
+      // 盘上 blob 的 index 恒 >= 已提交边界，之后只允许写更新的。
+      saved_blob_index_ = snapshot_index_;
+    } else {
+      // 空 / 老格式 / 损坏：视为无快照（首次启动就是这种情况）。
+      saved_blob_index_ = snapshot_index_;
+    }
+  }
   logs_ = std::move(logs);
 
   // 现在才是真正的"消费完整字节流"边界
   // 注：原代码在上方赋值后又用 snapshot_index_ 重复赋了一次 commit_index_/last_applied_，
   // 二者等价（snapshot_index_ == snap_idx），属冗余，已删除。
   if (!d.Ok()) return;
+}
+
+int Raft::MemberCountLocked() const {
+  int c = 0;
+  for (bool m : is_member_) {
+    if (m) c++;
+  }
+  return c;
+}
+
+// leader 在最近 150ms 里有没有收到过 i 的回包
+int Raft::CountRecentAcksLocked(int window_ms) const {
+  const auto cutoff = raftcpp::Now() - std::chrono::milliseconds(window_ms);
+  int count = 0;
+  for (size_t i = 0; i < last_ack_time_.size(); i++) {
+    // 已被移除 / 尚未正式加入的节点直接跳过：它连成员都不是，
+    // 它的"确认"对多数派判定没有任何意义。
+    // （少了这层过滤，被移除的节点凭一己之力就能凑出多数派 → 安全性崩塌。）
+    if (i >= is_member_.size() || !is_member_[i]) continue;
+    // leader 自己永远算一票：它不会给自己发 AppendEntries，
+    // last_ack_time_[me_] 不会被心跳回包刷新，必须无条件计入，
+    // 否则刚当选的 leader 会把自己判成"联系不上多数派"而立刻退位。
+    if (static_cast<int>(i) == me_) {
+      count++;
+      continue;
+    }
+    if (last_ack_time_[i] > cutoff) count++;
+  }
+  return count;
+}
+
+void Raft::BroadcastReadHeartbeat(int ctx) {
+  // 给每个 follower 发一条"带 read_ctx 的空心跳"。follower 在 AppendEntriesReply
+  // 里原样回显 read_ctx，leader 的回包处理据此调 RecordReadAckLocked 把票记到
+  // 对应的读请求上。
+  for (size_t s = 0; s < peers_.size(); s++) {
+    if (s == static_cast<size_t>(me_)) continue;
+    AppendEntriesArgs args;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (state_ != ServerState::kLeader) return;   // 已退位，发也没意义
+      args.term = current_term_;
+      args.leader_id = me_;
+      args.leader_commit = commit_index_;
+      args.prev_log_index = LastLogIndexLocked();
+      args.prev_log_term =
+          (args.prev_log_index == snapshot_index_)
+              ? snapshot_term_
+              : logs_[args.prev_log_index - snapshot_index_].term;
+      args.entries.clear();
+      args.read_ctx = ctx;
+    }
+    std::shared_ptr<Raft> self = shared_from_this();
+    const int server = static_cast<int>(s);
+    peers_[s]->CallAsyncTyped<AppendEntriesArgs, AppendEntriesReply>(
+        "Raft.AppendEntries", args,
+        [self, server, args, ctx](bool ok, const AppendEntriesReply& reply) {
+          (void)ctx;
+          if (!ok) return;                   // 丢包 / 对方挂了，等下次或超时
+          std::lock_guard<std::mutex> lk(self->mu_);
+          if (self->killed_.load()) return;
+          if (reply.term > self->current_term_) {
+            self->ConvertToFollowerLocked(reply.term);
+            self->last_heartbeat_ = raftcpp::Now();
+            self->tick_cv_.notify_all();
+            self->replicator_cv_.notify_all();
+            return;
+          }
+          // 二次确认：迟到的回包作废（term 不符 / 已非 leader）
+          if (args.term != self->current_term_ ||
+              self->state_ != ServerState::kLeader) {
+            return;
+          }
+          // 记下这次"联系"：刷新 CheckQuorum / Leader Lease 的 ack 时间
+          self->last_ack_time_[server] = raftcpp::Now();
+          // 按 ctx 把这一票记到对应的读请求上（普通心跳 ctx==0 会直接 return）
+          self->RecordReadAckLocked(reply.read_ctx);
+        },
+        &cancel_rpcs_);
+  }
+}
+
+void Raft::RecordReadAckLocked(int ctx) {
+  if (ctx == 0) return;                      // 普通心跳/普通快照，与读确认无关
+  auto it = read_ctxs_.find(ctx);
+  if (it == read_ctxs_.end()) return;        // 该 ctx 已完成/取消/超时，迟到回包忽略
+  ReadIndexCtx& r = it->second;
+  if (r.term != current_term_) return;       // term 变了，作废
+  r.ack_count++;
+  int majority = MemberCountLocked() / 2 + 1;
+  if (r.ack_count >= majority && !r.done) {
+    r.done = true;
+    // 共用 read_cv_：唤醒后各读线程查自己的 done 标志，互不干扰
+    read_cv_.notify_all();
+  }
+}
+
+// ReadIndex 的做法是每个读请求都重新验一次身份：
+// 1.记录当前 commitIndex 作 readIndex；
+// 2.给全体 follower 发一次空心跳；
+// 3.等多数派在当前 term 回 ack —— 拿不到就拒绝这个读（返回 -1）；
+// 4.确认自己仍是合法 leader 后，等状态机 apply 到 readIndex 再返回。
+int Raft::ReadIndex() {
+  int ctx = 0;
+  int my_read_index = 0;
+  int my_term = 0;
+
+  // 第 1 步：锁内判断身份、开租约、给本条读分配唯一 ctx 并登记上下文
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (state_ != ServerState::kLeader) return -1;    // 只有 leader 能服务
+
+    // 线性一致读硬性前提：本 leader 必须先提交一条自己 term 的 entry（no-op，
+    // 见 become-leader 块），把 commit_index_ 抬到覆盖上任前已提交的 entry；
+    // 否则 commit_index_ 是旧值（甚至 0），据此读会拿到 stale 状态
+    // （分区用例偶发 wrong appends / 空读）。不满足就拒绝，让上层 Clerk 换台/重试，
+    // 等 no-op 提交后 commit_index_ 自然越过 read_safe_commit_。
+    if (commit_index_ < read_safe_commit_) return -1;
+
+    // 快路径：LeaseRead（默认 kEnableLeaseRead=false，不走到这）
+    if (kEnableLeaseRead && raftcpp::Now() < lease_expire_) {
+      return commit_index_;
+    }
+
+    // 分配本条读的 ctx（per-request）：每条读一个唯一、单调递增的 ctx，
+    // 状态存在 read_ctxs_[ctx]，回包按 reply.read_ctx 精确归因，并发互不踩踏。
+    my_term = current_term_;
+    my_read_index = commit_index_;
+    ctx = next_read_ctx_++;
+    ReadIndexCtx r;
+    r.term = my_term;
+    r.read_index = my_read_index;
+    r.ack_count = 1;            // leader 自己这一票
+    r.done = false;
+    read_ctxs_[ctx] = std::move(r);
+  }
+
+  // 第 2 步：锁外发一轮带 ctx 的空心跳
+  BroadcastReadHeartbeat(ctx);
+
+  // 第 3 步：等多数派确认（锁外等待，绝不持锁阻塞）
+  const auto deadline =
+      raftcpp::Now() + std::chrono::milliseconds(kElectionTimeoutMin);
+  {
+    std::unique_lock<std::mutex> lk(mu_);
+    int result = -1;
+    while (!killed_.load()) {
+      auto it = read_ctxs_.find(ctx);
+      bool done = (it != read_ctxs_.end() && it->second.done);
+      if (done) { result = my_read_index; break; }   // 本条读的 ctx 已攒够
+      if (my_term != current_term_) break;           // term 变了 → 作废重试
+      if (state_ != ServerState::kLeader) break;     // 已不是 leader
+      auto remain = deadline - raftcpp::Now();
+      if (remain <= std::chrono::milliseconds(0)) break;  // 超时
+      read_cv_.wait_for(lk, remain);
+    }
+    if (result >= 0) {                               // 醒来再确认一遍
+      auto it = read_ctxs_.find(ctx);
+      if (it == read_ctxs_.end() || !it->second.done ||
+          it->second.term != current_term_ || state_ != ServerState::kLeader) {
+        result = -1;
+      }
+    }
+    read_ctxs_.erase(ctx);   // 清理：迟到回包因找不到 ctx 直接 return
+    return result;           // 调用方拿到 readIndex 后等 apply 到它再读
+  }
 }
 
 }  // namespace raft
