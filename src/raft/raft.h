@@ -120,10 +120,57 @@ inline const char* StateName(ServerState s) {
   return "???";
 }
 
+// ---------------------------------------------------------------------------
+// 成员角色（成员变更 / Learner 三态）
+// ---------------------------------------------------------------------------
+// 论文里"C_old 与 C_new 的多数派必有交集"的论证，落地点就是这个角色数组。
+//   kRemoved : 不在当前配置 C 里（已被移除 / 尚未加入）→ 不收 RPC、不投票、不计入多数派
+//   kLearner : 在 C 里但【只追数据不投票】（扩容零可用性损失，见文档 §2.6）
+//   kVoter   : 正式成员，参与一切（选举计票 / 日志提交 / CheckQuorum / ReadIndex）
+enum class MemberRole {
+  kRemoved = 0,
+  kLearner = 1,
+  kVoter = 2,
+};
+// 只有 kVoter 计入多数派 / 能投票 / 能当选。
+inline bool IsVoter(MemberRole r) { return r == MemberRole::kVoter; }
+// Q2 隐私加固的"冻结判据"：leader 是否该停止向 s 复制【新数据】。
+// 两个信息源必须取"或"——缺任何一个都会漏出一条真实路径：
+//   (a) removed_at_index_[s] >= 0：提案时 / apply 时写入的"冻结点"下标。
+//       覆盖【提案 → apply】这段窗口（此间 is_member_[s] 仍是 kVoter）。
+//   (b) is_member_[s] == kRemoved：配置视图。
+//       覆盖【经 InstallSnapshot 恢复配置】的场景：快照把 conf 条目截断了，
+//       新 leader 上任扫描 logs_ 扫不到那条 conf，removed_at_index_ 重建不出来，
+//       若只看 (a) 就会继续给 removed 节点发新数据（隐私泄漏）。
+// 只用 (b) 是旧 bug（㉓ 偶发 40%）：提案到 apply 之间 cap 形同虚设。
+inline bool IsRemovedFrozen(const std::vector<MemberRole>& is_member,
+                            const std::vector<int>& removed_at_index, int s) {
+  if (s < 0) return false;
+  if (s < static_cast<int>(removed_at_index.size()) &&
+      removed_at_index[s] >= 0) {
+    return true;
+  }
+  if (s < static_cast<int>(is_member.size()) &&
+      is_member[s] == MemberRole::kRemoved) {
+    return true;
+  }
+  return false;
+}
+
 struct LogEntry {
   int term = 0;
   int index = 0;
   Command command;
+  // ---- 成员变更配置条目 ----
+  // 普通命令 is_conf=false；成员变更条目 is_conf=true，并携带目标节点与加/删。
+  // 节点必须【apply 到这条 entry 时】才切换本地 is_member_（不是收到就切），
+  // 且同一时刻只允许一个 conf 变更在飞行（ProposeConfChange 里的 pending_conf_index_ 保证）。
+  bool is_conf = false;
+  int conf_server = -1;  // 目标节点编号
+  // 目标角色的整型值（MemberRole：0=kRemoved, 1=kLearner, 2=kVoter）。
+  // 原来是 bool conf_add，只能表达"加 / 删"两态，塞不下 learner 这个第三态，
+  // 所以升级成 int，直接存 MemberRole 的值。
+  int conf_role = 0;
 };
 
 // 提交给上层状态机的消息
@@ -213,6 +260,9 @@ struct InstallSnapshotArgs {
   int last_included_index = 0;    // 快照覆盖的最后一条日志下标的逻辑 index
   int last_included_term = 0;     // 该下标的 term
   std::string data;               // 快照内容（状态机 blob）
+  // 成员配置随快照一起传：落后太多的 follower 装快照时本地 logs_ 可能已不含
+  // 覆盖区间内的 conf 条目（被截断），必须按 leader 在快照点处的角色数组重建。
+  std::vector<int> members;       // 各节点角色（MemberRole 的整型值）
 
   std::string Serialize() const;
   bool Deserialize(const std::string& s);
@@ -228,7 +278,7 @@ struct InstallSnapshotReply {
 struct ReadIndexCtx {
   int term = 0;        // 发起读时的 currentTerm，term 一变该 ctx 作废
   int read_index = 0;  // 发起读那一刻的 commitIndex（本次读至少要看到它）
-  int ack_count = 0;   // 已收到的确认票数（含 leader 自己那一票）
+  std::vector<char> acked_;  // 按 server 下标去重：记录哪些节点已回过 ack（leader 自己那一票在 ReadIndex() 里置位）
   bool done = false;   // 是否已攒够多数派
 };
 
@@ -251,6 +301,19 @@ struct StartResult {
 // 万一这时候 Raft 已经被测试框架释放了（crash1 之后），回调里再摸
 // this 就是赤裸裸的野指针。持有一份 shared_ptr，就能保证"只要还有
 // 在途的 RPC，对象就还活着"。
+// ===========================================================================
+// 选举计票：纯函数，便于单元测试直接构造输入验证口径（见 test_raft.cpp）
+// ===========================================================================
+// 只统计"当前仍是 voter"的节点投出的赞成票。
+// 必须与 QuorumSizeLocked()（MemberCountLocked 只数 IsVoter）保持
+// 【分子分母同口径】：否则已移除 / learner 节点的票会混进分子，却用
+// "当前 voter 多数"作门槛 —— 候选者可能靠一张已作废的票凑够 quorum
+// 当选，leader 并非由当前配置多数选出（选举合法性被破坏）。
+//
+//   votes[i]: 0 = 未投/未回, 1 = 授予, -1 = 拒绝
+int CountGrantedVotes(const std::vector<MemberRole>& is_member,
+                      const std::vector<int>& votes);
+
 class Raft : public std::enable_shared_from_this<Raft> {
  public:
   Raft(std::vector<std::shared_ptr<labrpc::ClientEnd>> peers, int me,
@@ -278,10 +341,34 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // 不是 leader 就返回 is_leader=false。
   StartResult Start(const Command& command);
   int ReadIndex();
+  // 生产级扩展 ③：提议一次【单节点】成员变更（一次只加/减一个）。
+  // add=true  → 把 server 设为 kVoter；add=false → 设为 kRemoved。
+  // 内部会追加一条 conf 配置条目，节点在【apply 到该条目时】才切换本地配置；
+  // 若已有未提交的变更在途（pending_conf_index_ != 0）则拒绝（单飞保护）。
+  // 非 leader / 目标越界 / 有在途变更 → 返回 is_leader=false 且不做事。
+  StartResult ProposeConfChange(int server, bool add);
+  // 生产级扩展 ③b：把 server 设为【指定角色】（kRemoved / kLearner / kVoter 三态）。
+  // 与 ProposeConfChange 走完全相同的"追加配置条目 → apply 时切换"路径，
+  // 差别只是目标角色由调用方指定，因此支持 kLearner：
+  //   kLearner = 在集群里【只追数据、不投票、不计入多数派】，
+  //   用来做"先让新节点追平日志、追平后再提拔为 voter"的安全扩容
+  //   （避免新节点一进来就把多数派阈值撑大 → 扩容窗口内可用性下降）。
+  // 非 leader / 目标越界 / 角色非法 / 有在途变更 → 拒绝。
+  StartResult ProposeConfChangeTo(int server, MemberRole target);
   // 关掉这个 Raft 实例：停掉后台线程、取消所有在途 RPC。
   // 注意：持久化状态保存在 persister 里，不会被清掉。
   void Kill();
   bool killed() const { return killed_.load(); }
+  // 调试/测试：返回各节点当前角色（MemberRole 整型值），read-only。
+  // 0=kRemoved, 1=kLearner, 2=kVoter。用于验证成员变更是否按预期 apply。
+  std::vector<int> MembershipView() const;
+  // 调试/测试：当前多数派阈值（只数 kVoter）。
+  // 用来验证"learner 不计入多数派"：4 节点里 1 个是 learner 时，
+  // 有效 voter=3 → 阈值 2（而不是 4 节点的 3）。
+  int QuorumSize() const;
+  // 调试/测试：本节点日志最新下标。
+  // 用来验证"learner 虽不投票，但仍在持续接收并追加日志（追数据）"。
+  int LastLogIndex() const;
 
   // 调试用：一行文字描述当前状态
   std::string LogStatus();
@@ -333,7 +420,10 @@ class Raft : public std::enable_shared_from_this<Raft> {
   void Snapshot(int index, const std::string& snapshot);
 
   // 上层在收到 snapshot ApplyMsg 后调用，确认可以安全安装。
-  // 返回 false 表示状态机已经 apply 了更新的，别回退。
+  // 返回 true  ⟺ (index, term) 与 raft【当前】快照元数据一致（即"这就是刚装的那个"）；
+  // 返回 false ⟺ raft 已装了别的快照，这条消息过时了，装它会回退状态机。
+  // ⚠️ 不要再加 `last_applied_ > index` 这类判据：last_applied_ 是"raft 派发进度"
+  //    而非"状态机进度"，用它判旧会在正常时序下误伤（详见 raft.cpp 实现处的注释）。
   bool CondInstallSnapshot(int index, int term, const std::string& snapshot);
 
   // 快照 RPC：leader 给落后太多的 follower 发送。
@@ -401,13 +491,22 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // 多数派会直接破坏安全性（已移除的节点不该有能力凑出多数派）。
   // 调用前必须持有 mu_。
   int MemberCountLocked() const;
-
-    // 给所有 follower 发一轮"带 read_ctx 的空心跳"，用于 ReadIndex 的身份确认。
+  int QuorumSizeLocked() const { return MemberCountLocked() / 2 + 1; }
+  // 本轮（预）投票的赞成票数：只数"当前仍是 voter"的节点，
+  // 与 QuorumSizeLocked() 同口径（已移除 / learner 的票作废）。调用前持 mu_。
+  int CountGrantedVotesLocked() const;
+  int CountGrantedPrevotesLocked() const;
+  // 当选判定 + 上任初始化：够 quorum 就上任，否则什么也不做。调用前持 mu_。
+  // 回包处与 StartRealElection 发完票后都要调一次（详见 raft.cpp 注释）。
+  void BecomeLeaderIfQuorumLocked();
+  // 通用：n 个节点的多数派阈值（不依赖本节点配置）。
+  int MajorityOf(int n) const { return n / 2 + 1; }
+  // 给所有 follower 发一轮"带 read_ctx 的空心跳"，用于 ReadIndex 的身份确认。
   // 必须在锁外调用（RPC 异步，不能持 mu_ 发网络）。
   void BroadcastReadHeartbeat(int ctx);
   // 回包到达时按 ctx 把这一票记到对应读请求上；攒够多数派就标记 done 并唤醒。
   // 调用前必须持有 mu_。
-  void RecordReadAckLocked(int ctx);
+  void RecordReadAckLocked(int ctx, int server);
 
   mutable std::mutex mu_;
 
@@ -424,9 +523,21 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // ---- 2A：所有 server 都有的状态 ----
   ServerState state_ = ServerState::kFollower;
   int current_term_ = 0;
+  // 事件驱动退位标志：ApplyLoop 检测到本节点已被移除/降级出 voter 时置 true，
+  // 但【不立即退位】——继续当 leader，让 ReplicateLoop 把 leader_commit（含本移除
+  // 配置）通过普通心跳带出去；宽限 kStepdownGraceMs 后由 ReplicateLoop 真正退位。
+  // 这样剩余 voter 必能拿到新 commitIndex → apply 配置 → 按新 quorum 选新 leader，
+  // 杜绝原版"leader 退位太早 → 旧 quorum 缺我这一票 → 永远选不出"的死锁。
+  bool pending_stepdown_ = false;
+  raftcpp::TimePoint stepdown_after_{};  // pending_stepdown_ 置位时的退位截止时刻
   int voted_for_ = -1;    // 本任期把票投给了谁，-1 = 还没投
   int num_votes_ = 0;     // 本轮选举收到的票数
   int num_prevotes_ = 0;  // 预投票
+  // 本轮各节点对本节点的（预）投票态度：0=未投/未回, 1=授予, -1=拒绝。
+  // 必须记录"谁投的"而非只记一个整数票数，才能在计票时剔掉
+  // "回包时已被移除 / 降级成 learner"的票（与 QuorumSizeLocked 同口径）。
+  std::vector<int> vote_granted_;
+  std::vector<int> prevote_granted_;
 
   // 最近一次"听到合法 leader / 给别人投了票"的时刻。
   // 选举超时是相对它来算的。
@@ -547,13 +658,23 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // 持锁直读 kv_store_ → 那个 index 100 的 Append 根本还没进状态机
   // 客户端拿到一个比自己上一次读还要旧的值 → 违反线性一致性
   int read_safe_commit_ = 0;
-   // ---- 生产级扩展 ③：成员变更 ----
-  // 【is_member_】is_member_[i] == true 表示节点 i 在当前配置 C 里。
-  // 只有成员才参与：选举计票、日志提交的多数派判定、CheckQuorum 计数、
-  // ReadIndex 确认。非成员（已被移除的 / 还没正式加入的）一律不计数。
+  // ---- 生产级扩展 ③：成员变更 ----
+  // 【is_member_】成员变更 / Learner 三态数组，is_member_[i] 表示节点 i 的角色：
+  //   kVoter   : 正式投票成员，参与一切多数派判定
+  //   kLearner : 在集群里只追数据、不投票、不计入多数派（扩容零可用性损失）
+  //   kRemoved : 不在当前配置 C 里（已移除 / 尚未加入）→ 不收 RPC、不投票、不计数
   // 这个数组就是论文里"C_old 与 C_new 的多数派必有交集"那条论证的落地点。
-  std::vector<bool> is_member_;
-
+  std::vector<MemberRole> is_member_;
+  // 单飞保护：当前"已 propose 但还没 apply（commit）"的成员变更条目下标。
+  // 0 表示没有在途变更。同一时刻只允许一个变更在飞行（文档 §2.4 运维纪律）。
+  // 新 leader 上任时会扫描日志重建这个值，保证切主后不丢失"在途变更"状态。
+  int pending_conf_index_ = 0;
+  // Q2 隐私加固配套：记录每个节点"被移除时"的配置条目下标（冻结点）。
+  // removed_at_index_[i] >= 0 表示节点 i 已在下标 idx 处被移除，leader 向它复制的
+  // 日志最多到 idx（含移除条目本身），之后彻底冻结、不再发任何新日志/快照/心跳。
+  // -1 表示无冻结点（节点是 voter/learner，或刚重启尚未从 ApplyLoop 重建）。
+  // 不持久化：重启后节点本就从日志重放拿到过移除条目，cap<0 → 直接冻结即可，无需补发。
+  std::vector<int> removed_at_index_;
   // Start() 追加日志、或心跳计数变化时 notify_all() 唤醒所有复制线程
   std::condition_variable replicator_cv_;
   std::condition_variable apply_cv_;

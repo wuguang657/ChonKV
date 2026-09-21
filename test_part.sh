@@ -16,6 +16,7 @@
 #   PARALLEL=2 ./test_part.sh 2C  TSan 吃 CPU/内存，机器卡就把并发调小
 #   ./test_part.sh CheckQuorum    生产级扩展：CheckQuorum 全部 7 条
 #   ./test_part.sh ReadIndex      生产级扩展：ReadIndex 全部 10 条
+#   ./test_part.sh Membership   生产级扩展：Membership 全部 27 条
 #
 # 跑非 TSan 的日常版（快 5~15 倍）：
 #   BIN=./build/raft_test COUNT=100 ./test_part.sh 2B
@@ -127,6 +128,39 @@ case "$PART" in
       TestReadIndexUnreliable
       TestReadIndexDuringReelection
       TestReadIndexSnapshotUnreliable
+      TestReadIndexIgnoresNonVoterAcks
+      TestReadIndexTimesOutWithoutQuorum
+    ) ;;
+  Membership)
+    DEFAULT_BIN=./build-tsan/raft_test
+    TESTS=(
+      TestSingleNodeConfChange
+      TestNoRemovingLastVoter
+      TestLearnerCatchup
+      TestLearnerAvailabilityWin
+      TestMembershipPersistAcrossRestart
+      TestLearnerNeverLeader
+      TestLearnerPersistAcrossRestart
+      TestConfChangeChurn
+      TestRemoveLeaderSelf
+      TestInstallSnapshotRestoresMembership
+      TestConcurrentConfChangeLinearizable
+      TestLearnerCatchupWithChurn
+      TestConfChangeMidCrash
+      TestRemovedNodeExcludedFromQuorum
+      TestMembershipConsistencyAtQuiescence
+      TestReadIndexDuringConfChange
+      TestLearnerDirectlyRemoved
+      TestPromoteLaggingLearnerSafe
+      TestStartRejectedForNonVoter
+      TestInstallSnapshotRestoresRemovedRole
+      TestRemovedNodeStopsReceivingReplication
+      TestRemovedNodeStaysQuiescentAfterRemoval
+      TestMembershipFuzzChurn
+      TestConfChangeFromMinorityLeader
+      TestLearnerReadIndexRejected
+      TestVoteCountIgnoresRemovedVoters
+      TestRemovedFreezeCoversBothSources
     ) ;;
   *)
     echo "未知 part: ${PART}（只支持 2A/2B/2C/3A/3B/CheckQuorum/ReadIndex）" >&2

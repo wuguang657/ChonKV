@@ -1,20 +1,6 @@
 // raft.cpp —— Raft 核心实现（2A / 2B / 2C / 2D 均已完整实现）
-//
-// 下方按"第 N 部分"分区：选举定时器、RPC handler、日志复制、持久化、快照。
-//
-// 验收顺序：
-//   1) 先只做 2A（RequestVote / AppendEntries 的心跳部分 / StartElection）
-//      → 跑 ./raft_test 2A
-//   2) 再做 2B（Start / AppendEntries 日志部分 / ReplicateLoop / ApplyLoop）
-//      → 跑 ./raft_test 2B
-//   3) 最后 2C（PersistLocked / ReadPersist + 在改持久化状态的地方调用）
-//      → 跑 ./raft_test 2C
-//
-// 卡住的时候回看 raft.h 的接口注释 + 论文 Figure 2 的状态机，对照 config.h
-// 的测试脚手架确认行为；本仓库的测试即你的验收标准（./raft_test 2A/2B/2C/2D）。
 
 #include "raft.h"
-
 #include <cstdio>
 
 namespace raft {
@@ -41,7 +27,6 @@ static void Trace(const char* fmt, ...) {
 // 第一部分：序列化（已实现，不用改）
 // ===========================================================================
 //
-// 编码顺序和解码顺序必须严格一致。这就是 C++ 手写"反射"的代价。
 
 std::string RequestVoteArgs::Serialize() const {
   labrpc::Encoder e;
@@ -99,7 +84,8 @@ std::string AppendEntriesArgs::Serialize() const {
       .Int(read_ctx);
   e.Int(static_cast<int>(entries.size()));
   for (const LogEntry& en : entries) {
-    e.Int(en.term).Int(en.index).Bytes(en.command);
+    e.Int(en.term).Int(en.index).Bytes(en.command)
+    .Bool(en.is_conf).Int(en.conf_server).Int(en.conf_role);
   }
   return e.Take();
 }
@@ -115,7 +101,8 @@ bool AppendEntriesArgs::Deserialize(const std::string& s) {
   entries.reserve(static_cast<size_t>(n));
   for (int i = 0; i < n; i++) {
     LogEntry en;
-    if (!(d.Int(en.term) && d.Int(en.index) && d.Bytes(en.command)))
+    if (!(d.Int(en.term) && d.Int(en.index) && d.Bytes(en.command) &&
+          d.Bool(en.is_conf) && d.Int(en.conf_server) && d.Int(en.conf_role)))
       return false;
     entries.push_back(std::move(en));
   }
@@ -137,13 +124,26 @@ std::string InstallSnapshotArgs::Serialize() const {
   labrpc::Encoder e;
   e.Int(term).Int(leader_id).Int(last_included_index).Int(last_included_term);
   e.Bytes(data);
+  e.Int(static_cast<int>(members.size()));
+  for (int m : members) e.Int(m);
   return e.Take();
 }
 
 bool InstallSnapshotArgs::Deserialize(const std::string& s) {
   labrpc::Decoder d(s);
-  return d.Int(term) && d.Int(leader_id) && d.Int(last_included_index) &&
-         d.Int(last_included_term) && d.Bytes(data) && d.Ok();
+  if (!(d.Int(term) && d.Int(leader_id) && d.Int(last_included_index) &&
+        d.Int(last_included_term) && d.Bytes(data)))
+    return false;
+  int nm = 0;
+  if (!d.Int(nm) || nm < 0) return false;
+  members.clear();
+  members.reserve(static_cast<size_t>(nm));
+  for (int i = 0; i < nm; i++) {
+    int m = 0;
+    if (!d.Int(m)) return false;
+    members.push_back(m);
+  }
+  return d.Ok();
 }
 
 std::string InstallSnapshotReply::Serialize() const {
@@ -185,7 +185,8 @@ Raft::Raft(std::vector<std::shared_ptr<labrpc::ClientEnd>> peers, int me,
   last_ack_time_.assign(peers_.size(), raftcpp::TimePoint{});    // CheckQuorum/Lease：follower 最近一次成功回包时刻
   cq_consec_fail_.assign(peers_.size(), 0);   // CheckQuorum：每 follower 连续 RPC 失败计数，初始化为 0（健康）
 
-  is_member_.assign(peers_.size(), true);  // 初始化所有节点都是正式成员
+  is_member_.assign(peers_.size(), MemberRole::kVoter);  // 初始化所有节点都是正式投票成员
+  removed_at_index_.assign(peers_.size(), -1);  // Q2：冻结点初始化为"无上限"
   last_quorum_check_ = raftcpp::Now();
   // 下面三个 vector 必须按 peers_.size() 初始化，否则 ReplicateLoop 里
   // last_send_time_[s] / inflight_log_[s] / inflight_log_time_[s] 在空 vector
@@ -271,6 +272,12 @@ void Raft::ConvertToFollowerLocked(int new_term) {
   current_term_ = new_term;
   voted_for_ = -1;
   num_prevotes_ = 0;
+  pending_stepdown_ = false;  // 已退位，清理事件驱动退位标志
+  // 退位即作废旧 leader 租约：避免 CheckQuorum 退位(不增 term)后残留的
+  // lease_expire_ 停在“未来时间”，使该节点重当选瞬间误走快路径
+  // (raft.cpp:2111) 返回 stale 的 commit_index_。租约是绝对时间戳，
+  // 必须随退位清零(RAII)。详见 lease read 审计结论。
+  lease_expire_ = raftcpp::TimePoint{};
   // term / votedFor 变了，必须在应答 RPC 【之前】落盘：丢了它们就可能
   // 在同一 term 投两次票 → 安全性崩塌。所以这里不能挪到锁外异步做。
   PersistLocked();
@@ -300,10 +307,11 @@ void Raft::ElectionTimerLoop() {
       {
         std::unique_lock<std::mutex> lk(mu_);
         // std::chrono::steady_clock::time_point内部重载了 + 运算符，可以直接加时间间隔
+        // 这里不加voter判断，宽限期内 state_ 仍是 kLeader（ApplyLoop 没立刻转 follower），这段时间里它必须继续跑 leader 分支发心跳，整个「退位宽限期」设计才成立。
         auto deadline =
             raftcpp::Now() + std::chrono::milliseconds(kHeartbeatInterval);
         // 如果当前时间还没到超时时间，wait_for会睡眠并释放锁，等deadline时间到了/notify_all再唤醒，重新拿起锁，while循环继续
-        while (!killed_.load() && raftcpp::Now() < deadline) {
+        while (!killed_.load() && state_ == ServerState::kLeader && raftcpp::Now() < deadline) {
           // wait_until(abs_time) 内部要把"未来的某个时刻"翻译成 timespec，deadline 已经过期时 macOS 这版 libc++ 会算出 tv_sec = -1，被 POSIX 拒绝并抛 system_error；改用 wait_for(相对时长) 就没"过期"问题，再加一层 if (remain > 0) 人工 clamp 做双保险。
           // 就算算出负值也会被wait_for clamp为0
           auto remain = deadline - raftcpp::Now();
@@ -342,7 +350,7 @@ void Raft::ElectionTimerLoop() {
           // 自然区分"延迟"与"真断连"；容忍连续 kCQMaxConsecFail 次失败以扛住 10% 丢包抖动。
           int live = 1;  // 自己永远算一票（不会给自己发心跳）
           for (size_t i = 0; i < cq_consec_fail_.size(); i++) {
-            if (i >= is_member_.size() || !is_member_[i]) continue;
+            if (i >= is_member_.size() || !IsVoter(is_member_[i])) continue;
             if (static_cast<int>(i) == me_) continue;
             // 两路存活信号取"或"：
             //  (a) cq_consec_fail_[i] < kCQMaxConsecFail —— 最近收到过 ok=true
@@ -406,6 +414,7 @@ void Raft::ElectionTimerLoop() {
         // 自己已经是 leader 了 → 立刻回外层去发心跳。
         // 少了这句，刚当选的节点要干等最多 300ms 才发第一个心跳。
         if (state_ == ServerState::kLeader) break;
+        // 这里不用加isvoter判断，后面startelection会判断
         // 这个等待窗口内有人续过命 → 本次超时作废，重新抽签重新计时
         if (last_heartbeat_ >= start_time) break;
         if (raftcpp::Now() >= deadline) {
@@ -435,10 +444,21 @@ void Raft::StartElection() {
   //       避免落后/分区的节点自增 term 去打断正常集群(治你见过的 term 暴涨)。
   // 铁律:本阶段【绝不】改 current_term_、【绝不】写 voted_for_、【绝不】持久化。
   RequestPreVoteArgs pargs;
+  // 锁外决定收件人会有数据竞争（is_member_ 是 vector，配置变更时可能 reallocate）。
+  // 改为：在下面锁内把 voter 收件人下标收集到快照，锁外遍历快照发送。
+  std::vector<int> prevote_targets;
+  // 单 voter 快路径标志：锁内判定、锁外动作。
+  // ⚠️ StartRealElection() 内部会自己加 mu_（非递归锁），必须在锁【外】调用，
+  //    所以这里只能带标志出去，不能在锁区内直接调。
+  bool self_only = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
     if (killed_.load()) return;
     if (state_ == ServerState::kLeader) return;
+    // 非 voter（被移除 / learner）绝不出任 candidate：既不发预投票、也不自提。
+    // 否则被移除的节点仍跑选举定时器，可能在剩余 voter 选出新 leader 之前抢先自提、
+    // 并靠“日志最新”拿到多数票，变成幽灵 leader（TestRemoveLeaderSelf 抓的就是这个）。
+    if (!IsVoter(is_member_[me_])) return;
     // 候选超时：本轮真实选举没拿到多数派（典型是 2 节点分区下两候选在旧 term
     // 各自投自己、永远 split vote）。不能原地重发【同 term】的 RequestVote——
     // 那样 term 永远不前进、对方永远因 voted_for_!=自己 拒投，活锁。
@@ -455,17 +475,45 @@ void Raft::StartElection() {
     pargs.candidate_id = me_;
     pargs.last_log_index = LastLogIndexLocked();
     pargs.last_log_term = LastLogTermLocked();
-    num_prevotes_ = 1;                     // 自己给自己一票（退位清 0 后重新发起预投票）
+    num_prevotes_ = IsVoter(is_member_[me_]) ? 1 : 0;  // 自己是 voter 才算自己那票（被移除则 0）
+    // 记录"谁投的"而非只记票数：本轮预投票态度清零，自己那票按当前身份记。
+    prevote_granted_.assign(peers_.size(), 0);
+    if (IsVoter(is_member_[me_])) prevote_granted_[me_] = 1;
+    // 锁内快照收件人：避免锁外读 is_member_ 触发数据竞争 / stale 视图。
+    for (size_t ti = 0; ti < peers_.size(); ti++) {
+      if (static_cast<int>(ti) == me_) continue;
+      if (ti >= is_member_.size() || !IsVoter(is_member_[ti])) continue;
+      prevote_targets.push_back(static_cast<int>(ti));
+    }
+    // 【单 voter 快路径】自己之外无 voter peer 时，上面收集不到任何收件人，
+    // 也就不会发出任何预投票 RPC → 异步回包计数永不触发 → 卡死在预投票、
+    // 永远选不出 leader（实测：去掉这段 TestStartRejectedForNonVoter 5/5 失败，
+    // "expected one leader, got none"）。
+    // 此时 quorum=1，自己那一票（上面 prevote_granted_[me_]=1）本就够了，
+    // 故在此（已在锁内，is_member_/prevote_granted_ 均为最新）同步判一次；
+    // 动作放锁外。与真实选举侧 StartRealElection"发票前主动判一次"成对。
+    if (state_ == ServerState::kFollower &&
+        CountGrantedPrevotesLocked() >= QuorumSizeLocked()) {
+      self_only = true;
+    }
+  }
+  // 锁外可能会stale，但是StartRealElection()再次判断
+  if (self_only) {
+    StartRealElection();
+    return;
   }
 
+  // 如果在锁释放期间增减 voter:
+  // 减 voter：QuorumSizeLocked() 分母缩小，被减节点的 stale 票被过滤不进分子 → 回包侧能正确识别"现在我自己就够 quorum"。
+  // 增 voter：分母变大，但新节点没收到过本轮 prevote（收件人是 L476-480 锁内按旧配置快照的），分子不增 → 不会误触发。
   std::shared_ptr<Raft> self = shared_from_this();
-  for (size_t i = 0; i < peers_.size(); i++) {
-    if (static_cast<int>(i) == me_) continue;
+  for (int i : prevote_targets) {
     peers_[i]->CallAsyncTyped<RequestPreVoteArgs, RequestPreVoteReply>(
         "Raft.RequestPreVote", pargs,
-        [self, pargs](bool ok, const RequestPreVoteReply& reply) {
+        [self, pargs, i](bool ok, const RequestPreVoteReply& reply) {
           if (!ok) return;  // 丢包 / 对方挂了
-
+          // 假如他在回包后，自己被移除了，便进入不了真实选举;
+          // 假如follower被移除了，有self->CountGrantedPrevotesLocked() >= self->QuorumSizeLocked()兜底
           bool start_real = false;
           {
             std::lock_guard<std::mutex> lk(self->mu_);
@@ -483,8 +531,10 @@ void Raft::StartElection() {
             // + pargs.term 校验:丢弃本轮之前的旧轮次预投票回复(逻辑重置)
             if (pargs.term == self->current_term_ &&
                 self->state_ == ServerState::kFollower && reply.vote_granted) {
-              self->num_prevotes_++;
-              if (self->num_prevotes_ > static_cast<int>(self->peers_.size()) / 2) {
+              self->num_prevotes_++;  // 仅作调试计数；判定以下面同口径计票为准
+              // 记下这一票是谁投的，计票时按【当前】配置剔掉已移除 / learner 的票。
+              self->prevote_granted_[i] = 1;
+              if (self->CountGrantedPrevotesLocked() >= self->QuorumSizeLocked()) {
                 start_real = true;
               }
             }
@@ -498,28 +548,33 @@ void Raft::StartElection() {
 void Raft::StartRealElection() {
   // ===================== 阶段 2:真实投票 Real Vote =====================
   // 走到这里说明已拿到多数派预投票。此刻才【真正自增 term + 写 votedFor + 持久化】。
-  RequestVoteArgs args;
   {
     std::lock_guard<std::mutex> lk(mu_);
     num_prevotes_ = 0;  // 预投票使命结束,清理(与 num_votes_ 无关)
 
     if (killed_.load()) return;
-    if (state_ == ServerState::kLeader) return;
+    if (state_ != ServerState::kFollower) return;
+    // 双保险：走到“自提”这一步说明要当 candidate，非 voter 绝不允许（被移除 / learner）。
+    if (!IsVoter(is_member_[me_])) return;
     if (!(last_heartbeat_ < raftcpp::Now())) return;
 
     Trace("S%d 自提: term %d -> %d (state=%s)", me_, current_term_, current_term_ + 1, StateName(state_));
     state_ = ServerState::kCandidate;
     current_term_++;
     voted_for_ = me_;
-    num_votes_ = 1;  // 自己投自己
+    num_votes_ = IsVoter(is_member_[me_]) ? 1 : 0;  // 自己是 voter 才算自己那票（被移除则 0）
+    // 记录"谁投的"而非只记票数：本轮投票态度清零，自己那票按当前身份记。
+    vote_granted_.assign(peers_.size(), 0);
+    if (IsVoter(is_member_[me_])) vote_granted_[me_] = 1;
     last_heartbeat_ = raftcpp::Now();
 
-    args.term = current_term_;
-    args.candidate_id = me_;
-    args.last_log_index = LastLogIndexLocked();
-    args.last_log_term = LastLogTermLocked();
-
     PersistLocked();
+    // 【修复】集群只剩 1 个 voter（quorum=1,自己那票就够）时,SendRequestVoteRPCs
+    // 不会发出任何 RPC,回包回调永远不来,就等不到判定触发,leader 永远选不出。
+    // 这里发票前主动判一次(与 BecomeLeaderIfQuorumLocked 注释 (b) 的意图一致)。
+    if (CountGrantedVotesLocked() >= QuorumSizeLocked()) {
+      BecomeLeaderIfQuorumLocked();
+    }
   }
 
   SendRequestVoteRPCs();
@@ -530,10 +585,31 @@ void Raft::StartRealElection() {
 // 只发送 RequestVote RPC,【不】修改 state_/current_term_/num_votes_(否则会重复自增 term)。
 void Raft::SendRequestVoteRPCs() {
   RequestVoteArgs args;
+  // 锁外决定收件人会有数据竞争（is_member_ 是 vector，配置变更时可能 reallocate）。
+  // 改为：在下面锁内把 voter 收件人下标收集到快照，锁外遍历快照发送。
+  std::vector<int> vote_targets;
   {
     std::lock_guard<std::mutex> lk(mu_);
+    // 这里不用再判断单voter的问题，即使在上面放锁期间又变为单voter，会再发一轮StartElection
     if (killed_.load()) return;
     if (state_ != ServerState::kCandidate) return;
+    // Q3 双保险：发真实投票 RPC 前再确认自己仍是 voter。
+    // StartRealElection 已在校验过一次（且 state_==kCandidate 本身就意味着刚通过该校验），
+    // 但二者不在同一把锁内：从 StartRealElection 解锁到本函数重新加锁之间，可能有成员变更
+    // 把自己降成非 voter。此时若仍发出 RequestVote，对端 HandleRequestVote 会据规则 2.5
+    // 拒票（不会出错），这里只是提前短路、让自身语义更清晰。
+    // 加 is_member_ 就绪守卫：避免重启瞬间 is_member_ 尚未恢复时被误判成非 voter 而发不出
+    // 票、选不出 leader（非 voter 本就不该候选，但守卫确保不会因“未就绪”而非预期返回）。
+    if (!is_member_.empty() && me_ < static_cast<int>(is_member_.size()) &&
+        !IsVoter(is_member_[me_])) {
+      return;
+    }
+    // 锁内快照收件人：避免锁外读 is_member_ 触发数据竞争 / stale 视图。
+    for (size_t ti = 0; ti < peers_.size(); ti++) {
+      if (static_cast<int>(ti) == me_) continue;
+      if (ti >= is_member_.size() || !IsVoter(is_member_[ti])) continue;
+      vote_targets.push_back(static_cast<int>(ti));
+    }
     args.term = current_term_;
     args.candidate_id = me_;
     args.last_log_index = LastLogIndexLocked();
@@ -541,11 +617,10 @@ void Raft::SendRequestVoteRPCs() {
   }
 
   std::shared_ptr<Raft> self = shared_from_this();
-  for (size_t i = 0; i < peers_.size(); i++) {
-    if (static_cast<int>(i) == me_) continue;
+  for (int i : vote_targets) {
     peers_[i]->CallAsyncTyped<RequestVoteArgs, RequestVoteReply>(
         "Raft.RequestVote", args,
-        [self, args](bool ok, const RequestVoteReply& reply) {
+        [self, args, i](bool ok, const RequestVoteReply& reply) {
           if (!ok) return;
 
           std::lock_guard<std::mutex> lk(self->mu_);
@@ -559,57 +634,114 @@ void Raft::SendRequestVoteRPCs() {
           }
 
           if (self->state_ == ServerState::kCandidate &&
-              args.term == self->current_term_ && reply.vote_granted) {
-            self->num_votes_++;
-            if (self->num_votes_ > static_cast<int>(self->peers_.size()) / 2) {
-              Trace("S%d 当选 leader term=%d lastIdx=%d", self->me_, self->current_term_, self->LastLogIndexLocked());
-              // 【CheckQuorum 硬化】新当选 leader 给足一个自查周期的宽限：
-              // 重置自查时钟，否则 last_quorum_check 还是很久前(当 follower/
-              // candidate 时)的旧值，下一轮 CheckQuorum 零宽限、follower 还没
-              // 回心跳 ack 就可能被误退位(不可靠网络/高负载下尤其 flaky)。
-              self->last_quorum_check_ = raftcpp::Now();
-              // 条件补 no-op(沿用原 415-423 逻辑,满足 Figure 8)；
-              // 同时定下"本 term 读安全下标"read_safe_commit_：
-              //   - 有未提交旧尾巴 → 补 no-op 在 LastLogIndex+1，读安全点就是这条 no-op；
-              //     必须等它提交、commit_index_ 抬到覆盖上任前已提交 entry，ReadIndex 才安全。
-              //   - 无未提交尾巴 → commit_index_ 已是准确值（选举约束保证含全部已提交
-              //     entry），立即可安全读。
-              if (self->LastLogIndexLocked() > self->commit_index_) {
-                Trace("S%d 当选补 no-op: term=%d idx=%d (commitIndex=%d, 有未提交旧尾巴)",
-                      self->me_, self->current_term_,
-                      self->LastLogIndexLocked() + 1, self->commit_index_);
-                self->logs_.push_back(
-                    LogEntry{self->current_term_,
-                             self->LastLogIndexLocked() + 1, Command("")});
-                self->PersistLocked();
-                // 读安全点 = 这条 no-op 自身的下标（push 之后 LastLogIndexLocked()
-                // 就是它），不是它再 +1 —— 否则 no-op 提交后 commit_index_ 永远差 1，
-                // ReadIndex 会永久返回 -1，所有读都 WrongLeader → 60s 挂死。
-                self->read_safe_commit_ = self->LastLogIndexLocked();
-              } else {
-                self->read_safe_commit_ = self->commit_index_;
-              }
-              int last = self->LastLogIndexLocked();
-              for (size_t k = 0; k < self->peers_.size(); k++) {
-                self->next_index_[k] = last + 1;
-                self->match_index_[k] = 0;
-              }
-              self->heartbeat_seq_++;
-              self->last_heartbeat_ = raftcpp::Now();
-              self->tick_cv_.notify_all();
-              self->replicator_cv_.notify_all();
-              // ⚠️ 最后再置 leader：read_safe_commit_ 已先定好，避免 ReadIndex 在
-              // 读安全点设好前误判 commit_index_ >= read_safe_commit_(旧值0) 而提前放行读。
-              // （整段都在 mu_ 锁内，ReadIndex 也取锁，所以不存在真正并发；此处仅为语义清晰。）
-              self->state_ = ServerState::kLeader;
-              // 新身份 / 新任期，重新数起：别把上一任的"连续失败记忆"带到新 leader 上
-              // （否则旧任期里断过的 follower 在新任期头一轮就被误判死，要等它首个 ok=true 才恢复）。
-              self->cq_consec_fail_.assign(self->peers_.size(), 0);
-            }
+              args.term == self->current_term_ && reply.vote_granted &&
+    IsVoter(self->is_member_[self->me_]) ) {
+            self->num_votes_++;  // 仅作调试计数；判定以下面同口径计票为准
+            // 记下这一票是谁投的；计票时按【当前】配置剔掉已移除 / learner 的票，
+            // 保证分子（赞成票）与分母（QuorumSizeLocked 只数 voter）同口径。
+            // 不用担心在发rpc包之前清零该数组，延迟rpc包误改全局状态，有term保护。
+            self->vote_granted_[i] = 1;
+            self->BecomeLeaderIfQuorumLocked();
           }
         },
         &cancel_rpcs_);
   }
+}
+
+// ===========================================================================
+// 当选判定 + 上任初始化（调用前必须持有 mu_）
+// ===========================================================================
+// 从 RequestVote 回包回调里抽出来，供两处复用：
+//   (a) 收到投票回包时；
+//   (b) StartRealElection 发完票之后【主动判一次】——
+//       否则当集群只剩 1 个 voter（quorum=1，自己那一票就够）时，永远等不到
+//       任何“授予”回包来触发判定，leader 永远选不出来。
+//       实证：⑰ TestStartRejectedForNonVoter 稳定 50% 失败
+//       （expected one leader, got none）：learner/removed 按正确语义拒投后，
+//        唯一 voter 自己那票再也等不到触发判定的回包。
+void Raft::BecomeLeaderIfQuorumLocked() {
+  if (state_ != ServerState::kCandidate) return;
+  // 与回包处一致：自己必须仍是 voter 才能上任（被移除 / learner 不得当 leader）
+  if (!IsVoter(is_member_[me_])) return;
+  if (CountGrantedVotesLocked() < QuorumSizeLocked()) return;
+    Trace("S%d 当选 leader term=%d lastIdx=%d", me_, current_term_, LastLogIndexLocked());
+    // 【CheckQuorum 硬化】新当选 leader 给足一个自查周期的宽限：
+    // 重置自查时钟，否则 last_quorum_check 还是很久前(当 follower/
+    // candidate 时)的旧值，下一轮 CheckQuorum 零宽限、follower 还没
+    // 回心跳 ack 就可能被误退位(不可靠网络/高负载下尤其 flaky)。
+    last_quorum_check_ = raftcpp::Now();
+    // 条件补 no-op(沿用原 415-423 逻辑,满足 Figure 8)；
+    // 同时定下"本 term 读安全下标"read_safe_commit_：
+    //   - 有未提交旧尾巴 → 补 no-op 在 LastLogIndex+1，读安全点就是这条 no-op；
+    //     必须等它提交、commit_index_ 抬到覆盖上任前已提交 entry，ReadIndex 才安全。
+    //   - 无未提交尾巴 → commit_index_ 已是准确值（选举约束保证含全部已提交
+    //     entry），立即可安全读。
+    if (LastLogIndexLocked() > commit_index_) {
+      Trace("S%d 当选补 no-op: term=%d idx=%d (commitIndex=%d, 有未提交旧尾巴)",
+            me_, current_term_,
+            LastLogIndexLocked() + 1, commit_index_);
+      logs_.push_back(
+          LogEntry{current_term_,
+                   LastLogIndexLocked() + 1, Command("")});
+      PersistLocked();
+      // 读安全点 = 这条 no-op 自身的下标（push 之后 LastLogIndexLocked()
+      // 就是它），不是它再 +1 —— 否则 no-op 提交后 commit_index_ 永远差 1，
+      // ReadIndex 会永久返回 -1，所有读都 WrongLeader → 60s 挂死。
+      read_safe_commit_ = LastLogIndexLocked();
+    } else {
+      read_safe_commit_ = commit_index_;
+    }
+    int last = LastLogIndexLocked();
+    for (size_t k = 0; k < peers_.size(); k++) {
+      next_index_[k] = last + 1;
+      match_index_[k] = 0;
+    }
+    heartbeat_seq_++;
+    last_heartbeat_ = raftcpp::Now();
+    tick_cv_.notify_all();
+    replicator_cv_.notify_all();
+    // ⚠️ 最后再置 leader：read_safe_commit_ 已先定好，避免 ReadIndex 在
+    // 读安全点设好前误判 commit_index_ >= read_safe_commit_(旧值0) 而提前放行读。
+    // （整段都在 mu_ 锁内，ReadIndex 也取锁，所以不存在真正并发；此处仅为语义清晰。）
+    state_ = ServerState::kLeader;
+    // 新当选：作废任何残留的"待退位"意图——它属于上一任的身份结论，带过来会让
+    // 一个刚当选的合法 leader 拒收写/拒接读、并在宽限到点后无故自我退位。
+    // 当前所有调用路径上都已由 ConvertToFollowerLocked 清过，此处属防御性兜底。
+    pending_stepdown_ = false;
+    // 新身份 / 新任期，重新数起：别把上一任的"连续失败记忆"带到新 leader 上
+    // （否则旧任期里断过的 follower 在新任期头一轮就被误判死，要等它首个 ok=true 才恢复）。
+    cq_consec_fail_.assign(peers_.size(), 0);
+    // 上任扫描：重建"在途成员变更"状态（崩溃/切主恢复后保持一致）。
+    // 一次只允许一个变更在飞行，取最后一个未提交（index > commit_index_）的 conf 条目。
+    pending_conf_index_ = 0;
+    for (int ci = commit_index_ + 1;
+         ci <= LastLogIndexLocked(); ci++) {
+      size_t cpos = static_cast<size_t>(ci - snapshot_index_);
+      if (cpos < logs_.size() && logs_[cpos].is_conf) {
+        pending_conf_index_ = ci;
+      }
+    }
+    // 【Q2 冻结点重建】removed_at_index_ 是每个节点各自的本地状态
+    // （默认 -1），不会随日志/选举传递。若不重建，本节点刚当选 leader
+    // 时它对"谁已被移除、冻结在哪一条"一无所知：在 ApplyLoop 走到那条
+    // conf 条目之前 is_member_[sv] 仍是 kVoter，ReplicateLoop 就会继续
+    // 给已移除节点复制新日志 → Q2 冻结失效。
+    // 实证：㉓ TestRemovedNodeStopsReceivingReplication 偶发失败
+    // （removed 节点日志 11 -> 12/13），换主越频繁命中率越高。
+    // 上任时扫一遍日志里的 conf 条目即可恢复正确冻结下标。
+    removed_at_index_.assign(peers_.size(), -1);
+    for (const LogEntry& ce : logs_) {
+      if (!ce.is_conf) continue;
+      int sv = ce.conf_server;
+      if (sv < 0 ||
+          sv >= static_cast<int>(removed_at_index_.size()))
+        continue;
+      MemberRole role = static_cast<MemberRole>(ce.conf_role);
+      // 取最后一条针对该节点的配置决定：移除→记下冻结下标，
+      // 加回 / 降级 learner→清除冻结（它重新参与复制）。
+      removed_at_index_[sv] =
+          (role == MemberRole::kRemoved) ? ce.index : -1;
+    }
 }
 
 // ===========================================================================
@@ -630,6 +762,33 @@ void Raft::RequestVote(const RequestVoteArgs& args, RequestVoteReply& reply) {
   if (args.term > current_term_) {
     ConvertToFollowerLocked(args.term);
     reply.term = current_term_;
+  }
+
+  // 规则 2.5：候选人已不在当前 voter 集合（被成员变更移除）→ 拒绝投票。
+  // 否则被移除节点仍能靠"自己一票 + 别人一票"凑出多数派当上 leader，破坏安全性。
+  if (args.candidate_id < 0 ||
+      args.candidate_id >= static_cast<int>(is_member_.size()) ||
+      !IsVoter(is_member_[args.candidate_id])) {
+    return;
+  }
+
+  // 规则 2.6：【我自己】已被移除（kRemoved）→ 不投票。
+  // 少了这条，被移除节点会持续投出幽灵票：例如 3 节点移除一个、再断开
+  // 另一个真实 voter，在线真实 voter 只剩 1 个 < quorum(2)，却仍能靠被
+  // 移除节点那张票凑够 quorum 选出 leader（RemovedNodeExcludedFromQuorum）。
+  //
+  // ⚠️ 这里【只】禁 removed，不禁 learner：
+  //   · learner 仍在配置内、仍需复制日志；它那张票会被计票方
+  //     CountGrantedVotes（只数 voter）自然过滤掉，不会成幽灵票；
+  //   · 若连 learner 也禁，则「把唯一 follower 降级成 learner」后集群
+  //     只剩 1 个 voter 且再也收不到任何授予回包，leader 永远选不出来
+  //     （⑰ TestStartRejectedForNonVoter：expected one leader, got none）。
+  // 少了这条，被移除节点会持续投出"幽灵票"：例如 3 节点移除一个、再断开另一个
+  // 真实 voter，在线真实 voter 只剩 1 个 < quorum(2)，却仍能靠被移除节点那张票
+  // 凑够 quorum 选出 leader —— TestRemovedNodeExcludedFromQuorum 要防的正是这个。
+  if (is_member_.empty() || me_ >= static_cast<int>(is_member_.size()) ||
+      is_member_[me_] == MemberRole::kRemoved) {
+    return;
   }
 
   // 规则 3：同一任期只能投一票（但可以重复投给同一个候选人）
@@ -660,6 +819,24 @@ void Raft::RequestPreVote(const RequestPreVoteArgs& args,
   reply.term = current_term_;
   reply.vote_granted = false;
   if (killed_.load()) return;
+
+  // 规则 2.5：候选人已不在当前 voter 集合（被成员变更移除）→ 拒绝投票。
+  // 否则被移除节点仍能靠"自己一票 + 别人一票"凑出多数派当上 leader，破坏安全性。
+  // 回包时 follower 不再是 voter，这票照样算数，因为：(1) 票在授予时刻就合法且占死；(2) 它只占选举、不占提交；(3) 回包复查反而致死锁
+  if (args.candidate_id < 0 ||
+      args.candidate_id >= static_cast<int>(is_member_.size()) ||
+      !IsVoter(is_member_[args.candidate_id])) {
+    return;
+  }
+
+  // 规则 2.6（与 RequestVote 对称）：【我自己】已被移除 → 连预投票都不给。
+  // 同样只禁 removed、不禁 learner（理由同 RequestVote）。
+  // 否则被移除节点会投出幽灵票，在预投票阶段就把少数派选民"抬"过 quorum 门槛，
+  // 进而触发本不该发生的真实选举。
+  if (is_member_.empty() || me_ >= static_cast<int>(is_member_.size()) ||
+      is_member_[me_] == MemberRole::kRemoved) {
+    return;
+  }
 
   // ===== 与 RequestVote 的唯一区别:本函数【绝不】改变任何持久/任期状态 =====
   // - 即使 args.term < current_term_ 也不退位、不拒绝(探测是 probe,放行才能夺回领导)
@@ -782,7 +959,10 @@ StartResult Raft::Start(const Command& command) {
 
   StartResult result;
   result.term = current_term_;
-  if (killed_.load() || state_ != ServerState::kLeader) return result;
+  // 事件驱动退位宽限期内，本节点虽仍是 leader 但已被移除/降级出 voter，
+  // 不得再接受客户端写（否则会把后置数据写进自己日志，破坏 Q2 冻结/静默）。
+  if (killed_.load() || state_ != ServerState::kLeader || pending_stepdown_)
+    return result;
 
   int index = LastLogIndexLocked() + 1;
   logs_.push_back(LogEntry{current_term_, index, command});
@@ -798,6 +978,13 @@ StartResult Raft::Start(const Command& command) {
   replicator_cv_.notify_all();
   return result;
 }
+
+// 退位宽限（ms）：ApplyLoop 检测到本节点被移除/降级出 voter 时只置 pending_stepdown_
+// 标志并继续当 leader；ReplicateLoop 在多发 kStepdownGraceMs 心跳（把 leader_commit
+// 含移除配置带出去）之后才真正退位。kHeartbeatInterval=50ms，故 200ms ≈ 4 轮，足以让
+// 所有 voter 收到新 commitIndex 并 apply 配置、按新 quorum 选出新 leader。
+// 事件驱动、零阻塞、无额外 RPC、无人工预算 —— 取代原版"同步广播 + 锁外等 ack"的脆性设计。
+static constexpr int kStepdownGraceMs = 200;
 
 void Raft::ReplicateLoop(int server) {
   const size_t s = static_cast<size_t>(server);
@@ -839,6 +1026,15 @@ void Raft::ReplicateLoop(int server) {
       replicator_cv_.wait_for(lk, remain, [this, s] {
         if (killed_.load()) return true;
         if (state_ != ServerState::kLeader) return false;
+        // 只冻结【已移除】节点（Q2 隐私加固），不冻结 learner：
+        // learner 仍在集群内、必须及时收到日志才能追上，不能与 removed 混同抑制。
+        // 判据用 IsRemovedFrozen 而非 !IsVoter —— 后者会把 learner（该收日志）
+        // 和 removed（不该收新数据）混为一谈；前者还额外覆盖【提案移除 -> apply】
+        // 窗口（此间 is_member_[s] 仍是 kVoter，但 removed_at_index_ 已置位）。
+        if (IsRemovedFrozen(is_member_, removed_at_index_,
+                            static_cast<int>(s))) {
+          return false;
+        }
         if (raftcpp::Now() < last_send_time_[s] +
                                  std::chrono::milliseconds(kMinSendIntervalMs)) {
           return false;  // 节流中
@@ -854,12 +1050,60 @@ void Raft::ReplicateLoop(int server) {
       if (killed_.load()) return;
       if (state_ != ServerState::kLeader) continue;
 
+      // 事件驱动退位：ApplyLoop 已置 pending_stepdown_，且已过宽限期
+      // （期间普通心跳已将 leader_commit 含移除配置带出去）→ 真正退位。
+      // 多个 ReplicateLoop 线程可能同时进入此分支，故用 state_==kLeader 守卫，
+      // 只有第一个真正退位，其余看到已非 leader 自动跳过。
+      if (pending_stepdown_ && state_ == ServerState::kLeader &&
+          raftcpp::Now() >= stepdown_after_) {
+        // 退位前【复查身份】：宽限期内可能又 apply 了"把本节点加回 voter"的配置
+        // 条目（连续两次变更：先降级、再加回）。此时它已是合法 voter leader，不该
+        // 再退位——否则白白丢掉领导权、平白多一次选举。反之则撤销退位意图。
+        if (!IsVoter(is_member_[me_])) {
+          ConvertToFollowerLocked(current_term_);
+        } else {
+          pending_stepdown_ = false;
+        }
+        continue;
+      }
+
+      // ===== Q2 隐私加固：removed 节点只接收"移除它自己的那条配置条目"为止 =====
+      // 必须先让 removed 节点收到自己的移除条目，它才知道自己被移除；否则会卡在
+      // kVoter 永远收不到移除 → 集群成员视图分叉。removed_at_index_[s] 即该"冻结点"
+      // 下标（提案时 ProposeConfChangeTo 写入，apply 时 ApplyLoop 再写一次）。
+      // cap < 0（如刚重启尚未重建）则日志/快照全部不发（removed 节点本就从日志
+      // 重放拿到过移除条目，不依赖 leader 补发）。
+      //
+      // ⚠️ 冻结判据必须【两源取或】，不能只用一个：
+      //   (a) removed_at_index_[s] >= 0（冻结点）：覆盖【提案 → apply】这段窗口，
+      //       此间 is_member_[s] 仍是 kVoter。只用 is_member_ 判 → cap 形同虚设，
+      //       leader 会继续把 conf 之后的新条目（如 index 12/13）复制给待移除节点。
+      //       实证：㉓ TestRemovedNodeStopsReceivingReplication 偶发失败（11 -> 12/13），
+      //       换主/提案越频繁命中率越高（golden 实测 ~40%，换此法后降到 0）。
+      //   (b) is_member_[s] == kRemoved（配置视图）：覆盖【经 InstallSnapshot 恢复配置】
+      //       的场景——快照会把 conf 条目一并截断，新 leader 上任扫描 logs_ 扫不到那条
+      //       conf，removed_at_index_ 重建不出来（仍是 -1）。若只看 (a)，本节点明明已
+      //       从快照里读到 is_member_[s]==kRemoved，却仍继续给它发新数据 → 隐私泄漏。
+      // 两者任一为真即冻结，见 raft.h 的 IsRemovedFrozen。
+      bool removed = IsRemovedFrozen(is_member_, removed_at_index_,
+                                     static_cast<int>(s));
+      int removed_cap =
+          (s < removed_at_index_.size()) ? removed_at_index_[s] : -1;
+
       bool has_more = next_index_[s] <= LastLogIndexLocked();
       bool may_send_log = has_more &&
                           (!inflight_log_[s] ||
                            raftcpp::Now() - inflight_log_time_[s] >
                                std::chrono::milliseconds(kLogRetryMs));
+      if (removed) {
+        // 超过冻结点（含移除条目本身）的日志一律不发；cap<0 则连移除条目都不补发（冻结）
+        if (removed_cap < 0 || next_index_[s] > removed_cap) may_send_log = false;
+      }
       bool heartbeat_due = heartbeat_seq_ != last_heartbeat_seq_[s];
+      // 注意：removed 节点【允许心跳】。心跳只带 leader_commit（一个下标，不含任何
+      // 客户端数据），不泄漏隐私；但 removed 节点需要靠心跳推进自己的 commit_index_，
+      // 才能 apply 到"把它自己移除"的那条配置条目。日志/快照仍受上方 cap 与 !removed
+      // 闸门严格限制，新客户端数据绝不会发给它。
       if (!may_send_log && !heartbeat_due) continue;
 
       last_heartbeat_seq_[s] = heartbeat_seq_;
@@ -871,20 +1115,33 @@ void Raft::ReplicateLoop(int server) {
       // 该 follower 落后到快照点之前 → 改发 InstallSnapshot 而非 AppendEntries。
       // 必须放在计算 prev_log_index/term 之前：否则 next-1 可能落在快照区间，
       // logs_[next-1] 会越界（截断后 logs_ 里没有那些下标）。
-      if (next <= snapshot_index_) {
+      // Q2：removed 节点绝不发快照（快照携带完整 KV 数据 → 隐私泄漏，且会越过冻结点），
+      // 即使落后也强制走 AppendEntries 分支（只发到冻结点为止）。
+      if (next <= snapshot_index_ && !removed) {
         snap_args.term = current_term_;
         snap_args.leader_id = me_;
         snap_args.last_included_index = snapshot_index_;
         snap_args.last_included_term = snapshot_term_;
         snap_args.data = snapshot_data_;
+        // 把当前成员配置随快照一起发给落后 follower（见 InstallSnapshot 处重建）。
+        snap_args.members.clear();
+        for (MemberRole r : is_member_) snap_args.members.push_back(static_cast<int>(r));
         send_snap = true;
       } else {
         args.term = current_term_;
         args.leader_id = me_;
         args.leader_commit = commit_index_;
         args.prev_log_index = next - 1;
-        args.prev_log_term =
-            logs_[static_cast<size_t>(next) - 1 - snapshot_index_].term;
+        // prev_log_term 安全计算：removed 节点可能落后到快照点之前（leader 已压缩
+        // 过它的冻结点之前的下标），直接按下标取会越界 → 用快照 term 兜底。
+        if (next - 1 < snapshot_index_) {
+          args.prev_log_term = snapshot_term_;
+        } else {
+          size_t pos = static_cast<size_t>(next) - 1 - snapshot_index_;
+          args.prev_log_term = (pos < logs_.size())
+                                   ? logs_[pos].term
+                                   : snapshot_term_;
+        }
         args.entries.clear();
 
         if (may_send_log) {
@@ -892,6 +1149,9 @@ void Raft::ReplicateLoop(int server) {
           // 出了锁，别的线程（AppendEntries handler / Start）会改 logs_，
           // 拿着引用去序列化就是数据竞争 —— TSAN 一定会报。
           int last = LastLogIndexLocked();
+          // Q2：removed 节点最多发到冻结点（含移除条目），绝不越过泄漏新客户端数据。
+          if (removed && removed_cap >= 0 && last > removed_cap)
+            last = removed_cap;
           for (int i = next; i <= last; i++) {
             args.entries.push_back(
                 logs_[static_cast<size_t>(i) - snapshot_index_]);
@@ -990,6 +1250,7 @@ void Raft::ReplicateLoop(int server) {
             self->next_index_[s] = self->match_index_[s] + 1;
             // Leader Lease：只要多数派在最近一个选举超时窗口内确认过我，
             // 就把租约往后推。租约 = "我确信这段时间里没人能选出新 leader"。
+            // 续租依赖近实时 ack：CountRecentAcksLocked 数的是 last_ack_time_ 在 kElectionTimeoutMin 内刷新的 voter；不可靠网回包延迟会让它过于保守→租约建不起来→退化慢路径（安全取舍，非 bug）。
             if (self->CountRecentAcksLocked(kElectionTimeoutMin) >
                 self->MemberCountLocked() / 2) {
               self->lease_expire_ =
@@ -1001,8 +1262,12 @@ void Raft::ReplicateLoop(int server) {
             // 少了 `logs_[N].term == current_term_` 这个判断，
             // TestFigure82C 必挂。
             std::vector<int> matched;
-            matched.reserve(self->peers_.size());
+            matched.reserve(self->MemberCountLocked());
             for (size_t i = 0; i < self->peers_.size(); i++) {
+              if (i >= self->is_member_.size() ||
+                  !IsVoter(self->is_member_[i])) {
+                continue;  // 非投票成员不参与提交计票
+              }
               if (static_cast<int>(i) == self->me_) {
                 matched.push_back(self->LastLogIndexLocked());
               } else {
@@ -1010,7 +1275,19 @@ void Raft::ReplicateLoop(int server) {
               }
             }
             std::sort(matched.begin(), matched.end());
-            int n = matched[matched.size() / 2];
+            // ⚠️ 坑：不能简单取 matched[size/2]！
+            // 升序排序后，要让"第 k 小"恰好有 quorum 个元素 ≥ 它，
+            // 下标必须是 size - quorum（不是 size/2）。
+            //   voter=3 quorum=2：size/2=1，size-quorum=1 → 一致（奇数都对）
+            //   voter=4 quorum=3：size/2=2（只要 2 票！）  size-quorum=1（要 3 票）✅
+            //   voter=6 quorum=4：size/2=3（只要 3 票）    size-quorum=2（要 4 票）✅
+            // 也就是说：voter 数为偶数时，size/2 会悄悄少算一票，
+            // 4 节点集群会退化成"2 票即可提交"，安全性直接破防。
+            // （奇数规模下两者恒等，所以现有的 3/5 节点测试永远抓不到它。）
+            if (matched.empty()) return;
+            const size_t quorum =
+                static_cast<size_t>(self->QuorumSizeLocked());
+            int n = matched[matched.size() - quorum];
             if (n > self->commit_index_ && n >= 0) {
               size_t pos = static_cast<size_t>(n) - self->snapshot_index_;
               bool term_ok = (pos < self->logs_.size() &&
@@ -1074,10 +1351,60 @@ void Raft::ApplyLoop() {
           size_t pos = static_cast<size_t>(idx - snapshot_index_);
           if (pos < logs_.size()) {
             last_applied_ = idx;
-            msg.command_valid = true;
-            msg.command = logs_[pos].command;
-            msg.command_index = idx;
-            has_msg = true;
+            if (logs_[pos].is_conf) {
+              // ---- 成员变更条目：apply 时才切换本地配置（不是收到就切）----
+              int sv = logs_[pos].conf_server;
+              // 目标角色三态：kRemoved / kLearner / kVoter（原来是 bool，塞不下 learner）
+              MemberRole target = static_cast<MemberRole>(logs_[pos].conf_role);
+              if (sv >= 0 && sv < static_cast<int>(is_member_.size())) {
+                is_member_[sv] = target;
+                // Q2 隐私加固：记下"节点 sv 被移除时的配置条目下标"作为复制冻结点。
+                // 之后 leader 向 sv 复制日志最多到 idx（含本条移除条目），保证 sv 先
+                // 收到自己的移除条目、知道被移除，再彻底冻结（不再收任何新数据）。
+                // 非 kRemoved（加回 voter / 降级 learner）→ 清除冻结，恢复向它复制。
+                removed_at_index_[sv] =
+                    (target == MemberRole::kRemoved) ? idx : -1;
+              }
+              // 本变更已 apply → 清除在途标记（允许下一个变更）
+              if (logs_[pos].index == pending_conf_index_) {
+                pending_conf_index_ = 0;
+              }
+              PersistLocked();  // 配置变更也要落盘，重启能恢复
+              // 本节点已不是 voter（被移除、或降级成 learner）且是 leader → 主动退位。
+              // learner 不投票也不该当 leader，所以判据用 !IsVoter 而不是只判 kRemoved。
+              if (!IsVoter(is_member_[me_]) &&
+                  state_ == ServerState::kLeader) {
+                // 事件驱动退位：不在 applier 线程里阻塞等 ack。置标志后继续当
+                // leader，让 ReplicateLoop 把 leader_commit（含本移除配置）通过普通
+                // 心跳带出去；宽限 kStepdownGraceMs 后由 ReplicateLoop 真正退位。
+                // 这样剩余 voter 必能拿到新 commitIndex → apply 配置 → 按新 quorum
+                // 选新 leader，根除"旧 quorum 缺我这一票"的死锁，且无阻塞/无额外 RPC。
+                pending_stepdown_ = true;
+                stepdown_after_ =
+                    raftcpp::Now() + std::chrono::milliseconds(kStepdownGraceMs);
+              }
+              tick_cv_.notify_all();
+              replicator_cv_.notify_all();
+              // ⚠️ 配置条目【也要】作为一条命令派发给状态机/harness。
+              // 原因：harness 的 apply 顺序检查要求每个 index 都被记录；
+              // 若 has_msg=false 直接丢弃，conf 占据的 index 会留下空洞，
+              // 下一条真实命令会被误报 "apply out of order"。
+              // 载荷用哨兵字符串，应用层（KV）按需忽略即可；配置条目本身
+              // 已由上面这段逻辑在 raft 层内部消费（切换 is_member_），
+              // 不会被当成客户端写命令执行。
+              msg.command_valid = true;
+              msg.command = "CONF:" + std::to_string(sv) + ":" +
+                            (target == MemberRole::kVoter     ? "V"
+                             : target == MemberRole::kLearner ? "L"
+                                                              : "R");
+              msg.command_index = idx;
+              has_msg = true;
+            } else {
+              msg.command_valid = true;
+              msg.command = logs_[pos].command;
+              msg.command_index = idx;
+              has_msg = true;
+            }
           }
           // else：该 idx 尚未复制到本节点，等下一轮
         }
@@ -1301,6 +1628,19 @@ void Raft::InstallSnapshot(const InstallSnapshotArgs& args,
     snapshot_index_ = args.last_included_index;
     snapshot_term_ = args.last_included_term;
     snapshot_data_ = args.data;
+    // 成员配置随快照一起恢复：落后 follower 装快照时本地 logs_ 可能已不含覆盖
+    // 区间内的 conf 条目（被截断），必须用 leader 在快照点处的角色数组重建，
+    // 否则 is_member_ 与 leader 不一致 → 多数派判定错位 → 安全性崩塌。
+    if (static_cast<int>(args.members.size()) == static_cast<int>(peers_.size())) {
+      is_member_.clear();     // 清空元素，不会释放分配的capacity的内存区
+      is_member_.reserve(args.members.size());   // 如果size小于上条的capacity，不会缩容
+      for (int m : args.members) {
+        is_member_.push_back(static_cast<MemberRole>(m));
+      }
+      if (!IsVoter(is_member_[me_]) && state_ == ServerState::kLeader) {
+        ConvertToFollowerLocked(current_term_);
+      }
+    }
     // 注意：blob 已在阶段 1 于锁外落盘，PersistLocked() 只写 raft state。
 
     // 截断 logs_：哨兵重建（index 对齐到快照点）；args.last_included_index+1 之后
@@ -1356,27 +1696,115 @@ bool Raft::CondInstallSnapshot(int index, int term,
                                const std::string& snapshot) {
   (void)snapshot;
   std::lock_guard<std::mutex> lk(mu_);
-  // 单相设计后，本函数【只做"是否已接受过这个 snap"的查询】——所有 raft state
+  // 单相设计后，本函数【只做"这个快照还能不能装"的查询】——所有 raft state
   // 修改已经在 InstallSnapshot 内完成（截断 + 推进 + 持久化）。
   //
-  // 返回 true：raft 当前快照元数据正好匹配 (index, term)，
-  //           KVServer 可以安全 ApplySnapshotLocked 重置 KV state。
-  // 返回 false：边界场景——
-  //   1) stale snap（已被更新覆盖）→ KV state 已是更新的，不要回退
-  //   2) 极小概率：InstallSnapshot 单相修改后 last_applied_ > index，意味着
-  //      leader 在装 snap 后又发了一批新 entries 已经 apply；KVServer 应让
-  //      ApplyLoop 派的 logs 来追平，不能用更旧的 snap 覆盖更新的 KV state。
+  // 唯一判据：(index, term) 必须等于 raft【当前】的快照元数据。
+  //   · 相等 → 这就是本节点刚装的那个快照，状态机应当安装它；
+  //   · 不等 → raft 已经装了别的（更新的）快照，这条消息已过时，装它会回退状态机。
+  //
+  // ⚠️ 这里【不要】用 last_applied_ 判旧（历史上曾有 `last_applied_ > index → false`）。
+  // 原因：本实现里 last_applied_ 的语义是「raft 已派发到 apply_ch_ 的位置」，而不是
+  // 「状态机已经应用到哪」——ApplyLoop 派发快照消息后会【立刻继续】派发 N+1、N+2…，
+  // 而状态机在另一个线程【异步】消费。于是正常时序下就会出现
+  //     last_applied_ = N+k  >  index = N
+  // 该判据被误命中 → 状态机拒绝安装快照 → 快照覆盖区间 [1..N] 在状态机里留下空洞
+  // → 下一条命令 apply N+k+1 时前一条不在 → harness 报 "apply out of order"
+  //   （偶发失败 TestReadIndexSnapshotUnreliable 的根因，自然失败率 <1/40）。
+  //
+  // 而它想防的"用旧快照覆盖更新的状态机"其实【不会发生】：apply_ch_ 是 FIFO，
+  // 快照消息恒排在它之后的 entries 之前被状态机处理；且 pending_snapshot_ 只保留
+  // 最新快照（InstallSnapshot 内比较 snapshot_index 后覆盖），不会派发更旧的快照。
+  // 所以这条判据既会误伤、又是冗余的 —— 已删除。
   if (index != snapshot_index_ || term != snapshot_term_) {
     Trace("S%d CondInstallSnapshot idx=%d term=%d → false (raft snap_idx=%d snap_term=%d last_applied=%d)",
           me_, index, term, snapshot_index_, snapshot_term_, last_applied_);
     return false;
   }
-  if (last_applied_ > index) {
-    Trace("S%d CondInstallSnapshot idx=%d → false (stale: last_applied=%d)", me_, index, last_applied_);
-    return false;
-  }
   Trace("S%d CondInstallSnapshot idx=%d term=%d → true", me_, index, term);
   return true;
+}
+
+std::vector<int> Raft::MembershipView() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  std::vector<int> v;
+  v.reserve(is_member_.size());
+  for (MemberRole r : is_member_) v.push_back(static_cast<int>(r));
+  return v;
+}
+
+int Raft::QuorumSize() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return QuorumSizeLocked();
+}
+
+int Raft::LastLogIndex() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return LastLogIndexLocked();
+}
+
+// 两态便捷入口：add=true → kVoter；add=false → kRemoved。
+// 想设成 kLearner 请用下面的 ProposeConfChangeTo(server, MemberRole::kLearner)。
+StartResult Raft::ProposeConfChange(int server, bool add) {
+  return ProposeConfChangeTo(server, add ? MemberRole::kVoter
+                                         : MemberRole::kRemoved);
+}
+
+// 三态入口：把 server 设为指定角色（kRemoved / kLearner / kVoter）。
+// 内部追加一条 conf 配置条目，与普通命令走同一条"复制 → 提交 → apply"路径；
+// 节点在【apply 到该条目时】才真正切换本地 is_member_（不是收到就切），
+// 保证所有节点按相同顺序、在同一逻辑时刻切换。
+StartResult Raft::ProposeConfChangeTo(int server, MemberRole target) {
+  std::lock_guard<std::mutex> lk(mu_);
+  StartResult res;
+  res.term = current_term_;
+  res.is_leader = (state_ == ServerState::kLeader);
+  if (!res.is_leader) return res;
+  // 与 Start() 对称：事件驱动退位宽限期内，本节点虽仍是 leader 但已被移除/降级出
+  // voter，不得再发起新的成员变更。否则会由"非 voter 的 leader"驱动配置变更——
+  // 由于 AppendEntries 只校验 term、不校验 sender 是否 voter，该变更仍可能被多数派
+  // 接受并提交，等于让无权节点改写配置。
+  // 注意：res.is_leader 上面已按 state_ 置为 true，这里必须显式改回 false，
+  // 让调用方能像 Start() 那样用 is_leader 判定"是否被接受"，而不是去猜 index==0。
+  if (pending_stepdown_) {
+    res.is_leader = false;
+    return res;
+  }
+  // 单飞保护：已有未提交的成员变更在途，拒绝新的（文档 §2.4 运维纪律）。
+  if (pending_conf_index_ != 0) return res;
+  if (server < 0 || server >= static_cast<int>(is_member_.size())) return res;
+  // 角色合法性：只接受三态之一，防止 conf_role 被塞进野值。
+  if (target != MemberRole::kRemoved && target != MemberRole::kLearner &&
+      target != MemberRole::kVoter) {
+    return res;
+  }
+  // 安全阀：变更后的配置必须至少保留一个 voter，否则集群再也无法选出 leader（quorum=0）。
+  // 危险情形：server 当前是 kVoter，却要被设为 kRemoved / kLearner（移除或降级最后一个 voter），
+  // 且当前只剩这一个 voter —— 必须拒绝。is_member_ 此刻是【已提交】配置（变更只在 apply 时切换），
+  // MemberCountLocked() 取的是同一把锁内快照，与真正 apply 后的计数口径一致。
+  if (IsVoter(is_member_[server]) && !IsVoter(target) && MemberCountLocked() <= 1) {
+    return res;  // 会变成 0 voter 配置，拒绝（res.index 保持 -1 = StartResult 默认，未接受）
+  }
+  // 追加一条 conf 配置条目（与普通命令走同一复制/提交/apply 路径）。
+  LogEntry e;
+  e.term = current_term_;
+  e.index = LastLogIndexLocked() + 1;
+  e.is_conf = true;                        // 标记：这是"成员变更条目"
+  e.conf_server = server;                  // 改谁（比如节点2）
+  e.conf_role = static_cast<int>(target);  // 改成什么角色（三态）
+  // Q2 隐私加固：在【提案此刻】就记下"server 被移除时的配置条目下标"作为复制冻结点。
+  // 必须早于 conf 提交/apply：否则 ReplicateLoop 可能在 cap 设置前就把 conf 之后的
+  // 新客户端条目（index > e.index）拷进发送缓冲并发给 server，造成"removed 节点多收
+  // 数据"的竞态。提案时下标 e.index 已知，且本函数持 mu_，ReplicateLoop 持锁拷贝
+  // 条目时必能看到该 cap。ApplyLoop apply 时还会再设一次（覆盖 follower / 重启重放）。
+  // 非 kRemoved（加回 voter / 降级 learner）→ 清除冻结，否则加回后仍被误冻结。
+  removed_at_index_[server] = (target == MemberRole::kRemoved) ? e.index : -1;
+  logs_.push_back(std::move(e));
+  pending_conf_index_ = e.index;           // 记下"这条在飞行"，单飞保护
+  PersistLocked();
+  replicator_cv_.notify_all();
+  res.index = pending_conf_index_;
+  return res;
 }
 
 // ===========================================================================
@@ -1389,8 +1817,13 @@ void Raft::PersistLocked() {
   e.Int(snapshot_index_).Int(snapshot_term_);  // 快照元数据也要随状态恢复
   e.Int(static_cast<int>(logs_.size()));
   for (const LogEntry& en : logs_) {
-    e.Int(en.term).Int(en.index).Bytes(en.command);
+    e.Int(en.term).Int(en.index).Bytes(en.command)
+    .Bool(en.is_conf).Int(en.conf_server).Int(en.conf_role);
   }
+  // 持久化当前成员配置（与日志一起落盘，重启能恢复）。
+  e.Int(static_cast<int>(is_member_.size()));
+  for (MemberRole r : is_member_) e.Int(static_cast<int>(r));
+  e.Int(pending_conf_index_);
 
   // ⚠️ 这里【只写 raft state】，不再写 snapshot blob。
   // blob 已由 SaveSnapshotBlob() 在锁外单独落盘（阶段 1）。
@@ -1413,7 +1846,9 @@ void Raft::ReadPersist(const std::string& data) {
   logs.reserve(static_cast<size_t>(n));
   for (int i = 0; i < n; i++) {
     LogEntry en;
-    if (!(d.Int(en.term) && d.Int(en.index) && d.Bytes(en.command))) return;
+    if (!(d.Int(en.term) && d.Int(en.index) && d.Bytes(en.command) &&
+          d.Bool(en.is_conf) && d.Int(en.conf_server) && d.Int(en.conf_role)))
+      return;
     logs.push_back(std::move(en));
   }
 
@@ -1482,7 +1917,27 @@ void Raft::ReadPersist(const std::string& data) {
     }
   }
   logs_ = std::move(logs);
-
+  // 恢复成员配置（与 state 一起落盘）。peer 数与磁盘不符时退化为全 voter（安全默认）。
+  {
+    int nm = 0;
+    if (!d.Int(nm)) return;
+    std::vector<MemberRole> restored;
+    restored.reserve(nm > 0 ? static_cast<size_t>(nm) : 0);
+    bool ok = (nm == static_cast<int>(peers_.size()));
+    for (int i = 0; i < nm; i++) {
+      int rv = 0;
+      if (!d.Int(rv)) return;
+      if (ok) restored.push_back(static_cast<MemberRole>(rv));
+    }
+    if (ok) {
+      is_member_ = std::move(restored);
+    } else {
+      is_member_.assign(peers_.size(), MemberRole::kVoter);
+    }
+    int pc = 0;
+    if (!d.Int(pc)) return;
+    pending_conf_index_ = pc;
+  }
   // 现在才是真正的"消费完整字节流"边界
   // 注：原代码在上方赋值后又用 snapshot_index_ 重复赋了一次 commit_index_/last_applied_，
   // 二者等价（snapshot_index_ == snap_idx），属冗余，已删除。
@@ -1491,10 +1946,39 @@ void Raft::ReadPersist(const std::string& data) {
 
 int Raft::MemberCountLocked() const {
   int c = 0;
-  for (bool m : is_member_) {
-    if (m) c++;
+  for (MemberRole m : is_member_) {
+    if (IsVoter(m)) c++;
   }
   return c;
+}
+
+// ===========================================================================
+// 选举计票（纯函数）
+// ===========================================================================
+// 只数"当前仍是 voter"的赞成票，与 QuorumSizeLocked()（只数 IsVoter）
+// 保持【分子分母同口径】。
+//
+// 为什么必须过滤：若把"回包时已被移除 / 降级成 learner"的票也算进分子，
+// 却拿"当前 voter 多数"当门槛，候选者就能靠一张已作废的票凑够 quorum
+// 当选 —— leader 并非由当前配置多数选出，选举合法性被破坏。
+// （典型场景：候选者发出投票请求时对方还是 voter，回包前配置变更把对方
+//  移除，同时 quorum 随配置缩小而下降，那张票正好补上缺口。）
+int CountGrantedVotes(const std::vector<MemberRole>& is_member,
+                      const std::vector<int>& votes) {
+  int n = 0;
+  for (size_t i = 0; i < is_member.size() && i < votes.size(); i++) {
+    if (!IsVoter(is_member[i])) continue;  // 已移除 / learner：票作废
+    if (votes[i] == 1) n++;
+  }
+  return n;
+}
+
+int Raft::CountGrantedVotesLocked() const {
+  return CountGrantedVotes(is_member_, vote_granted_);
+}
+
+int Raft::CountGrantedPrevotesLocked() const {
+  return CountGrantedVotes(is_member_, prevote_granted_);
 }
 
 // leader 在最近 150ms 里有没有收到过 i 的回包
@@ -1505,7 +1989,7 @@ int Raft::CountRecentAcksLocked(int window_ms) const {
     // 已被移除 / 尚未正式加入的节点直接跳过：它连成员都不是，
     // 它的"确认"对多数派判定没有任何意义。
     // （少了这层过滤，被移除的节点凭一己之力就能凑出多数派 → 安全性崩塌。）
-    if (i >= is_member_.size() || !is_member_[i]) continue;
+    if (i >= is_member_.size() || !IsVoter(is_member_[i])) continue;
     // leader 自己永远算一票：它不会给自己发 AppendEntries，
     // last_ack_time_[me_] 不会被心跳回包刷新，必须无条件计入，
     // 否则刚当选的 leader 会把自己判成"联系不上多数派"而立刻退位。
@@ -1528,6 +2012,7 @@ void Raft::BroadcastReadHeartbeat(int ctx) {
     {
       std::lock_guard<std::mutex> lk(mu_);
       if (state_ != ServerState::kLeader) return;   // 已退位，发也没意义
+      if (s >= is_member_.size() || !IsVoter(is_member_[s])) continue;  // 只读 voter
       args.term = current_term_;
       args.leader_id = me_;
       args.leader_commit = commit_index_;
@@ -1562,22 +2047,36 @@ void Raft::BroadcastReadHeartbeat(int ctx) {
           }
           // 记下这次"联系"：刷新 CheckQuorum / Leader Lease 的 ack 时间
           self->last_ack_time_[server] = raftcpp::Now();
+          if (server >= static_cast<int>(self->is_member_.size()) ||
+              !IsVoter(self->is_member_[server])) {
+            return;
+          }
           // 按 ctx 把这一票记到对应的读请求上（普通心跳 ctx==0 会直接 return）
-          self->RecordReadAckLocked(reply.read_ctx);
+          self->RecordReadAckLocked(reply.read_ctx, server);
         },
         &cancel_rpcs_);
   }
 }
 
-void Raft::RecordReadAckLocked(int ctx) {
+void Raft::RecordReadAckLocked(int ctx, int server) {
   if (ctx == 0) return;                      // 普通心跳/普通快照，与读确认无关
   auto it = read_ctxs_.find(ctx);
   if (it == read_ctxs_.end()) return;        // 该 ctx 已完成/取消/超时，迟到回包忽略
   ReadIndexCtx& r = it->second;
   if (r.term != current_term_) return;       // term 变了，作废
-  r.ack_count++;
+  if (server < 0 || server >= static_cast<int>(r.acked_.size())) return;
+  if (r.acked_[server]) return;  // 已记过：跳过 O(N) 重算（性能优化；正确性由下方现算保证）
+  r.acked_[server] = 1;          // 标记该 server 已回 ack
+  // 现算分子：当前 voter 中、回过 ack 的去重集合大小（与 CheckQuorum/commit/选举同构）
+  int granted = 0;
+  const int n = static_cast<int>(r.acked_.size());
+  for (int i = 0; i < n; ++i) {
+    if (r.acked_[i] && i < static_cast<int>(is_member_.size()) && IsVoter(is_member_[i])) {
+      ++granted;
+    }
+  }
   int majority = MemberCountLocked() / 2 + 1;
-  if (r.ack_count >= majority && !r.done) {
+  if (granted >= majority && !r.done) {
     r.done = true;
     // 共用 read_cv_：唤醒后各读线程查自己的 done 标志，互不干扰
     read_cv_.notify_all();
@@ -1599,6 +2098,14 @@ int Raft::ReadIndex() {
     std::lock_guard<std::mutex> lk(mu_);
     if (state_ != ServerState::kLeader) return -1;    // 只有 leader 能服务
 
+    // 与 Start() 的 pending_stepdown_ 守卫【对称】：事件驱动退位的宽限期内，
+    // 本节点虽仍是 leader，但已被移除 / 降级出 voter，不得服务线性一致读 ——
+    // 否则 learner 会以 leader 身份返回本地 commit_index_（脏读风险）。
+    // 缺这条时：leader 把自己降级为 learner 后，ReadIndex 仍能凑齐多数派 ack
+    // （AppendEntries 只校验 term、不校验 sender 是否 voter）而返回 >=0，
+    // 正是 TestLearnerReadIndexRejected 偶发失败的根因。
+    if (pending_stepdown_ || !IsVoter(is_member_[me_])) return -1;
+
     // 线性一致读硬性前提：本 leader 必须先提交一条自己 term 的 entry（no-op，
     // 见 become-leader 块），把 commit_index_ 抬到覆盖上任前已提交的 entry；
     // 否则 commit_index_ 是旧值（甚至 0），据此读会拿到 stale 状态
@@ -1619,7 +2126,8 @@ int Raft::ReadIndex() {
     ReadIndexCtx r;
     r.term = my_term;
     r.read_index = my_read_index;
-    r.ack_count = 1;            // leader 自己这一票
+    r.acked_.assign(peers_.size(), 0);  // 去重表，大小对齐 peers_
+    r.acked_[me_] = 1;            // leader 自己这一票（voter 默认已 ack 自己）
     r.done = false;
     read_ctxs_[ctx] = std::move(r);
   }
@@ -1639,6 +2147,7 @@ int Raft::ReadIndex() {
       if (done) { result = my_read_index; break; }   // 本条读的 ctx 已攒够
       if (my_term != current_term_) break;           // term 变了 → 作废重试
       if (state_ != ServerState::kLeader) break;     // 已不是 leader
+      if (pending_stepdown_ || !IsVoter(is_member_[me_])) break;
       auto remain = deadline - raftcpp::Now();
       if (remain <= std::chrono::milliseconds(0)) break;  // 超时
       read_cv_.wait_for(lk, remain);
@@ -1646,7 +2155,8 @@ int Raft::ReadIndex() {
     if (result >= 0) {                               // 醒来再确认一遍
       auto it = read_ctxs_.find(ctx);
       if (it == read_ctxs_.end() || !it->second.done ||
-          it->second.term != current_term_ || state_ != ServerState::kLeader) {
+          it->second.term != current_term_ || state_ != ServerState::kLeader ||
+    pending_stepdown_ || !IsVoter(is_member_[me_])) {
         result = -1;
       }
     }

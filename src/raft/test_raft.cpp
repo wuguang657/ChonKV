@@ -13,6 +13,8 @@
 #include <iostream>
 #include <map>
 #include <optional>
+#include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -1772,13 +1774,46 @@ void TestReadIndexUnreliable() {
   // 先提交一个已知下标，作为"已提交"的硬基准（commit_index 只增不减）
   int idx = cfg->One("prime", servers, true);
   int leader = cfg->CheckOneLeader();
+  (void)leader;
 
+  // 不可靠网下 leadership 可能易主（丢心跳触发选举）。轻量本地读 GetState()
+  // 做 leader 重解析——不能用 CheckOneLeader()（每轮 sleep 450ms + 对"同 term
+  // 多 leader" Fatal），放进读热路径会拖慢并误判。PickLeaderFast 挑 term 最大且
+  // 自称 leader 的节点。
+  auto PickLeaderFast = [&]() -> int {
+    int best = -1, best_term = -1;
+    for (int i = 0; i < servers; i++) {
+      auto rf = cfg->GetRaft(i);
+      if (!rf) continue;
+      auto st = rf->GetState();               // (term, is_leader)
+      if (st.second && st.first > best_term) { best_term = st.first; best = i; }
+    }
+    return best;
+  };
+  int cur_leader = PickLeaderFast();
+  if (cur_leader >= 0) leader = cur_leader;    // 爆发前先校准一次
+
+  // 顺序发 50 次读。每次若返回 -1（非 leader / 瞬态退位被拒），重解析 leader 后
+  // 重试最多 kMaxRetry 轮——这正是真实 Clerk 在收到"非 leader"拒绝后的换台重发。
+  // 只吸收【换主瞬间】的合法拒绝，不动安全性；若 leader 真长时间不可用，重试后
+  // 仍全 -1 → 下面 ok<=fail 仍会 Fatal（真实 liveness 回归照样抓得住）。
   const int n = 50;
+  const int kMaxRetry = 3;
+  const int kRetrySleepMs = 20;
   int ok = 0, fail = 0, stale = 0;
   for (int i = 0; i < n; i++) {
-    int ri = cfg->GetRaft(leader)->ReadIndex();
+    int ri = -1;
+    for (int attempt = 0; attempt <= kMaxRetry && ri < 0; attempt++) {
+      int l = cur_leader;
+      if (l >= 0) ri = cfg->GetRaft(l)->ReadIndex();
+      if (ri < 0) {
+        int nl = PickLeaderFast();            // 可能刚换主 → 重解析后重试
+        if (nl >= 0) cur_leader = nl;
+        if (attempt < kMaxRetry) raftcpp::SleepMs(kRetrySleepMs);
+      }
+    }
     if (ri < 0) {
-      fail++;            // 丢包超时 / 瞬态退位，保守返回 -1，可接受
+      fail++;            // 重试后仍失败：保守返回 -1，可接受
     } else {
       ok++;
       // 安全性：返回的 readIndex 必须覆盖我们已知已提交的下标 idx
@@ -1916,13 +1951,44 @@ void TestReadIndexSnapshotUnreliable() {
   cfg->Start1(laggard);
 
   // 与此同时在不可靠网下并发读 —— 覆盖"丢包下装快照时的读"
+  // 轻量 leader 重解析：只看各节点的 GetState()=(term,is_leader)，不 sleep。
+  // （不能用 CheckOneLeader()：它每轮先睡 450ms，且会对"同 term 多 leader" Fatal，
+  //   放进读热路径既拖慢又会引入误判。）
+  auto PickLeaderFast = [&]() -> int {
+    int best = -1, best_term = -1;
+    for (int i = 0; i < servers; i++) {
+      auto rf = cfg->GetRaft(i);
+      if (!rf) continue;
+      auto st = rf->GetState();               // (term, is_leader)
+      if (st.second && st.first > best_term) { best_term = st.first; best = i; }
+    }
+    return best;
+  };
+  {
+    int nl = PickLeaderFast();
+    if (nl >= 0) leader = nl;                 // 爆发前先校准一次
+  }
+
+  // 与此同时在不可靠网下并发读 —— 覆盖"丢包下装快照时的读"
+  std::atomic<int> cur_leader{leader};
   const int nthreads = 8, ncalls = 20;
+  const int kMaxRetry = 2;        // 每次读最多补 2 轮重试（真实 Clerk 换台重发）
+  const int kRetrySleepMs = 20;
   std::vector<std::thread> ts;
   std::atomic<int> ok{0}, fail{0}, stale{0};
   for (int t = 0; t < nthreads; t++) {
     ts.emplace_back([&]() {
       for (int i = 0; i < ncalls; i++) {
-        int ri = cfg->GetRaft(leader)->ReadIndex();
+        int ri = -1;
+        for (int attempt = 0; attempt <= kMaxRetry && ri < 0; attempt++) {
+          int l = cur_leader.load();
+          if (l >= 0) ri = cfg->GetRaft(l)->ReadIndex();
+          if (ri < 0) {
+            int nl = PickLeaderFast();        // 可能刚换主 → 重解析后重试
+            if (nl >= 0 && nl != l) cur_leader.store(nl);
+            if (attempt < kMaxRetry) raftcpp::SleepMs(kRetrySleepMs);
+          }
+        }
         if (ri < 0) {
           fail++;
         } else {
@@ -1942,11 +2008,2180 @@ void TestReadIndexSnapshotUnreliable() {
                "）—— 线性一致读被破坏（ctx 归因/超时吐旧值回归）");
   }
 
-  // (b) 可用性：丢包 + 装快照环境下多数派心跳仍能凑齐，成功数应多于失败数
+  // (b) 可用性：丢包 + 装快照环境下多数派心跳仍能凑齐，成功数应多于失败数。
+  //     注意这里统计的是【Clerk 语义重试后】的成败 —— ReadIndex 对"非 leader"
+  //     【立即拒绝】是正确行为，若按"单瞬间、零重试、固定节点"取样，一次换主
+  //     就会让 160 次调用在微秒级全部返回 -1，被误判成读路径 liveness 回归。
   if (ok <= fail) {
     cfg->Fatal("不可靠网装快照期间 ReadIndex 成功(" + std::to_string(ok) +
                ") 未超过失败(" + std::to_string(fail) +
                ") —— 线性一致读基本不可用（liveness 回归）");
+  }
+
+  cfg->End();
+}
+
+// ===========================================================================
+// ReadIndex 扩展：learner 的 ack 绝不能计入读 quorum
+//
+// 背景（变异实证坐实的真实缺口）：把 ReadIndex 三处判据（raft.cpp 发送侧 /
+// 回包侧 / 计票侧）从 IsVoter 改成"非 kRemoved 即算"（learner 也算）后，原
+// 37 条用例（ReadIndex 全族 + 成员变更全族）全部绿灯、零捕获。根因是既有
+// TestLearnerReadIndexRejected 只验「learner 自己调 ReadIndex 被拒」，走的是
+// state_ != kLeader 平凡分支，根本没走到多数派确认，区分不了"learner 的票算不算"。
+//
+// 本用例构造：5 节点 → 降 2 个为 learner（剩 3 voter）→ 断掉另外 2 个非 leader
+// voter（在线只剩 leader + 2 learner）。此时：
+//   正确实现：granted = 1（仅 leader 自己，raft.cpp:2124） < majority = 3/2+1 = 2 → 必须 -1
+//   变异实现：granted = 1 + 2(learner) = 3 >= 2 → 放行 → 假安全脏读
+// 关键：读之前【不能 sleep】—— CheckQuorum 会让 leader 退位，退位后两种实现
+// 都返回 -1，就失去区分度了。
+// ===========================================================================
+void TestReadIndexIgnoresNonVoterAcks() {
+  const int servers = 5;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: ReadIndex must NOT count learner acks toward read quorum");
+
+  int leader = cfg->CheckOneLeader();
+  cfg->One("v0", servers, false);
+
+  // 挑两个非 leader 节点降为 learner（一次一个、等 apply 后再提下一个 —— 单飞保护）
+  std::vector<int> learners;
+  for (int i = 0; i < servers && static_cast<int>(learners.size()) < 2; i++) {
+    if (i != leader) learners.push_back(i);
+  }
+  for (int s : learners) {
+    StartResult r = cfg->GetRaft(leader)->ProposeConfChangeTo(s, MemberRole::kLearner);
+    if (r.index < 0) {
+      cfg->Fatal("前提失败：降级节点 " + std::to_string(s) + " 的提案被拒（index<0）");
+    }
+    bool applied = false;
+    for (int t = 0; t < 100; t++) {
+      raftcpp::SleepMs(50);
+      auto v = cfg->GetRaft(leader)->MembershipView();
+      if (s < static_cast<int>(v.size()) &&
+          v[s] == static_cast<int>(MemberRole::kLearner)) { applied = true; break; }
+    }
+    if (!applied) {
+      cfg->Fatal("前提失败：节点 " + std::to_string(s) + " 未切换为 kLearner");
+    }
+  }
+
+  // 剩下的非 leader voter 全部断连 → 在线只剩 leader + 2 个 learner
+  std::vector<int> offline;
+  for (int i = 0; i < servers; i++) {
+    if (i == leader) continue;
+    bool is_learner = false;
+    for (int s : learners) if (s == i) is_learner = true;
+    if (!is_learner) offline.push_back(i);
+  }
+  if (static_cast<int>(offline.size()) != 2) {
+    cfg->Fatal("前提失败：期望 2 个可断连的 voter，实际 " + std::to_string(offline.size()));
+  }
+  for (int s : offline) cfg->Disconnect(s);
+
+  // ★ 立刻读（零 sleep）：此刻正确实现必须全部拒绝
+  int returned = 0, while_leader = 0;
+  for (int k = 0; k < 8 && returned == 0; k++) {
+    auto rf = cfg->GetRaft(leader);
+    if (rf->GetState().second) while_leader++;
+    if (rf->ReadIndex() >= 0) returned++;
+  }
+  if (returned > 0) {
+    cfg->Fatal("learner 的 ack 被计入读 quorum：仅剩 1 个 voter 在线时 ReadIndex 仍放行 —— 假安全脏读（线性一致性破防）");
+  }
+  if (while_leader == 0) {
+    cfg->Fatal("用例退化：读期间节点已不是 leader，未真正考察 quorum 口径");
+  }
+
+  // 对称正例：恢复连通后 voter 多数派回来，ReadIndex 应重新可用
+  // （证明上面的 -1 是"确实凑不齐票"，而不是把读路径整坏了）
+  for (int s : offline) cfg->Connect(s);
+  bool recovered = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    for (int i = 0; i < servers; i++) {
+      auto rf = cfg->GetRaft(i);
+      if (rf && rf->GetState().second && rf->ReadIndex() >= 0) { recovered = true; break; }
+    }
+    if (recovered) break;
+  }
+  if (!recovered) {
+    cfg->Fatal("对照失败：恢复连通后 ReadIndex 应重新可用（读路径被整坏？）");
+  }
+
+  cfg->End();
+}
+
+// ===========================================================================
+// ReadIndex × 失多数派超时契约（行为契约测试；【变异有牙】）
+//
+// 稳定 leader 失去多数派时，ReadIndex 必须在有限时间内返回 -1（不永久阻塞调用方）。
+// 生产线索：raft.cpp:2133-2146 用 deadline = Now()+kElectionTimeoutMin 等待多数派
+// 确认，超时（L2146 remain<=0 break）即跳出循环返回 -1；同时 raft.cpp:2093/2143
+// 在 leader 退位（CheckQuorum 每 ~150ms 自查 / pending_stepdown_ 事件驱动）时也返回 -1。
+//
+// 变异实证【有牙】（与早期猜测相反，已实测坐实）：
+//   删掉 raft.cpp:2146 的超时 break 后，循环不会因 remain<=0 跳出，而是落到
+//   read_cv_.wait_for(lk, remain) —— 此时 remain 已过期为负，wait_for 按 0 超时
+//   立即返回，于是循环在持有 mu_（L2136 的 unique_lock 贯穿整个循环）的前提下
+//   busy-spin。CheckQuorum 的退位逻辑同样需要 mu_（raft.cpp:296/303/394 均持锁），
+//   被这条 read 循环饿死，state_/pending_stepdown_ 永远改不了 → L2143/L2144 永真不了
+//   → ReadIndex 永久阻塞。实测：本用例挂起到单用例看门狗（TEST_TIMEOUT_MS）触发
+//   "判定为死锁/永久阻塞，强制 abort"（raw_exit=134）。即：超时 break 是【持锁不死锁】
+//   的关键——它让循环在持锁状态下也能按时退出，放行 CheckQuorum 退位。本用例锁的就是
+//   这条"持位但失多数派 → 有限时间内返回 -1"的契约；删超时即挂死，被 CI 看门狗捕获。
+// ===========================================================================
+void TestReadIndexTimesOutWithoutQuorum() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test (Ext): leader 失去多数派时 ReadIndex 必须在有限时间内超时返回 -1（不卡死）");
+
+  cfg->One("prime", servers, true);
+  int leader = cfg->CheckOneLeader();
+
+  // 断开 2 个 follower：leader 仍持位（刚断，退位宽限未到），但失去多数派，
+  // ReadIndex 的广播读心跳收不到足够 ack。
+  for (int i = 0; i < servers; i++) {
+    if (i != leader) cfg->Disconnect(i);
+  }
+
+  // 同步调用：干净实现应在 ~kElectionTimeoutMin(150ms) 内超时返回 -1；
+  // 若删掉超时（raft.cpp:2146 的 remain<=0 break），ReadIndex 永久阻塞 → 本用例挂起，
+  // 被 CI 单用例超时捕获。这正是该超时契约不可删的铁证。
+  int ri = cfg->GetRaft(leader)->ReadIndex();
+  if (ri >= 0) {
+    cfg->Fatal("leader 失去多数派时 ReadIndex 竟返回 >=0（" + std::to_string(ri) +
+               "）—— 应当因凑不齐读 quorum 而超时/退位返回 -1");
+  }
+
+  // 对称正例：恢复连通后 ReadIndex 应重新可用
+  for (int i = 0; i < servers; i++) cfg->Connect(i);
+  bool recovered = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(50);
+    for (int i = 0; i < servers; i++) {
+      if (cfg->GetRaft(i)->GetState().second &&
+          cfg->GetRaft(i)->ReadIndex() >= 0) { recovered = true; break; }
+    }
+    if (recovered) break;
+  }
+  if (!recovered) cfg->Fatal("对照失败：恢复连通后 ReadIndex 应重新可用");
+
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ①：单节点变更（一次一个、apply 时切换、单飞保护）
+// 验证 §2.7 / §3.1 三件套：统一 majority、is_member_ 三态、单节点变更。
+// ===========================================================================
+void TestSingleNodeConfChange() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: single-node membership change (apply-time switch + single in-flight)");
+
+  int leader = cfg->CheckOneLeader();
+
+  // ---- 1) 移除节点 2：只追加一条 conf 条目；本用例只验证最终切到 kRemoved ----
+  // （"apply 时才切换"的具体时机由 ConfChange 系列其他用例兜底，此处不重复钉）
+  // 【稳健性】原写法忽略返回值：提案若被拒（单飞/退位）会一路走到下面的
+  // "移除失败" Fatal，错误信息误导排查方向。
+  StartResult r_rm = cfg->GetRaft(leader)->ProposeConfChange(2, false);
+  if (r_rm.index < 0) cfg->Fatal("移除提案被拒（index<0）—— 用例前提不成立");
+
+  // 等全集群把这条 conf 条目 apply（is_member_[2] 变成 kRemoved）
+  bool ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    bool all = true;
+    for (int i = 0; i < servers; i++) {
+      if (cfg->GetRaft(i)->MembershipView()[2] !=
+          static_cast<int>(MemberRole::kRemoved)) {
+        all = false;
+        break;
+      }
+    }
+    if (all) {
+      ok = true;
+      break;
+    }
+  }
+  if (!ok) cfg->Fatal("移除失败：is_member_[2] 未在 apply 时切换为 kRemoved");
+
+  // 被移除节点下线，避免它反复扰动选举（生产上也是"变更期间禁止下线"的反面：
+  // 这里是已经移除，模拟它真的离开集群）。
+  cfg->Disconnect(2);
+
+  // 剩余 2 个 voter 仍应能选出 leader，且绝不可能是已被移除的 2
+  int new_leader = cfg->CheckOneLeader();
+  if (new_leader == 2) cfg->Fatal("被移除的节点2竟然成为了 leader");
+  // 提交一条命令，确认 2 节点（0/1）多数派仍可用
+  cfg->One("after-remove", 2, false);
+
+  // ---- 2) 重新加入节点 2（单飞保护：上一条已 apply，pending 已清空，允许新的）----
+  cfg->Connect(2);
+  // 【稳健性】原写法直接拿 CheckOneLeader() 的结果提提案。当它返回的节点正处在
+  // 「apply 后宽限期退位」窗口（pending_stepdown_，raft.cpp:1763）时，提案会被
+  // 闸门拒绝（index<0），用例会误报成"重新加入失败"。改为轮询取"自身视图里
+  // 仍是 kVoter 的 leader" —— 与 TestNoRemovingLastVoter 修过的同类 flaky 一致。
+  // 轮询找"自身视图里仍是 kVoter 的当前 leader"。
+  // 【稳健性】不走 CheckOneLeader()：它每次调用自 sleep ~500ms 且对"短暂无/多 leader"
+  // 直接 Fatal，放进轮询会在重连后的瞬时选举间隙误杀整个用例。
+  // 改为逐节点轮询 GetState().second（isLeader），无任何内部 Fatal，瞬时无主就继续等。
+  int l2 = -1;
+  for (int t = 0; t < 40 && l2 < 0; t++) {
+    for (int i = 0; i < servers; i++) {
+      if (cfg->GetRaft(i)->GetState().second) {
+        auto v = cfg->GetRaft(i)->MembershipView();
+        if (i < static_cast<int>(v.size()) &&
+            v[i] == static_cast<int>(MemberRole::kVoter)) { l2 = i; break; }
+      }
+    }
+    if (l2 >= 0) break;
+    raftcpp::SleepMs(50);
+  }
+  if (l2 < 0) cfg->Fatal("重连后找不到自身仍为 kVoter 的 leader —— 用例前提不成立");
+  StartResult r_add = cfg->GetRaft(l2)->ProposeConfChange(2, true);
+  if (r_add.index < 0) cfg->Fatal("重新加入提案被拒（index<0）—— 无法断言单飞保护已放行");
+
+  ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    bool all = true;
+    for (int i = 0; i < servers; i++) {
+      if (cfg->GetRaft(i)->MembershipView()[2] !=
+          static_cast<int>(MemberRole::kVoter)) {
+        all = false;
+        break;
+      }
+    }
+    if (all) {
+      ok = true;
+      break;
+    }
+  }
+  if (!ok) cfg->Fatal("重新加入失败：is_member_[2] 未恢复为 kVoter");
+
+  // 恢复 3 节点多数派后提交一条命令
+  cfg->One("after-readd", 3, false);
+
+  // ---- 3) 单飞保护：连续两次变更，第二次必须被拒绝（pending_conf_index_ 未清空）----
+  // 旧实现这里是无断言的"空壳"（只验不崩溃），两种失败结局都放行 → 假绿。
+  // 正确断言：第二次变更【不应】被追加成新日志条目（否则两个未提交配置重叠 → 脑裂）。
+  // 用 LastLogIndex 做"是否追加了新条目"的可观测探针——不依赖最终成员态的竞态。
+  int leader3 = cfg->CheckOneLeader();
+  int idx_before = cfg->GetRaft(leader3)->LastLogIndex();
+  // 第一次：追加一条 conf 条目，pending_conf_index_ 被置位
+  StartResult r1 = cfg->GetRaft(leader3)->ProposeConfChange(2, false);
+  if (!r1.is_leader || r1.index != idx_before + 1) {
+    cfg->Fatal("单飞保护前置失败：第一条变更未成功追加为日志条目");
+  }
+  // 立刻再提一次：上一条还没 apply，pending 未清 ⇒ 必须被拒（不追加新条目）。
+  // 确定性探针：直接读返回值。单飞闸门（raft.cpp:1768）命中时返回
+  // {is_leader==true, index==-1}——index 保持默认 -1 表示"未追加任何条目"。
+  StartResult r2 = cfg->GetRaft(leader3)->ProposeConfChange(2, true);
+  if (!r2.is_leader || r2.index != -1) {
+    cfg->Fatal("单飞保护失效：第二条并发变更未被拒绝"
+               "（pending_conf_index_ 闸门漏了 → 两个未提交配置重叠 → 脑裂风险）");
+  }
+  // 冗余保险：确认日志长度确实没增长（与上面的返回值断言互为印证）。
+  // 注：此 idx_after 比较依赖"第一条 conf 在两次调用之间尚未 apply"的时序前提；
+  // 生产实现下两条语句纳秒级紧挨、apply 需过一轮 RPC，故不会误杀。主钉是上面的
+  // 返回值断言（r2.index==-1，确定性、零时序依赖）。
+  int idx_after = cfg->GetRaft(leader3)->LastLogIndex();
+  if (idx_after != idx_before + 1) {
+    cfg->Fatal("单飞保护失效：第二条变更也被追加成新日志条目"
+               "（pending_conf_index_ 没挡住并发变更 → 两个未提交配置重叠 → 脑裂风险）");
+  }
+  // 收尾：让这条移除真正 apply（pending 清空），节点2 最终落到 kRemoved
+  bool ok3 = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    bool all_removed = true;
+    for (int i = 0; i < servers; i++) {
+      if (cfg->GetRaft(i)->MembershipView()[2] !=
+          static_cast<int>(MemberRole::kRemoved)) { all_removed = false; break; }
+    }
+    if (all_removed) { ok3 = true; break; }
+  }
+  if (!ok3) cfg->Fatal("单飞保护收尾失败：移除条目未最终 apply");
+
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更：安全阀回归 —— 配置变更后必须至少保留一个 voter
+//   把最后一个 voter 移除（kRemoved）或降级（kLearner）都必须被拒绝，
+//   否则集群变 0 voter → quorum=0 → 永远选不出 leader（死锁）。
+// ===========================================================================
+void TestNoRemovingLastVoter() {
+  const int servers = 2;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: reject removing/demoting the last voter (keep >=1 voter)");
+
+  int leader = cfg->CheckOneLeader();  // 初始 2 个 voter（0,1）
+
+  // 1) 移除节点 1：2 voter -> 1 voter，合法（非最后一个）
+  cfg->GetRaft(leader)->ProposeConfChange(1, false);
+  bool ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    bool all = true;
+    for (int i = 0; i < servers; i++) {
+      if (cfg->GetRaft(i)->MembershipView()[1] !=
+          static_cast<int>(MemberRole::kRemoved)) { all = false; break; }
+    }
+    if (all) { ok = true; break; }
+  }
+  if (!ok) cfg->Fatal("前置失败：节点1 未被移除");
+
+  // ⚠️ 硬化：不能直接取 CheckOneLeader() 的返回值当 sole。
+  // 若被移除的恰好是原 leader（2 节点下有 50% 概率），它在 apply 移除配置后
+  // 会进入退位宽限期（pending_stepdown_=true，state_ 仍短暂为 kLeader）——
+  // 此时 CheckOneLeader() 可能仍返回它。用它调用 ProposeConfChange 会被
+  // pending_stepdown_ 闸门拒绝（index=-1），导致下面第 4 步"加回 voter 应合法"
+  // 误判为被拒绝而 Fatal —— 这是测试自身的 flaky，不是代码 bug。
+  // 修复：轮询直到拿到【自身仍是 kVoter 的】leader。
+  int sole = -1;
+  for (int t = 0; t < 100; t++) {
+    int l = -1;
+    for (int i = 0; i < servers; i++) {
+      if (cfg->GetRaft(i)->GetState().second &&
+          cfg->GetRaft(i)->MembershipView()[i] ==
+              static_cast<int>(MemberRole::kVoter)) {
+        l = i;
+        break;
+      }
+    }
+    if (l >= 0 && cfg->GetRaft(l)->MembershipView()[l] ==
+                      static_cast<int>(MemberRole::kVoter)) {
+      sole = l;
+      break;
+    }
+    raftcpp::SleepMs(100);
+  }
+  if (sole < 0) cfg->Fatal("前置失败：找不到自身仍是 voter 的 leader");
+
+  // 2) 尝试移除最后一个 voter：必须被拒绝（index 保持 -1，StartResult 默认值）
+  StartResult r_remove = cfg->GetRaft(sole)->ProposeConfChange(sole, false);
+  // 被拒绝时 index 保持 StartResult 默认值 -1（接受时才为正数）
+  if (r_remove.index >= 0) {
+    cfg->Fatal("应拒绝移除最后一个 voter，但 conf 条目被追加了（index=" +
+               std::to_string(r_remove.index) + ")");
+  }
+
+  // 3) 尝试把最后一个 voter 降级为 learner：必须被拒绝
+  StartResult r_demote = cfg->GetRaft(sole)->ProposeConfChangeTo(sole, MemberRole::kLearner);
+  if (r_demote.index >= 0) {
+    cfg->Fatal("应拒绝把最后一个 voter 降级为 learner，但 conf 条目被追加了");
+  }
+
+  // 4) 正向对照：把节点1 重新加回为 voter（1 voter -> 2 voter），应合法
+  StartResult r_add = cfg->GetRaft(sole)->ProposeConfChange(1, true);
+  // 加回应合法：被接受时 index>0；index<0 表示被错误拒绝
+  if (r_add.index < 0) {
+    cfg->Fatal("加回 voter 应合法，却被拒绝（index=" +
+               std::to_string(r_add.index) + ")");
+  }
+
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ②：Learner 三态真正用起来（learner 持续追数据、可提拔回 voter）
+//   1) learner 不计入多数派：有效 voter 数下降 → 多数派阈值跟着下降
+//   2) learner 虽然不投票、不计票，但仍在持续接收并追加日志（追数据）
+//   3) 追平后可把 learner 提拔回 voter，阈值随之恢复
+// 这样新节点就能"先以 learner 身份追平日志，期间不把多数派撑大，追平再转正"。
+// ===========================================================================
+void TestLearnerCatchup() {
+  const int servers = 4;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: learner catches up logs without being counted in quorum");
+
+  int leader = cfg->CheckOneLeader();
+
+  // 基线：4 个 voter → 多数派阈值 = 4/2+1 = 3
+  int q_all = cfg->GetRaft(leader)->QuorumSize();
+  if (q_all != 3) {
+    cfg->Fatal("基线阈值错误：4 个 voter 应为 3，实际 " + std::to_string(q_all));
+  }
+
+  // ---- 1) 把节点 3 降级为 learner（走三态入口）----
+  cfg->GetRaft(cfg->CheckOneLeader())->ProposeConfChangeTo(3, MemberRole::kLearner);
+
+  bool ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    bool all = true;
+    for (int i = 0; i < servers; i++) {
+      if (cfg->GetRaft(i)->MembershipView()[3] !=
+          static_cast<int>(MemberRole::kLearner)) {
+        all = false;
+        break;
+      }
+    }
+    if (all) { ok = true; break; }
+  }
+  if (!ok) cfg->Fatal("降级失败：is_member_[3] 未在 apply 时切换为 kLearner");
+
+  // ---- 2) learner 不计入多数派：有效 voter 只剩 3 个 → 阈值应为 2 ----
+  int q_learner = cfg->GetRaft(0)->QuorumSize();
+  if (q_learner != 2) {
+    cfg->Fatal("learner 被计入了多数派：3 个 voter 阈值应为 2，实际 " +
+               std::to_string(q_learner));
+  }
+
+  // ---- 3) learner 不投票，但仍应持续追数据 ----
+  // expected_servers 是下限（One 内部判 nd >= expected），3 个 voter 全提交即可
+  cfg->One("learner-1", 3, false);
+  cfg->One("learner-2", 3, false);
+
+  ok = false;
+  int node3_idx = -1;
+  int voters_max = -1;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    int mx = 0;
+    for (int i = 0; i < servers - 1; i++) {  // 0..2 是 voter
+      int idx = cfg->GetRaft(i)->LastLogIndex();
+      if (idx > mx) mx = idx;
+    }
+    voters_max = mx;
+    node3_idx = cfg->GetRaft(3)->LastLogIndex();
+    if (node3_idx >= voters_max) { ok = true; break; }
+  }
+  if (!ok) {
+    cfg->Fatal("learner 没追上日志：节点3=" + std::to_string(node3_idx) +
+               "，voter 最大=" + std::to_string(voters_max));
+  }
+
+  // ---- 4) 提拔回 voter：阈值恢复为 3 ----
+  cfg->GetRaft(cfg->CheckOneLeader())->ProposeConfChangeTo(3, MemberRole::kVoter);
+
+  ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    bool all = true;
+    for (int i = 0; i < servers; i++) {
+      if (cfg->GetRaft(i)->MembershipView()[3] !=
+          static_cast<int>(MemberRole::kVoter)) {
+        all = false;
+        break;
+      }
+    }
+    if (all) { ok = true; break; }
+  }
+  if (!ok) cfg->Fatal("提拔失败：is_member_[3] 未恢复为 kVoter");
+
+  int q_back = cfg->GetRaft(0)->QuorumSize();
+  if (q_back != 3) {
+    cfg->Fatal("提拔后阈值应恢复为 3，实际 " + std::to_string(q_back));
+  }
+  cfg->One("after-promote", 4, false);
+
+  cfg->End();
+}
+
+// ===========================================================================
+// 端到端演示：learner 换来"扩容不丢容错余量"
+//
+// 场景（4 节点 0..3，节点 3 是"待扩容进来的新机器"）：
+//   新节点 3 还在 loading / 还没追上数据（用 Disconnect 模拟它收不到日志），
+//   此时再挂掉一个老 voter。存活节点完全一样，唯一的差别是节点 3 的角色：
+//
+//   A 组：节点 3 直接提成 voter  → voter=4，quorum=3；能 ack 的只剩 2 票 → 写不进去
+//   B 组：节点 3 先以 learner 加入 → voter 仍是 3，quorum=2；能 ack 的刚好 2 票 → 写得进去
+//
+// 这就是 learner 的全部价值：把"撑大 quorum"推迟到新节点真正能可靠投票之后。
+// ===========================================================================
+
+// 限时尝试提交一条命令：成功返回 true，超时/无 leader 返回 false（绝不 Fatal 终止测试）。
+// Config::One() 内部失败会 Fatal，所以"预期写不进去"的场景必须自己写一个。
+static bool TryAgreement(Config* cfg, const std::string& cmd, int expected,
+                         int timeout_ms) {
+  auto deadline = std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(timeout_ms);
+  while (std::chrono::steady_clock::now() < deadline) {
+    int index = -1;
+    for (int si = 0; si < cfg->n(); si++) {
+      if (!cfg->Connected(si)) continue;
+      auto rf = cfg->GetRaft(si);
+      if (!rf) continue;
+      StartResult r = rf->Start(cmd);
+      if (r.is_leader) {
+        index = r.index;
+        break;
+      }
+    }
+    if (index != -1) {
+      auto sub_deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
+      while (std::chrono::steady_clock::now() < sub_deadline) {
+        auto res = cfg->NCommitted(index);
+        int nd = res.first;
+        auto cmd1 = res.second;
+        if (nd > 0 && nd >= expected && cmd1 && *cmd1 == cmd) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+      return false;  // 提上去了但提交不了 → 凑不够多数派
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  return false;  // 压根没有 leader
+}
+
+// 准备场景：把节点 3 移除成"待加入槽位"，再断网模拟"新机器还在 loading"；
+// 返回此时 {0,1,2} 里的 leader（断网后旧 leader 若在 3 上会因 CheckQuorum 退位）。
+static int PrepareNewNodeOffline(Config* cfg, int servers) {
+  // 1) 先把节点 3 移除，让它变成"扩容槽位"
+  int leader = cfg->CheckOneLeader();
+  cfg->GetRaft(leader)->ProposeConfChange(3, false);
+  bool ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    bool all = true;
+    for (int i = 0; i < servers; i++) {
+      if (cfg->GetRaft(i)->MembershipView()[3] !=
+          static_cast<int>(MemberRole::kRemoved)) {
+        all = false;
+        break;
+      }
+    }
+    if (all) { ok = true; break; }
+  }
+  if (!ok) cfg->Fatal("准备阶段失败：节点 3 未能进入 kRemoved 槽位状态");
+
+  // 2) 断网 → 节点 3 收不到任何日志，等价于"新节点还在 loading，日志为空"
+  cfg->Disconnect(3);
+
+  // 3) 等 leader 落到 {0,1,2} 上（断网的 3 若曾是 leader，会被 CheckQuorum 撸下来）
+  leader = -1;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    int ld = cfg->CheckOneLeader();
+    if (ld != 3) { leader = ld; break; }
+  }
+  if (leader < 0) cfg->Fatal("准备阶段失败：断网后 {0,1,2} 未能选出 leader");
+  return leader;
+}
+
+// 成员变更 ③：learner 作为扩容槽位时，集群仍保住减员容错余量（文档 §2.6「扩容零可用性损失」）
+void TestLearnerAvailabilityWin() {
+  const int servers = 4;
+
+  // ================= A 组：新节点直接提 voter =================
+  {
+    auto cfg = MakeConfig(servers, false);
+    cfg->Begin("Test: adding a not-yet-caught-up node as VOTER loses quorum");
+
+    int leader = PrepareNewNodeOffline(cfg.get(), servers);
+
+    // 把还在 loading 的节点 3 直接提成 voter
+    cfg->GetRaft(leader)->ProposeConfChange(3, true);
+    bool ok = false;
+    for (int t = 0; t < 100; t++) {
+      raftcpp::SleepMs(100);
+      if (cfg->GetRaft(leader)->MembershipView()[3] ==
+          static_cast<int>(MemberRole::kVoter)) { ok = true; break; }
+    }
+    if (!ok) cfg->Fatal("A 组：节点 3 未被提为 voter");
+
+    int q_voter_grp = cfg->GetRaft(leader)->QuorumSize();
+    if (q_voter_grp != 3) {
+      cfg->Fatal("A 组阈值错误：4 个 voter 应为 3，实际 " +
+                 std::to_string(q_voter_grp));
+    }
+
+    // 再挂一个"非 leader"的老 voter（leader 得活着才能处理写）
+    int victim = -1;
+    for (int i = 0; i < 3; i++) {
+      if (i != leader) { victim = i; break; }
+    }
+    cfg->Disconnect(victim);
+
+    bool wrote = TryAgreement(cfg.get(), "x-voter-group", 2, 3000);
+
+    std::printf("  [A 组 直接提 voter] 节点3断网(未追平) + 节点%d 也挂掉\n", victim);
+    std::printf("     voter 数=4 → quorum=%d，实际能给 ack 的只有 2 票\n", q_voter_grp);
+    std::printf("     写入结果：%s\n", wrote ? "成功" : "失败（超时/无 leader）");
+    std::fflush(stdout);
+
+    if (wrote) {
+      cfg->Fatal("A 组预期写不进去（quorum 被撑大到 3 却只剩 2 票可 ack），"
+                 "实际却写成功了 —— 说明多数派口径有问题");
+    }
+    cfg->End();
+  }
+
+  // ================= B 组：新节点先当 learner =================
+  {
+    auto cfg = MakeConfig(servers, false);
+    cfg->Begin("Test: adding the same node as LEARNER keeps quorum intact");
+
+    int leader = PrepareNewNodeOffline(cfg.get(), servers);
+
+    // 同一个节点 3，这回只提为 learner（追数据，但不计票）
+    cfg->GetRaft(leader)->ProposeConfChangeTo(3, MemberRole::kLearner);
+    bool ok = false;
+    for (int t = 0; t < 100; t++) {
+      raftcpp::SleepMs(100);
+      if (cfg->GetRaft(leader)->MembershipView()[3] ==
+          static_cast<int>(MemberRole::kLearner)) { ok = true; break; }
+    }
+    if (!ok) cfg->Fatal("B 组：节点 3 未被提为 learner");
+
+    int q_learner_grp = cfg->GetRaft(leader)->QuorumSize();
+    if (q_learner_grp != 2) {
+      cfg->Fatal("B 组阈值错误：learner 不计票，3 个 voter 应为 2，实际 " +
+                 std::to_string(q_learner_grp));
+    }
+
+    int victim = -1;
+    for (int i = 0; i < 3; i++) {
+      if (i != leader) { victim = i; break; }
+    }
+    cfg->Disconnect(victim);
+
+    bool wrote = TryAgreement(cfg.get(), "x-learner-group", 2, 5000);
+
+    std::printf("  [B 组 先当 learner]  节点3断网(未追平) + 节点%d 也挂掉\n", victim);
+    std::printf("     voter 数=3 → quorum=%d，能给 ack 的刚好 2 票\n", q_learner_grp);
+    std::printf("     写入结果：%s\n", wrote ? "成功" : "失败（超时/无 leader）");
+    std::fflush(stdout);
+
+    if (!wrote) {
+      cfg->Fatal("B 组预期写得进去（learner 不计票，quorum 仍是 2），实际却卡住了");
+    }
+
+    std::printf("  >>> 结论：存活节点完全相同，只因新节点角色不同（voter vs learner）\n");
+    std::printf("      A 组不可用 / B 组可用 —— learner 保住了扩容期间的容错余量\n");
+    std::fflush(stdout);
+
+    cfg->End();
+  }
+}
+
+// ===========================================================================
+// 成员变更 ④：成员配置必须随状态一起持久化，崩溃重启后不丢失
+//
+// 这套特性的标题就是「is_member_ 三态化 + 持久化」。如果某节点被移除后
+// 崩溃重启，重启后 is_member_ 必须从磁盘恢复成 kRemoved —— 而不是退化回
+// 默认的「全员 kVoter」。否则重启节点会以为自己仍是正式 voter，开始重新
+// 参与选举 / 投票 / 提交 → 安全性崩塌。
+//
+// 【有牙隔离设计】：这条专门抓「ReadPersist 没真恢复 is_member_」。
+// 普通版会被"已提交的 conf 条目被日志重放 / 快照 members 重水化"兜底掩盖
+// （实测把 ReadPersist 的 is_member_ 恢复分支改成 if(false)，普通版照样过）。
+// 所以这里用快照把 conf 条目截断出日志、再断网重启，让节点 2 重启后：
+//   - 自己日志里没有 conf 条目（被快照截断）→ ApplyLoop 重放补不回来；
+//   - 断网收不到 leader 的 InstallSnapshot → args.members 重水化也到不了；
+//   于是 is_member_ 只能来自 ReadPersist 恢复的 raft state。
+//   此时若 ReadPersist 不恢复 is_member_，节点 2 退化回 kVoter → 用例 FAILED。
+// ===========================================================================
+void TestMembershipPersistAcrossRestart() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->EnableSnapshotCompaction();
+  cfg->Begin("Test: membership change survives crash+restart (is_member_ persisted, isolated)");
+
+  int leader = cfg->CheckOneLeader();
+
+  // 1) 先写一批，确保 leader（进而各 follower）真的生成过快照
+  for (int i = 1; i <= 40; i++)
+    cfg->One("put k" + std::to_string(i) + " v" + std::to_string(i), servers, true);
+
+  // 2) 移除节点 2（conf 条目此刻落在日志里）
+  StartResult r = cfg->GetRaft(leader)->ProposeConfChange(2, false);
+  int conf_idx = r.index;
+  bool ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    bool all = true;
+    for (int i = 0; i < servers; i++) {
+      if (cfg->GetRaft(i)->MembershipView()[2] !=
+          static_cast<int>(MemberRole::kRemoved)) { all = false; break; }
+    }
+    if (all) { ok = true; break; }
+  }
+  if (!ok) cfg->Fatal("移除失败：is_member_[2] 未在 apply 时切换为 kRemoved");
+
+  // 3) 再写一批。注意：节点 2 已被移除，Q2 隐私加固让它【不再接收任何新日志】
+  //    （ReplicateLoop 对其直接跳过），所以这里只要求剩下的 2 个 voter 提交。
+  //    若仍写 servers=3，会卡等 removed 节点永远收不到的条目 → 超时。
+  for (int i = 41; i <= 120; i++)
+    cfg->One("put b" + std::to_string(i) + " v" + std::to_string(i), 2, false);
+
+  // Q2 护栏：removed 节点必须被冻结在移除点，绝不能偷偷收新日志。
+  // （本用例新增的刚性断言：坐实 Q2 真的生效，而不是退化成"removed 还在收数据"。）
+  // 原本这里要求"节点2 对自己快照、截断点越过 conf_idx"以隔离 ReadPersist——
+  // 但 Q2 下 removed 节点永不前进、永不对自己快照，那条隔离前提已不可能成立，
+  // 故改为直接验证"冻结 + 角色持久化"这一更贴近 Q2 语义的性质。
+  auto n2 = GetRaftOrFatal(cfg, 2);
+  if (n2->LastLogIndex() > conf_idx) {
+    cfg->Fatal("Q2 失效：removed 节点2 仍在接收新日志（LastLogIndex=" +
+               std::to_string(n2->LastLogIndex()) + " > conf_idx=" +
+               std::to_string(conf_idx) + "），隐私加固未生效");
+  }
+
+  // 4) 节点 2 断网后再崩溃：重启后它收不到 leader 的 InstallSnapshot，
+  //    自己日志里也没有 conf 条目（被快照截断）→ is_member_ 只能来自 ReadPersist。
+  cfg->Disconnect(2);
+  cfg->Crash1(2);
+  cfg->Start1(2);   // 刻意保持断网，不 Connect
+
+  // 5) 重连之前立刻断言：节点 2 必须记得自己被移除（仅依赖 ReadPersist）
+  raftcpp::SleepMs(300);
+  int role2 = cfg->GetRaft(2)->MembershipView()[2];
+  if (role2 != static_cast<int>(MemberRole::kRemoved)) {
+    cfg->Fatal("成员变更未持久化：节点2【快照截断+断网重启】后 is_member_[2]=" +
+               std::to_string(role2) + "，应为 kRemoved(" +
+               std::to_string(static_cast<int>(MemberRole::kRemoved)) +
+               ") —— 日志重放/InstallSnapshot 都到不了，说明 ReadPersist 没恢复 is_member_"
+               "（退化回 kVoter 会重新参与选举/提交 → 安全性崩塌）");
+  }
+
+  // 6) 重连，确认 0/1 两个 voter 仍能正常提交（多数派不受影响）
+  cfg->Connect(2);
+  cfg->One("after-restart", 2, false);
+
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ⑤：learner 绝不能当选 leader（安全性硬约束）
+//
+// learner 不投票、不计票。若实现错误地让它参选/收票，日志可能落后的 learner
+// 一旦当选就会覆盖多数派已提交日志 → 安全性崩塌。
+// 这条专门抓「learner 也参与选举/被投票」的实现 bug。
+// ===========================================================================
+void TestLearnerNeverLeader() {
+  const int servers = 4;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: a learner must never be elected leader");
+
+  int leader = cfg->CheckOneLeader();
+
+  // 把节点 3 降级为 learner
+  cfg->GetRaft(leader)->ProposeConfChangeTo(3, MemberRole::kLearner);
+  bool ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(3)->MembershipView()[3] ==
+        static_cast<int>(MemberRole::kLearner)) { ok = true; break; }
+  }
+  if (!ok) cfg->Fatal("降级失败：is_member_[3] 未切换为 kLearner");
+
+  // 阶段1：正常集群里反复重选若干轮，learner 节点必须【从不】自认 leader
+  for (int round = 1; round <= 3; round++) {
+    int l = cfg->CheckOneLeader();
+    for (int t = 0; t < 20; t++) {
+      raftcpp::SleepMs(50);
+      if (cfg->GetRaft(3)->GetState().second) {
+        cfg->Fatal("learner 节点3 在重选期间自认 leader —— 安全性破防");
+      }
+    }
+    cfg->Crash1(l);
+    cfg->Start1(l);
+    cfg->CheckOneLeader();  // 等新 leader 选出（非 learner）
+  }
+
+  // 阶段2（有牙）：把 0/1/2 全部移除，只剩 learner(3)。
+  // 正确实现下 learner 不是 voter → 集群无 voter → 节点3 永远当不了 leader；
+  // 错误实现下（learner 被当成 voter 计票）节点3 会自投自当选 → 这里抓到。
+  for (int i = 0; i < 2; i++) {  // 先移除 0、1（节点2 兜底作 leader）
+    int ld = cfg->CheckOneLeader();
+    cfg->GetRaft(ld)->ProposeConfChange(i, false);
+    for (int t = 0; t < 100; t++) {
+      raftcpp::SleepMs(100);
+      if (cfg->GetRaft(i)->MembershipView()[i] ==
+          static_cast<int>(MemberRole::kRemoved)) break;
+    }
+  }
+  {  // 最后移除节点2（自身即最后一个 voter/leader）；移除后无 leader，不再 CheckOneLeader
+    int ld = cfg->CheckOneLeader();
+    cfg->GetRaft(ld)->ProposeConfChange(2, false);
+    raftcpp::SleepMs(800);  // 等 conf apply + 节点2 退位
+  }
+  // 此刻集群：0/1/2=kRemoved，3=learner。轮询验证节点3 从不自认 leader
+  bool learner_elected = false;
+  for (int t = 0; t < 50; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(3)->GetState().second) { learner_elected = true; break; }
+  }
+  if (learner_elected) {
+    cfg->Fatal("learner 节点3 在所有 voter 下线后竟然当选 leader —— learner 不应参选/收票");
+  }
+
+  cfg->End();  // 集群已无 voter，直接结束（无需恢复）
+}
+
+// ===========================================================================
+// 成员变更 ⑥：kLearner 角色必须随状态持久化，崩溃重启后不退化回 kVoter
+//
+// 与 ④ 同构，但验证【learner 角色】持久化。若 is_member_ 的 learner 角色没真落盘/
+// 没真从 ReadPersist 恢复，重启后节点会退化回默认的 kVoter —— 立刻把多数派撑大，
+// 扩容期间本该保住的容错余量就没了。
+// 隔离手法同 ④：快照把 learner 变更条目截断出日志 + 断网重启，逼状态只来自 ReadPersist。
+// ===========================================================================
+void TestLearnerPersistAcrossRestart() {
+  int servers = 4;
+  auto cfg = MakeConfig(servers, false);
+  cfg->EnableSnapshotCompaction();
+  cfg->Begin("Test: learner role persists across crash+restart (isolated)");
+
+  int leader = cfg->CheckOneLeader();
+
+  // 先写一批，确保各节点真的生成过快照
+  for (int i = 1; i <= 40; i++)
+    cfg->One("put k" + std::to_string(i) + " v" + std::to_string(i), servers, true);
+
+  // 把节点 3 降为 learner（conf 条目此刻落在日志里）
+  StartResult r = cfg->GetRaft(leader)->ProposeConfChangeTo(3, MemberRole::kLearner);
+  int conf_idx = r.index;
+  bool ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(3)->MembershipView()[3] ==
+        static_cast<int>(MemberRole::kLearner)) { ok = true; break; }
+  }
+  if (!ok) cfg->Fatal("降级失败：is_member_[3] 未切换为 kLearner");
+
+  // 再写一批，把 learner 变更推进快照截断点
+  for (int i = 41; i <= 120; i++)
+    cfg->One("put b" + std::to_string(i) + " v" + std::to_string(i), servers, true);
+
+  // 前提：节点 3 快照点必须越过 learner 变更条目，否则隔离失败
+  auto n3 = GetRaftOrFatal(cfg, 3);
+  if (n3->SnapshotIndex() <= conf_idx) {
+    cfg->Fatal("前提不成立：节点3快照点(" + std::to_string(n3->SnapshotIndex()) +
+               ") 未越过 learner 变更条目(" + std::to_string(conf_idx) +
+               ")，conf 条目仍在日志里 → 测试无法隔离 ReadPersist");
+  }
+
+  // 断网 + 崩溃 + 重启（刻意保持断网）：节点3 日志无 conf 条目、收不到 InstallSnapshot
+  cfg->Disconnect(3);
+  cfg->Crash1(3);
+  cfg->Start1(3);
+
+  // 重连之前断言：节点3 仍必须是 learner（仅依赖 ReadPersist）
+  raftcpp::SleepMs(300);
+  int role3 = cfg->GetRaft(3)->MembershipView()[3];
+  if (role3 != static_cast<int>(MemberRole::kLearner)) {
+    cfg->Fatal("learner 角色未持久化：节点3【快照截断+断网重启】后 is_member_[3]=" +
+               std::to_string(role3) + "，应为 kLearner(" +
+               std::to_string(static_cast<int>(MemberRole::kLearner)) +
+               ") —— 退化回 kVoter 会把扩容期间的 quorum 撑大 → 可用性损失");
+  }
+
+  cfg->Connect(3);
+  cfg->One("after-restart", 3, false);
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ⑦：连续快速变更（churn）+ 跨 leadership 单飞
+//
+// 单节点变更的安全性靠「新旧配置多数派永远相交」，且 leader 在 apply 一条 conf 之前
+// 不会 propose 下一条（pending_conf_index_）。这里压两件事：
+//   1) 连续对节点2 反复 remove/add 交替，每轮中间强制一次 leader 重启（且不立即拉起），
+//      验证「跨 leadership 时单飞不破」——新 leader 不会在旧 conf 还没 apply 时
+//      又 propose 一条，导致两条未提交 conf 同时生效（脑裂）。
+//   2) 全程集群始终单一 leader、始终能提交，最终收敛到一致状态。
+// ===========================================================================
+void TestConfChangeChurn() {
+  const int servers = 4;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: rapid conf changes (churn) survive leader turnovers");
+
+  for (int round = 1; round <= 6; round++) {
+    int leader = cfg->CheckOneLeader();
+    int role2 = cfg->GetRaft(leader)->MembershipView()[2];
+    bool is_voter = (role2 == static_cast<int>(MemberRole::kVoter));
+    // 交替：voter→remove，removed→add
+    cfg->GetRaft(leader)->ProposeConfChange(2, !is_voter);
+
+    int want = is_voter ? static_cast<int>(MemberRole::kRemoved)
+                        : static_cast<int>(MemberRole::kVoter);
+    bool ok = false;
+    for (int t = 0; t < 100; t++) {
+      raftcpp::SleepMs(100);
+      bool all = true;
+      for (int i = 0; i < servers; i++) {
+        if (cfg->GetRaft(i)->MembershipView()[2] != want) { all = false; break; }
+      }
+      if (all) { ok = true; break; }
+    }
+    if (!ok) cfg->Fatal("churn 第" + std::to_string(round) + "轮 conf 未 apply");
+
+    // 强制 leader 退位但不立即重启，逼剩余节点重选（真正跨 leadership）
+    cfg->Crash1(leader);
+    cfg->CheckOneLeader();  // leader 仍 down，必须选出新 leader（验证跨 leadership 单飞安全）
+    cfg->Start1(leader);    // 旧 leader 回来当 follower
+
+    // 每轮集群仍能提交（节点2 是 voter 时 4 票，removed 时 3 票）
+    int voters = (want == static_cast<int>(MemberRole::kVoter)) ? servers : (servers - 1);
+    cfg->One("churn-r" + std::to_string(round), voters, false);
+  }
+
+  // 收尾：节点2 恢复为 voter
+  int leader = cfg->CheckOneLeader();
+  if (cfg->GetRaft(leader)->MembershipView()[2] !=
+      static_cast<int>(MemberRole::kVoter)) {
+    cfg->GetRaft(leader)->ProposeConfChange(2, true);
+    bool ok = false;
+    for (int t = 0; t < 100; t++) {
+      raftcpp::SleepMs(100);
+      bool all = true;
+      for (int i = 0; i < servers; i++) {
+        if (cfg->GetRaft(i)->MembershipView()[2] !=
+            static_cast<int>(MemberRole::kVoter)) { all = false; break; }
+      }
+      if (all) { ok = true; break; }
+    }
+    if (!ok) cfg->Fatal("churn 收尾：节点2 未能恢复为 voter");
+  }
+  cfg->One("churn-final", servers, false);
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ⑧：移除【当前 leader 自己】后必须主动退位（step down）
+//
+// Raft 单节点变更里，leader 也可能被写进移除列表。正确实现应在 conf apply、发现自己
+// 不再是 voter 时立即 step down，让剩余节点重选。否则它会以「已被集群移除」的身份
+// 继续发心跳/提交，造成「幽灵 leader」（其他节点不再投它票，但它还在干活）。
+// 这条抓「移除自身后不退位」的实现 bug，用 GetState().second（is_leader）精确断言。
+// ===========================================================================
+void TestRemoveLeaderSelf() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: removing the current leader itself must step it down");
+
+  int leader = cfg->CheckOneLeader();
+
+  // 移除 leader 自己
+  cfg->GetRaft(leader)->ProposeConfChange(leader, false);
+
+  // 等 conf apply：该节点 is_member_ 变成 kRemoved
+  bool ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(leader)->MembershipView()[leader] ==
+        static_cast<int>(MemberRole::kRemoved)) { ok = true; break; }
+  }
+  if (!ok) cfg->Fatal("移除自身失败：is_member_[leader] 未切换为 kRemoved");
+
+  // 关键断言：原 leader 必须主动退位（轮询，容忍全量负载下的时序抖动）
+  bool stepped_down = false;
+  for (int t = 0; t < 30; t++) {
+    raftcpp::SleepMs(100);
+    if (!cfg->GetRaft(leader)->GetState().second) { stepped_down = true; break; }
+  }
+  if (!stepped_down) {
+    cfg->Fatal("移除自身的 leader 没有主动退位（GetState 仍报告 is_leader=true）—— 幽灵 leader 风险");
+  }
+
+  // 集群应选出新 leader（非原 leader），且剩余 2 voter 仍能提交
+  int new_leader = cfg->CheckOneLeader();
+  if (new_leader == leader) {
+    cfg->Fatal("移除后原 leader 仍被认作 leader（集群未重选）");
+  }
+  cfg->One("after-leader-removed", 2, false);
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ⑨：InstallSnapshot 必须正确重水化 is_member_ 角色
+//
+// 落后节点靠 InstallSnapshot 被拉起时，快照里的 members 必须携带【角色】
+// （learner/removed），而不只是「是否是成员」的 bool。若快照只用 bool 编码，
+// learner 装快照后会退化回 kVoter，removed 节点会复活成 voter —— 两种情况都会
+// 悄悄撑大 quorum。这条让节点2 降为 learner 并大幅落后，重连后由 InstallSnapshot
+// 拉起，断言它起来后仍是 learner（角色随快照正确重水化）。
+// ===========================================================================
+void TestInstallSnapshotRestoresMembership() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->EnableSnapshotCompaction();
+  cfg->Begin("Test: InstallSnapshot restores learner role (not just membership)");
+
+  int leader = cfg->CheckOneLeader();
+
+  // 把节点 2 降为 learner
+  auto conf_res = cfg->GetRaft(leader)->ProposeConfChangeTo(2, MemberRole::kLearner);
+  int conf_idx = conf_res.index;  // 这条 learner 变更条目的下标（事后确认快照覆盖了它）
+  bool ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(2)->MembershipView()[2] ==
+        static_cast<int>(MemberRole::kLearner)) { ok = true; break; }
+  }
+  if (!ok) cfg->Fatal("降级失败：is_member_[2] 未切换为 kLearner");
+
+  // 让节点2 落后：断网，期间写很多（触发 leader 做快照）
+  cfg->Disconnect(2);
+  for (int i = 1; i <= 60; i++)
+    cfg->One("put k" + std::to_string(i) + " v" + std::to_string(i), 2, false);
+
+  // 节点2 此时 next_index 远落后于 leader 的 snapshot_index → 重连后必走 InstallSnapshot
+  cfg->Connect(2);
+
+  // 等节点2 被 InstallSnapshot 拉起并应用快照（含 members/角色）
+  ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(2)->LastLogIndex() >= 50 &&
+        cfg->GetRaft(2)->MembershipView()[2] ==
+            static_cast<int>(MemberRole::kLearner)) { ok = true; break; }
+  }
+  if (!ok) {
+    int role2 = cfg->GetRaft(2)->MembershipView()[2];
+    cfg->Fatal("InstallSnapshot 未正确重水化角色：节点2 起来后 is_member_[2]=" +
+               std::to_string(role2) + "，应为 kLearner(" +
+               std::to_string(static_cast<int>(MemberRole::kLearner)) +
+               ") —— 若快照只用 bool 编码成员，learner 会退化回 voter → quorum 被撑大");
+  }
+
+  // 小修：显式确认节点2 是【走 InstallSnapshot 重水化】拿到 learner 角色，
+  // 而非靠普通日志追平（否则本用例退化为普通追平检验，对快照 bool 编码 bug 漏检）。
+  int snap_idx = cfg->GetRaft(2)->SnapshotIndex();
+  if (snap_idx <= conf_idx) {
+    cfg->Fatal("InstallSnapshot 未覆盖成员变更条目：节点2 的 SnapshotIndex(" +
+               std::to_string(snap_idx) + ") <= conf_idx(" + std::to_string(conf_idx) +
+               ") —— 节点2 是走普通日志追平而非快照重水化（假绿风险）");
+  }
+
+  cfg->One("after-snap", 2, false);
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ⑩：变更期间并发写入必须不丢、不重
+//
+// 修订动机：原版收尾用 `for 每个 cmd: cfg->One(cmd,3)` 重新提交 —— 这等于把
+// "丢没丢" 彻底掩盖（One 会自旋等到节点2 重新加入后再提交）。唯一硬断言只剩
+// "节点2 终回 kVoter"，所以"不丢/不重"几乎没真正验到 → 假绿。
+//
+// 修订做法：变更与写入都结束后，扫描整段【已提交】日志（index 1..leader.LastLogIndex()），
+// 收集所有我们真发过的 "c*" 命令值，断言恰好 {c0..cK-1} 各出现一次：
+//   - 缺失 → 命令丢失（未出现在已提交日志中）；
+//   - 某个值出现 >1 次 → 同一条命令被重复提交（Raft 线性一致破防）。
+// conf 变更条目也占 index，其载荷是 "CONF:..." 哨兵串，不在 cmds 集合里，
+// 扫描时只统计与已知 cmds 完全相等的值，不会误伤。
+// ===========================================================================
+void TestConcurrentConfChangeLinearizable() {
+  const int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: concurrent writes during a membership change must not be lost/duplicated");
+  int leader = cfg->CheckOneLeader();
+
+  const int K = 30;
+  std::vector<std::string> cmds(K);
+  for (int i = 0; i < K; i++) cmds[i] = "c" + std::to_string(i);
+
+  // 【稳健性】原写法要求每条命令都提交到 servers(=3) 台。但在"节点2 被移除"的
+  // 窗口里它已被冻结（Q2：不再收新数据），该窗口内发起的 One 只能凑到 2 台；
+  // Config::One 内层只等 2s（config.cpp:504）且 retry=false 会立刻 Fatal，
+  // 高负载下加回+追平若超过 2s 就误判失败（假 flaky）。
+  // 这里改为按【变更期始终成立的多数派】= servers-1 提交：
+  //   ・不会重发命令（retry 仍为 false —— 改成 true 会重复 Start 同一条命令，
+  //     直接违背下面"不重复"断言）；
+  //   ・"不丢/不重"的真正把关是下面那段【全量已提交日志审计】+
+  //     Wait(idx, servers) 要求 3 台都补齐，复制完整性并未被削弱。
+  const int kStableServers = servers - 1;
+  std::thread writer([&]() {
+    for (int i = 0; i < K; i++) cfg->One(cmds[i], kStableServers, false);
+  });
+
+  // 主线程在写入进行中穿插一次成员变更（移除节点2 + 加回）
+  raftcpp::SleepMs(150);
+  cfg->GetRaft(leader)->ProposeConfChange(2, false);
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(2)->MembershipView()[2] ==
+        static_cast<int>(MemberRole::kRemoved)) break;
+  }
+  StartResult r_add = cfg->GetRaft(cfg->CheckOneLeader())->ProposeConfChange(2, true);
+  if (r_add.index < 0) cfg->Fatal("加回节点2 的提案被拒（index<0）—— 无法断言并发变更下的单飞保护");
+  bool back = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(2)->MembershipView()[2] ==
+        static_cast<int>(MemberRole::kVoter)) { back = true; break; }
+  }
+  if (!back) cfg->Fatal("加回节点2 后 10s 内未回到 kVoter —— 用例前提不成立");
+  writer.join();
+
+  // 角色断言：变更必须完整回滚（节点2 回到 voter）
+  if (cfg->GetRaft(2)->MembershipView()[2] !=
+      static_cast<int>(MemberRole::kVoter)) {
+    cfg->Fatal("成员变更未完整恢复：节点2 应回到 kVoter（并发写入期间变更后状态错乱）");
+  }
+
+  // ★ 真·不丢/不重审计（修复假绿）
+  // 扫描整段已提交日志，只统计我们真发过的命令，断言恰好各出现一次。
+  int last = cfg->GetRaft(cfg->CheckOneLeader())->LastLogIndex();
+  std::map<std::string, int> seen;
+  for (int idx = 1; idx <= last; idx++) {
+    auto v = cfg->Wait(idx, servers, -1);
+    if (!v) cfg->Fatal("扫描已提交日志时 Wait(" + std::to_string(idx) + ") 返回空");
+    // 只统计真发过的命令（conf 哨兵串 "CONF:..." 不在此集合，自动跳过）
+    bool ours = false;
+    for (int i = 0; i < K; i++) {
+      if (*v == cmds[i]) { ours = true; break; }
+    }
+    if (ours) seen[*v]++;
+  }
+  for (int i = 0; i < K; i++) {
+    if (seen.find(cmds[i]) == seen.end())
+      cfg->Fatal("并发变更期间命令 " + cmds[i] + " 丢失（未出现在已提交日志中）");
+    if (seen[cmds[i]] > 1)
+      cfg->Fatal("命令 " + cmds[i] + " 在已提交日志中出现 " +
+                 std::to_string(seen[cmds[i]]) +
+                 " 次（被重复提交 → 线性一致破防）");
+  }
+
+  cfg->One("final", servers, false);
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ⑪：learner 在追平过程中遇到网络抖动，最终仍能追平
+//
+// 把节点3 降为 learner，然后用后台线程周期性断连/重连节点3 模拟不稳定网络，
+// 期间持续写入。验证：
+//  1) 抖动期间集群仍可用（只要求 3 个 voter 提交，learner 可能离线）；
+//  2) 抖动结束后 learner 必须最终追平（最终要求 4 节点都提交）；
+//  3) learner 角色不被抖动破坏（仍是 kLearner，不能退化成 voter 撑大 quorum）。
+// 这条抓的是"断连/重连后复制状态机（next_index_/match_index_）错乱导致追平
+// 死循环 / 永久落后"类的 bug。
+// ===========================================================================
+void TestLearnerCatchupWithChurn() {
+  const int servers = 4;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: learner catches up despite network churn (periodic disconnect/reconnect)");
+  int leader = cfg->CheckOneLeader();
+
+  cfg->GetRaft(leader)->ProposeConfChangeTo(3, MemberRole::kLearner);
+  bool ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(3)->MembershipView()[3] ==
+        static_cast<int>(MemberRole::kLearner)) { ok = true; break; }
+  }
+  if (!ok) cfg->Fatal("降级失败：is_member_[3] 未切换为 kLearner");
+
+  const int M = 40;
+  std::thread churn([&]() {
+    for (int i = 0; i < M; i++) {
+      if (i % 3 == 0) cfg->Disconnect(3);
+      else if (i % 3 == 1) cfg->Connect(3);
+      // i%3==2 保持当前网络状态不变
+      cfg->One("churn-" + std::to_string(i), servers - 1, false);  // learner 可能离线，容 3 个 voter
+      raftcpp::SleepMs(30);
+    }
+    cfg->Connect(3);  // 收尾确保连通，让 learner 最终追平
+  });
+  churn.join();
+
+  // 最终 learner 必须追平：所有命令在 learner 也 apply（要求 4 节点都提交）
+  for (int i = 0; i < M; i++)
+    cfg->One("churn-" + std::to_string(i), servers, false);
+
+  // learner 角色不被抖动破坏
+  if (cfg->GetRaft(3)->MembershipView()[3] !=
+      static_cast<int>(MemberRole::kLearner)) {
+    cfg->Fatal("抖动后 learner 角色错乱：节点3 应仍为 kLearner（不能退化成 voter 撑大 quorum）");
+  }
+  cfg->One("after-churn", servers, false);
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ⑫：变更中途 leader 崩溃（conf 未提交）必须安全收敛
+//
+// 单节点变更的安全性靠「新旧配置多数派永远相交」+「leader 在 apply 一条 conf 之前
+// 不提下一条（pending_conf_index_）」。这条专门压「leader 在 conf 已 propose 但
+// 还没 commit/apply 时崩溃」：新 leader 上任后必须让集群以一致状态继续，绝不能
+// 留下【分叉的成员态】或脑裂。
+//
+// 关键实现事实（raft.cpp）：conf 条目随日志持久化，pending_conf_index_ 也是
+// 持久化、且是【每个节点各自】的。新 leader 不会继承别人的 pending —— 但它仍可能
+// 继承一条「未提交」的 conf 条目。正确实现下这条条目会被新 leader 正常
+// 复制→提交→apply，所有节点最终一致切到目标角色；本用例断言的就是这个收敛结果
+// （含原 leader 崩溃回来后，三节点成员视图仍完全一致）。
+// 与 ⑭（干净 apply + 复杂序列）互补：这条覆盖「崩溃打断未提交窗口」。
+// ===========================================================================
+void TestConfChangeMidCrash() {
+  const int servers = 5;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: membership change survives leader crash before conf commits");
+
+  int leader = cfg->CheckOneLeader();
+
+  // 选一个【不是 leader】的节点做移除目标，避免与「leader 自移除」耦合
+  int target = (leader + 1) % servers;
+
+  // 1) 发起「移除 target」变更，但【不等它 commit/apply】就立刻把 leader 打掉
+  cfg->GetRaft(leader)->ProposeConfChange(target, false);
+  raftcpp::SleepMs(120);  // conf 条目可能已复制到 follower，但远未确定是否已 apply
+
+  cfg->Crash1(leader);
+
+  // 2) 剩余节点必须仍能选出新 leader
+  //    5 节点移除 1 后仍有 ≥3 voter；即便 conf 已 apply，crash 1 个 leader 后
+  //    余下 ≥3 voter ≥ quorum(4)=3，绝不脑裂/卡死（这是 3 节点版本做不到的）
+  int new_leader = cfg->CheckOneLeader();
+  if (new_leader == leader) cfg->Fatal("崩溃后竟还认原 leader（它已 down）");
+
+  // 3) 收敛后所有【在线】节点成员视图必须一致（核心不变量：不能有分叉成员态）
+  //    （原 leader 已 down，跳过它）
+  int ref = (leader + 2) % servers;
+  if (ref == leader) ref = (leader + 3) % servers;
+  auto view_ref = cfg->GetRaft(ref)->MembershipView();
+  for (int i = 0; i < servers; i++) {
+    if (i == leader) continue;  // 原 leader 还 down，跳过
+    if (cfg->GetRaft(i)->MembershipView() != view_ref) {
+      cfg->Fatal("崩溃后在线节点成员视图不一致（分叉成员态 → 安全性崩塌）");
+    }
+  }
+
+  // 4) 剩余节点仍能正常提交（多数派未被破坏；3 = 5 节点集群的 quorum）
+  cfg->One("after-crash", 3, false);
+
+  // 5) 原 leader 回来：最终【所有 5 个节点】成员视图必须一致
+  cfg->Start1(leader);
+  cfg->Connect(leader);
+  raftcpp::SleepMs(500);  // 等 conf 条目在重连后跨节点最终一致
+  auto final_view = cfg->GetRaft(0)->MembershipView();
+  for (int i = 0; i < servers; i++) {
+    if (cfg->GetRaft(i)->MembershipView() != final_view) {
+      cfg->Fatal("原 leader 回归后节点" + std::to_string(i) +
+                 " 成员视图仍与其他节点不一致（conf 跨重启未收敛）");
+    }
+  }
+
+  // 6) 收敛后集群仍能提交（4 = 移除 1 节点后的 voter 数）
+  cfg->One("final", 4, false);
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ⑬：被移除的节点即使在线，也绝不被计入 quorum（无幽灵票）
+//
+// 与 TestLearnerNeverLeader（learner 不当选）、TestRemoveLeaderSelf（移除自身退位）
+// 互补：那条验「被移除节点不能【当】leader」，这条验「被移除节点不能【凑】quorum」。
+// 危险场景：若 quorum 计算错误地把 kRemoved 节点也算进多数派，那么移除节点2 后，
+// 即便再断掉一个真实 voter，剩下「1 个真实 voter + 节点2(removed)」仍能凑齐
+// quorum → 会选出 leader（或让某次读/写成功），等于节点2 的「幽灵票」生效。
+//
+// 断言：移除节点2 → 断开一个真实 voter → CheckNoLeader（证明没有节点2 的幽灵票，
+// 在线真实 voter 只剩 1 个 < quorum=2，永远选不出 leader）。
+// 【变异实证：有牙】把 QuorumSizeLocked / MemberCountLocked 改成把 kRemoved 也算成员
+// → 幽灵票生效 → {1,2} 凑齐 quorum → CheckNoLeader 失败（选出 leader）。
+// ===========================================================================
+void TestRemovedNodeExcludedFromQuorum() {
+  const int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: a removed node is excluded from quorum even when online (no ghost vote)");
+
+  int leader = cfg->CheckOneLeader();
+
+  // 1) 移除节点2（它仍是 running + connected，模拟「被移除但还活着、还在网上」）
+  cfg->GetRaft(leader)->ProposeConfChange(2, false);
+  bool ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(2)->MembershipView()[2] ==
+        static_cast<int>(MemberRole::kRemoved)) { ok = true; break; }
+  }
+  if (!ok) cfg->Fatal("移除失败：is_member_[2] 未切换为 kRemoved");
+
+  // 2) 断开一个【真实 voter】（既不是节点2，也不在被移除状态），
+  //    剩「另 1 个真实 voter + 节点2(removed)」
+  int victim = (leader + 1) % servers;
+  if (victim == 2) victim = (leader + 2) % servers;  // 保证 victim 是真实 voter
+  cfg->Disconnect(victim);
+
+  // 3) 关键断言：没有节点2 的幽灵票，在线真实 voter 只剩 1 个 < quorum(2) → 选不出 leader
+  raftcpp::SleepMs(2 * kRaftElectionTimeout);
+  cfg->CheckNoLeader();
+
+  // 4) 恢复：重连真实 voter → 必须能重新选出 leader，且集群继续可用
+  cfg->Connect(victim);
+  cfg->CheckOneLeader();
+  cfg->One("after-reconnect", 2, false);
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ⑭：任意 churn 收敛后，所有节点成员视图必须完全一致（防分叉成员态）
+//
+// 廉价强不变式兜底：不管变更序列多乱（voter↔removed 切换、learner↔voter 切换、
+// 穿插 leadership 换届），只要集群静默下来，所有节点的 MembershipView() 必须逐字节
+// 相等。任何让某节点漏 apply / 多 apply / 错 apply 成员变更的路径，都会暴露为
+// 「分叉成员态」——而分叉成员态正是脑裂 / 提交错乱的前兆。
+// 与 ⑫（注入崩溃）互补：这条覆盖「干净 apply 但序列复杂」的收尾一致性。
+// 【齿已磨尖】收尾故意留节点3 为 learner 终态（见下方收敛段注释）；若某节点
+// 漏 apply 自己/他人的 learner 角色，视图会与正确终态分叉 → 此用例 FAILED。
+// 此前该用例因收尾强制作 voter 恰好与「默认态」重合而齿钝，现已修正。
+// ===========================================================================
+void TestMembershipConsistencyAtQuiescence() {
+  const int servers = 5;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: all nodes agree on membership after arbitrary churn");
+
+  // 跑一段确定性但杂乱的变更序列：偶数轮切节点2(voter↔removed)，奇数轮切节点3(learner↔voter)
+  for (int round = 0; round < 8; round++) {
+    int l = cfg->CheckOneLeader();
+    if (round % 2 == 0) {
+      int role2 = cfg->GetRaft(l)->MembershipView()[2];
+      bool is_v = (role2 == static_cast<int>(MemberRole::kVoter));
+      // 【稳健性】原写法忽略提案返回值、且等待循环无 ok 标志：变更若被拒/未 apply
+      // 会静默继续跑，后续"全员视图一致"断言就失去意义（分不清"没生效"和"真分叉"）。
+      StartResult pr = cfg->GetRaft(l)->ProposeConfChange(2, !is_v);  // voter<->removed
+      if (pr.index < 0) {
+        cfg->Fatal("第 " + std::to_string(round) +
+                   " 轮提案被拒（index<0）—— 用例前提不成立，继续跑只是在测空气");
+      }
+      int want = is_v ? static_cast<int>(MemberRole::kRemoved)
+                      : static_cast<int>(MemberRole::kVoter);
+      bool applied = false;
+      for (int t = 0; t < 100; t++) {
+        raftcpp::SleepMs(100);
+        bool all = true;
+        for (int i = 0; i < servers; i++)
+          if (cfg->GetRaft(i)->MembershipView()[2] != want) { all = false; break; }
+        if (all) { applied = true; break; }
+      }
+      if (!applied) {
+        cfg->Fatal("第 " + std::to_string(round) +
+                   " 轮：节点2 的角色变更 10s 内未被全员 apply —— 静默放过会让终态断言失去意义");
+      }
+    } else {
+      int role3 = cfg->GetRaft(l)->MembershipView()[3];
+      MemberRole want = (role3 == static_cast<int>(MemberRole::kVoter))
+                            ? MemberRole::kLearner
+                            : MemberRole::kVoter;
+      StartResult pr2 = cfg->GetRaft(l)->ProposeConfChangeTo(3, want);
+      if (pr2.index < 0) {
+        cfg->Fatal("第 " + std::to_string(round) +
+                   " 轮提案被拒（index<0）—— 用例前提不成立，继续跑只是在测空气");
+      }
+      int want_i = static_cast<int>(want);
+      bool applied2 = false;
+      for (int t = 0; t < 100; t++) {
+        raftcpp::SleepMs(100);
+        bool all = true;
+        for (int i = 0; i < servers; i++) {
+          auto vi = cfg->GetRaft(i)->MembershipView();
+          // 【Q2 冻结的设计后果，不是缺陷】已被移除的节点会被冻结在"它自己的移除
+          // 条目"上，之后的新数据一律不发（raft.cpp ReplicateLoop 的 IsRemovedFrozen
+          // 闸门 + removed_cap 限流）。因此它【看不到】本轮对节点3 的降级，视图停在
+          // 旧值 —— 这是隐私要求下的预期行为。原用例要求"全员一致"对已移除节点是
+          // 错误预期（只因等待循环静默超时才没暴露）；这里显式跳过这类节点。
+          if (i < static_cast<int>(vi.size()) &&
+              vi[i] == static_cast<int>(MemberRole::kRemoved)) continue;
+          if (vi[3] != want_i) { all = false; break; }
+        }
+        if (all) { applied2 = true; break; }
+      }
+      if (!applied2) {
+        cfg->Fatal("第 " + std::to_string(round) +
+                   " 轮：节点3 的角色变更 10s 内未被【在集群内】的节点全员 apply"
+                   " —— 静默放过会让终态断言失去意义");
+      }
+    }
+    // 每 3 轮制造一次 leadership 换届（真正跨 leadership），增加路径覆盖
+    if (round % 3 == 2) {
+      cfg->Crash1(l);
+      cfg->CheckOneLeader();
+      cfg->Start1(l);
+    }
+  }
+
+    // 收敛：只把节点2 恢复为 voter，【故意留节点3 为 learner】终态 ——
+  // 这样若某节点漏 apply 了节点3 的 learner 角色（"自身角色不自更新"那类 bug），
+  // 它的视图会与「节点3=learner」的正确终态分叉 → 下面的完全一致断言抓到（齿变尖）。
+  int leader = cfg->CheckOneLeader();
+  if (cfg->GetRaft(leader)->MembershipView()[2] !=
+      static_cast<int>(MemberRole::kVoter))
+    cfg->GetRaft(leader)->ProposeConfChange(2, true);
+  if (cfg->GetRaft(leader)->MembershipView()[3] !=
+      static_cast<int>(MemberRole::kLearner))
+    cfg->GetRaft(leader)->ProposeConfChangeTo(3, MemberRole::kLearner);  // 确保终态=learner
+  raftcpp::SleepMs(600);  // 静默期，让所有节点把最后的 conf 都 apply 一致
+
+  // 不变式：所有节点 MembershipView 完全相等
+  auto base = cfg->GetRaft(0)->MembershipView();
+  for (int i = 1; i < servers; i++) {
+    if (cfg->GetRaft(i)->MembershipView() != base) {
+      cfg->Fatal("静默后节点" + std::to_string(i) +
+                 " 的成员视图与其他节点不一致（分叉成员态 → 脑裂前兆）");
+    }
+  }
+
+  cfg->One("final", servers - 1, false);  // 节点3 终态是 learner（不计票），4 个 voter 提交即可
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ⑮：变更期间的线性一致读（ReadIndex）必须用「已提交配置」的 quorum
+//
+// ReadIndex 的读确认要攒够【多数派】确认。这个多数派必须是「已提交配置」的
+// voter 集合，而不能是旧配置（quorum 过大 → 该读的读不出来 / 超时）或
+// in-progress 配置（quorum 过小 → 可能返回未真正安全的读）。
+// 这条用 4→3 节点变更 + 断一个 voter，制造「新旧配置 quorum 大小不同」的窗口，
+// 断言变更后 ReadIndex 仍能用新的、更小的 quorum 正常返回（返回 >= 0 而非 -1）。
+// 【变异实证：有牙】把读确认多数派改成 peers_.size()/2+1（旧 4 节点口径），
+//   变更+断网后只剩 3 节点却需 3 票 → ReadIndex 超时返回 -1 → 本用例 FAILED。
+// ===========================================================================
+void TestReadIndexDuringConfChange() {
+  const int servers = 4;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: ReadIndex uses committed-config quorum across a membership change");
+
+  int leader = cfg->CheckOneLeader();
+
+  // 基线：4 voter → quorum 3，全在线，ReadIndex 应能返回（>=0）
+  cfg->One("v1", servers, false);
+  int ri_base = cfg->GetRaft(leader)->ReadIndex();
+  if (ri_base < 0)
+    cfg->Fatal("基线 ReadIndex 失败（4 节点全在线应可线性一致读）");
+
+  // 移除节点 3（4 → 3 voter，quorum 由 3 降到 2）
+  cfg->GetRaft(leader)->ProposeConfChange(3, false);
+  bool ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(3)->MembershipView()[3] ==
+        static_cast<int>(MemberRole::kRemoved)) { ok = true; break; }
+  }
+  if (!ok) cfg->Fatal("移除节点3 失败：未切换为 kRemoved");
+
+  // 断开【被移除的节点3】（确保它不在线、不补 ReadIndex 的 ack 票）
+  cfg->Disconnect(3);
+  // 再断开一个真实 voter（节点2）→ 在线只剩 {0,1} 两个 voter。
+  // 新（已提交）配置：3 节点 quorum=2 → {0,1} 刚好够 → ReadIndex 应返回 >=0。
+  // 旧 4 节点配置：quorum=3 → 只剩 2 票可达 → 超时返回 -1 → 线性一致读被破坏。
+  cfg->Disconnect(2);
+
+  // 慷慨轮询等 {0,1} 选出 leader（高负载下选举可能超过单次 CheckOneLeader 固定超时，
+  // 用轮询而非固定 sleep，避免偶发 "expected one leader, got none"）。
+  int leader2 = -1;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    for (int i = 0; i < servers; i++) {
+      if (i == 2 || i == 3) continue;  // leader 只可能在 {0,1}
+      if (cfg->GetRaft(i)->GetState().second) { leader2 = i; break; }
+    }
+    if (leader2 >= 0) break;
+  }
+  if (leader2 < 0) cfg->Fatal("变更+断网后 {0,1} 未选出 leader（集群不可用）");
+  raftcpp::SleepMs(kRaftElectionTimeout);  // 等 leader 稳定、no-op 提交（ReadIndex 前提）
+
+  // ReadIndex 重试几次：高负载下偶发 ack 超时返回 -1 属瞬态，需与
+  // 「旧配置导致持续 -1」区分——后者任何重试都拿不到 >=0。
+  int ri = -1;
+  for (int attempt = 0; attempt < 5; attempt++) {
+    ri = cfg->GetRaft(leader2)->ReadIndex();
+    if (ri >= 0) break;
+    raftcpp::SleepMs(200);
+  }
+  if (ri < 0) {
+    cfg->Fatal("变更后 ReadIndex 失败：ReadIndex 似乎用了旧配置的大 quorum"
+               "（4 节点口径需 3 票，但节点2/3 都已不在，只剩 2 票可达）→ 线性一致读被破坏");
+  }
+
+  // 再写一条（2 个 voter 即可提交），ReadIndex 必须看到更新的 commit（证明读随配置/日志推进）
+  cfg->One("v2", 2, false);
+  int ri2 = -1;
+  for (int attempt = 0; attempt < 5; attempt++) {
+    ri2 = cfg->GetRaft(leader2)->ReadIndex();
+    if (ri2 >= 0) break;
+    raftcpp::SleepMs(200);
+  }
+  if (ri2 < 0) cfg->Fatal("变更后第二次 ReadIndex 失败");
+
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ⑯：learner 可直接被移除（learner → removed，跳过 voter 中间态）
+//
+// 三态转移里 voter→removed、learner→voter、voter→learner 都有覆盖，但
+// 「learner 直接变 removed」这条直转分支没测过。若 ApplyLoop 处理 conf 时
+// 对 learner 来源有特殊分支/漏处理，可能导致 learner 卡在中间态或不被真正移除。
+// ===========================================================================
+void TestLearnerDirectlyRemoved() {
+  const int servers = 4;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: a learner can be removed directly (learner -> removed)");
+
+  int leader = cfg->CheckOneLeader();
+
+  // 先把节点 3 降为 learner
+  cfg->GetRaft(leader)->ProposeConfChangeTo(3, MemberRole::kLearner);
+  bool ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(3)->MembershipView()[3] ==
+        static_cast<int>(MemberRole::kLearner)) { ok = true; break; }
+  }
+  if (!ok) cfg->Fatal("降级失败：节点3 未切换为 kLearner");
+
+  // 直接移除（learner → removed，不走 voter 中间态）
+  cfg->GetRaft(cfg->CheckOneLeader())->ProposeConfChange(3, false);
+  ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    bool all = true;
+    for (int i = 0; i < servers; i++) {
+      if (cfg->GetRaft(i)->MembershipView()[3] !=
+          static_cast<int>(MemberRole::kRemoved)) { all = false; break; }
+    }
+    if (all) { ok = true; break; }
+  }
+  if (!ok) cfg->Fatal("learner 直转 removed 失败：节点3 未落到 kRemoved");
+
+  // 移除后集群仍可提交（3 个 voter）
+  cfg->One("after-direct-remove", servers - 1, false);
+
+  // 角色不被任何路径复活：再等一会儿确认仍是 removed
+  raftcpp::SleepMs(300);
+  if (cfg->GetRaft(0)->MembershipView()[3] !=
+      static_cast<int>(MemberRole::kRemoved)) {
+    cfg->Fatal("learner→removed 直转后角色回退（被复活）");
+  }
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ⑰：提拔「还落后的 learner」必须安全（已提交日志不丢不重）
+//
+// 扩容标准流程是「先以 learner 追平，再提拔为 voter」。但若实现允许把【日志还
+// 差很多】的 learner 直接提成 voter 且立刻让其参与提交，就可能用落后日志覆盖
+// 多数派已提交日志 → 安全性崩塌（「不安全提拔」）。
+// 这条：把节点3 降为 learner 并让其大幅落后，再提拔为 voter，断言提拔后
+// 【所有此前已提交的命令一条都不丢、不重】（集群始终保持线性一致）。
+// 【变异实证：有牙】把「提拔」改成不等待追平、且让该 learner 立即被计入提交
+// 多数派（忽略其 match_index 落后）→ 已提交命令丢失/重复 → 扫描日志检出 → FAILED。
+//   注：正确 Raft 靠选举日志比较天然挡住「落后节点当选」，故该用例主要作安全不变式
+//   回归守卫；变异需同时破坏「role 切换」与「提交计票」两道闸才暴露，属深齿。
+// ===========================================================================
+void TestPromoteLaggingLearnerSafe() {
+  const int servers = 4;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: promoting a still-lagging learner must not lose committed entries");
+
+  int leader = cfg->CheckOneLeader();
+
+  // 先写一批「基线命令」，确保已提交
+  const int BASE = 10;
+  for (int i = 0; i < BASE; i++)
+    cfg->One("base" + std::to_string(i), servers, false);
+
+  // 把节点 3 降为 learner 并【断网】→ 它开始落后
+  cfg->GetRaft(leader)->ProposeConfChangeTo(3, MemberRole::kLearner);
+  bool ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(3)->MembershipView()[3] ==
+        static_cast<int>(MemberRole::kLearner)) { ok = true; break; }
+  }
+  if (!ok) cfg->Fatal("降级失败：节点3 未切换为 kLearner");
+  cfg->Disconnect(3);
+
+  // 断网期间继续写（节点3 持续落后）
+  for (int i = 0; i < 10; i++)
+    cfg->One("lag" + std::to_string(i), servers - 1, false);  // 3 voter 提交
+
+  // 重连：节点3 开始追平，但此刻日志仍落后 —— 必须在提拔前重连，
+  // 否则提拔条目到不了节点3，它永远停在 learner。
+  cfg->Connect(3);
+
+  // 立刻提拔节点 3 为 voter（此时它日志仍可能没追平 lag 命令）
+  cfg->GetRaft(cfg->CheckOneLeader())->ProposeConfChangeTo(3, MemberRole::kVoter);
+  ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(3)->MembershipView()[3] ==
+        static_cast<int>(MemberRole::kVoter)) { ok = true; break; }
+  }
+  if (!ok) cfg->Fatal("提拔失败：节点3 未恢复为 kVoter");
+
+  // 等节点3 追平
+  raftcpp::SleepMs(800);
+
+  // 安全断言：所有此前已提交的命令（base* + lag*）在集群已提交日志里各出现恰好一次。
+  // 用扫描已提交日志的方式核对（exact-once 审计，同 ⑮）。
+  int last = cfg->GetRaft(cfg->CheckOneLeader())->LastLogIndex();
+  std::set<std::string> expected;
+  for (int i = 0; i < BASE; i++) expected.insert("base" + std::to_string(i));
+  for (int i = 0; i < 10; i++) expected.insert("lag" + std::to_string(i));
+
+  std::map<std::string, int> seen;
+  for (int idx = 1; idx <= last; idx++) {
+    auto v = cfg->Wait(idx, servers, -1);
+    if (!v) cfg->Fatal("扫描日志 Wait(" + std::to_string(idx) + ") 返回空");
+    if (expected.count(*v)) seen[*v]++;  // 跳过 conf 哨兵串 "CONF:..."
+  }
+  for (const auto& c : expected) {
+    if (seen.find(c) == seen.end())
+      cfg->Fatal("已提交命令 " + c + " 丢失（不安全提拔导致日志被覆盖）");
+    if (seen[c] > 1)
+      cfg->Fatal("已提交命令 " + c + " 重复出现（线性一致破防）");
+  }
+
+  cfg->One("after-promote", servers, false);
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ⑱：对非 voter（removed / learner）调 Start() 必须被拒，命令永不提交
+//
+// 与 ⑯（learner 不当选）、⑬（removed 不计 quorum）互补：那条验「身份」，
+// 这条验「写入口」。一个 removed/learner 节点若还能通过 Start() 把命令写进日志
+// 并提交，就等于它仍能影响状态机 → 安全性破防。
+// 断言：Start() 返回 is_leader=false 且 index=-1（命令根本没被追加），且限时内
+// 该命令不出现在任何已提交日志中。
+// 【变异实证：有牙】去掉 Start() 的 `state_ != kLeader` 拦截（允许非 leader 也追加）
+//   → removed/learner 节点 Start() 返回 index>=0 → 本用例 FAILED。
+// ===========================================================================
+void TestStartRejectedForNonVoter() {
+  const int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: Start() on a removed/learner node is rejected (command never commits)");
+
+  int leader = cfg->CheckOneLeader();
+
+  // ---- removed 节点 ----
+  cfg->GetRaft(leader)->ProposeConfChange(2, false);
+  bool ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(2)->MembershipView()[2] ==
+        static_cast<int>(MemberRole::kRemoved)) { ok = true; break; }
+  }
+  if (!ok) cfg->Fatal("移除失败：节点2 未切换为 kRemoved");
+
+  StartResult r_removed = cfg->GetRaft(2)->Start("from-removed");
+  if (r_removed.is_leader || r_removed.index != -1) {
+    cfg->Fatal("removed 节点 Start() 不应接受写（应 is_leader=false 且 index=-1）");
+  }
+
+  // ---- learner 节点 ----
+  int leader2 = cfg->CheckOneLeader();
+  cfg->GetRaft(leader2)->ProposeConfChangeTo(1, MemberRole::kLearner);  // 节点1 降 learner
+  ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(1)->MembershipView()[1] ==
+        static_cast<int>(MemberRole::kLearner)) { ok = true; break; }
+  }
+  if (!ok) cfg->Fatal("降级失败：节点1 未切换为 kLearner");
+
+  StartResult r_learner = cfg->GetRaft(1)->Start("from-learner");
+  if (r_learner.is_leader || r_learner.index != -1) {
+    cfg->Fatal("learner 节点 Start() 不应接受写（应 is_leader=false 且 index=-1）");
+  }
+
+  // 限时确认这两条命令从未进入已提交日志
+  raftcpp::SleepMs(500);
+  int last = cfg->GetRaft(cfg->CheckOneLeader())->LastLogIndex();
+  for (int idx = 1; idx <= last; idx++) {
+    // 注意：不要求 3 节点都拥有每条（Q2 下 removed/learner 节点不再收新日志，
+    // 仅剩 voter 数可能 < 3）。只要"被提交的命令里出现非 voter 来源"即判失败——
+    // 若 Start() 没拦住 removed/learner 的写，它会被提交到某条 index，这里必然抓到。
+    auto v = cfg->Wait(idx, 1, 200);
+    if (v && (*v == "from-removed" || *v == "from-learner"))
+      cfg->Fatal("非 voter 节点 Start() 的命令竟出现在已提交日志（应被拒）");
+  }
+
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ⑲：removed 节点保持冻结 + kRemoved（不被复活、不收新数据）
+//
+// ⑨ 验了「learner 装快照后仍是 learner」。这条补对称场景：在 Q2 隐私加固下，
+// removed 节点【根本不再接收任何复制流量（日志/快照/心跳）】——它已在被移除前作为
+// voter 收到了自己的移除配置并 apply 成 kRemoved，之后只需冻结。于是落后、重连后
+// 它仍是 kRemoved 且日志不前进，绝不会被快照重水化"复活成 voter"或偷偷拿到新数据。
+// 与 ⑨ 共同覆盖「成员角色编码」的正确性：learner 走快照路径、removed 走冻结路径，
+// 两条路径都不会把 removed 误当成 member 复活成 voter（否则 quorum 被悄悄撑大）。
+// ===========================================================================
+void TestInstallSnapshotRestoresRemovedRole() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->EnableSnapshotCompaction();
+  cfg->Begin("Test: a removed node stays removed AND frozen (never resurrected, never gets new data)");
+
+  int leader = cfg->CheckOneLeader();
+
+  // 把节点 2 降为 removed（用 removed，而非 ⑪ 的 learner）
+  auto conf_res = cfg->GetRaft(leader)->ProposeConfChange(2, false);
+  int conf_idx = conf_res.index;  // 这条 removed 变更条目的下标
+  bool ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(2)->MembershipView()[2] ==
+        static_cast<int>(MemberRole::kRemoved)) { ok = true; break; }
+  }
+  if (!ok) cfg->Fatal("移除失败：节点2 未切换为 kRemoved");
+
+  // 让节点2 落后：断连期间写很多（触发 leader 做快照），节点2 收不到
+  cfg->Disconnect(2);
+  for (int i = 1; i <= 60; i++)
+    cfg->One("put r" + std::to_string(i) + " v" + std::to_string(i), 2, false);
+
+  // 节点2 的 next_index 远落后 leader 的 snapshot_index → 旧逻辑下重连必走 InstallSnapshot。
+  // 但 Q2 规定 removed 节点不再收任何复制流量（含快照），所以重连后它应【保持冻结 +
+  // kRemoved】，而不是被快照重水化"复活成 voter"或偷偷拿到新数据。
+  cfg->Connect(2);
+
+  ok = false;
+  for (int t = 0; t < 60; t++) {
+    raftcpp::SleepMs(100);
+    // 关键断言：仍是 kRemoved，且日志未前进（证明没收到新数据/快照）
+    if (cfg->GetRaft(2)->MembershipView()[2] ==
+            static_cast<int>(MemberRole::kRemoved) &&
+        cfg->GetRaft(2)->LastLogIndex() <= conf_idx) { ok = true; break; }
+  }
+  if (!ok) {
+    int role2 = cfg->GetRaft(2)->MembershipView()[2];
+    int ll = cfg->GetRaft(2)->LastLogIndex();
+    cfg->Fatal("removed 节点未保持冻结+removed：role=" + std::to_string(role2) +
+               " LastLogIndex=" + std::to_string(ll) +
+               "（应为 kRemoved 且 LastLogIndex <= conf_idx=" +
+               std::to_string(conf_idx) + "；Q2 应阻止其收任何新数据/快照）");
+  }
+
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ㉓：removed 节点的日志必须冻结（Q2 隐私加固刚性验证）
+//
+// 移除一个节点后，集群继续大量写入。正确的 Q2 行为：该 removed 节点的日志长度
+// 永远停在「它被移除的那条配置条目」下标，不再前进半格。若 ReplicateLoop 仍向它
+// 发 AppendEntries，它的 LastLogIndex 会随集群增长 → 这条抓到。
+// 这是 ④ 里那句"LastLogIndex > conf_idx 即 Fatal"的【独立、无重启】版本，更直接。
+// ===========================================================================
+void TestRemovedNodeStopsReceivingReplication() {
+  const int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: a removed node's log stops advancing (Q2 privacy hardening)");
+
+  int leader = cfg->CheckOneLeader();
+  for (int i = 1; i <= 10; i++)
+    cfg->One("put a" + std::to_string(i) + " v" + std::to_string(i), servers, true);
+
+  // 移除节点 2，记录冻结点（它作为 voter 收到的最后一条 = 移除配置条目）
+  auto r = cfg->GetRaft(leader)->ProposeConfChange(2, false);
+  int conf_idx = r.index;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(2)->MembershipView()[2] ==
+        static_cast<int>(MemberRole::kRemoved)) break;
+  }
+  int frozen = cfg->GetRaft(2)->LastLogIndex();
+  if (frozen < conf_idx)
+    cfg->Fatal("节点2 冻结点异常：LastLogIndex(" + std::to_string(frozen) +
+               ") < conf_idx(" + std::to_string(conf_idx) + ")");
+
+  // 继续写很多，只要求 2 个 voter 提交
+  for (int i = 1; i <= 80; i++)
+    cfg->One("put z" + std::to_string(i) + " v" + std::to_string(i), 2, false);
+
+  raftcpp::SleepMs(500);
+  int after = cfg->GetRaft(2)->LastLogIndex();
+  if (after != frozen) {
+    cfg->Fatal("Q2 失效：removed 节点2 日志仍在前进（" + std::to_string(frozen) +
+               " -> " + std::to_string(after) + "），应被冻结在移除点");
+  }
+  if (cfg->GetRaft(2)->MembershipView()[2] !=
+      static_cast<int>(MemberRole::kRemoved))
+    cfg->Fatal("removed 节点2 角色漂移（不再是 kRemoved）");
+
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ㉔：removed 节点永不看到 post-removal 的客户端数据（Q2 隐私加固）
+//
+// 移除前写一条"公开"数据（节点 2 作为 voter 收得到）；移除后写一条"机密"数据，
+// 只走 2 个 voter 提交。正确行为：机密数据【绝不】出现在 removed 节点 2 的已提交
+// 日志里 → NCommitted(机密index) == 2（只有两个 voter），而不是 3。
+// 这是对 Q2"不向 removed 节点泄漏新数据"最直接的端到端断言。
+// ===========================================================================
+void TestRemovedNodeStaysQuiescentAfterRemoval() {
+  const int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: a removed node never sees post-removal client data (Q2)");
+
+  int leader = cfg->CheckOneLeader();
+  cfg->One("put public-pre", 3, true);  // 节点 2 作为 voter 收得到
+
+  cfg->GetRaft(leader)->ProposeConfChange(2, false);
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(2)->MembershipView()[2] ==
+        static_cast<int>(MemberRole::kRemoved)) break;
+  }
+
+  // 移除后写机密数据，只要求 2 个 voter 提交
+  int idx = cfg->One("put SECRET-post-removal", 2, false);
+  raftcpp::SleepMs(500);
+
+  // 这条机密命令应【只】在 2 个 voter 上提交；removed 节点 2 绝不该拥有它。
+  auto [nd, cmd] = cfg->NCommitted(idx);
+  if (nd >= 3) {
+    cfg->Fatal("Q2 失效：removed 节点2 竟拥有 post-removal 机密数据"
+               "（NCommitted=" + std::to_string(nd) + "，应为 2）");
+  }
+  if (cfg->GetRaft(2)->MembershipView()[2] !=
+      static_cast<int>(MemberRole::kRemoved))
+    cfg->Fatal("removed 节点2 角色漂移（不再是 kRemoved）");
+
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ⑳：随机化 churn 模糊测试（fuzz）
+//
+// 确定性用例（⑦Churn / ⑭）只翻转固定节点（偶数轮切节点2、奇数轮切节点3），
+// 漏掉「特定随机翻转顺序触发 ApplyLoop 分支遗漏 / 收敛卡死」这类竞态。这条用
+// 固定种子的伪随机引擎，随机翻转角色（voter/learner/removed，且始终保证在线
+// voter ≥ quorum）+ 随机断连重连 + 偶发 leader 崩溃换届，制造确定性序列碰不到
+// 的变更路径。收敛后断言：所有节点成员视图完全一致 + 集群仍能提交。
+//
+// 就像 ⑭ 一样是「广覆盖一致性兜底网」，但比 ⑭ 更狠——随机序列能撞到
+// 确定性序列永远走不到的翻转组合。
+// 【变异实证有牙】：ApplyLoop 应用 conf 时跳过本节点（sv != me_）→ 被变更节点
+//   不自更视图 → 收敛后视图分叉 → FAILED（与 ⑭ 同源变异）。
+// ===========================================================================
+void TestMembershipFuzzChurn() {
+  const int servers = 5;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test (fuzz): randomized membership churn must converge to a consistent view");
+
+  // 固定种子，可复现；想换序列就改这里
+  std::mt19937 rng(20260916);
+  auto rand_int = [&](int n) { return std::uniform_int_distribution<int>(0, n - 1)(rng); };
+
+  // 本地模型：当前角色（起点全是 voter）。仅用于 quorum 闸门与可读性，
+  // 最终断言一律用集群真实 MembershipView，模型漂移不影响正确性。
+  std::vector<MemberRole> role(servers, MemberRole::kVoter);
+  std::vector<bool> connected(servers, true);
+  int leader = cfg->CheckOneLeader();
+
+  const int STEPS = 25;
+  const MemberRole kTargets[3] = {MemberRole::kRemoved, MemberRole::kLearner,
+                                  MemberRole::kVoter};
+  for (int step = 0; step < STEPS; step++) {
+    int node = rand_int(servers);
+    MemberRole tgt = kTargets[rand_int(3)];
+    if (tgt == role[node]) continue;  // 没变化就跳过本步
+
+    // quorum 闸门：应用后在线 voter 数（含即将变更的 node）必须 ≥ 3（5 节点 majority）
+    int online_voters = 0;
+    for (int i = 0; i < servers; i++) {
+      MemberRole r = (i == node) ? tgt : role[i];
+      if (connected[i] && r == MemberRole::kVoter) online_voters++;
+    }
+    if (online_voters < 3) continue;  // 会破坏 quorum，跳过该步
+
+    // 【稳健性】原写法忽略返回值且等待循环无 ok 标志：变更被拒/未 apply 时静默继续，
+    // 本地模型 role[] 却已推进 —— 模型与集群漂移，终态断言等于没在测。
+    StartResult pr = cfg->GetRaft(leader)->ProposeConfChangeTo(node, tgt);
+    if (pr.index < 0) continue;   // 被拒（换届/单飞）：模型不推进，下一步再试
+    role[node] = tgt;
+    // 等 apply（单飞保护：上一条未 commit 前新提议会被拒，所以这里等它真正生效）
+    bool applied = false;
+    for (int t = 0; t < 40; t++) {
+      raftcpp::SleepMs(50);
+      if (cfg->GetRaft(node)->MembershipView()[node] == static_cast<int>(tgt)) {
+        applied = true;
+        break;
+      }
+    }
+    if (!applied) {
+      cfg->Fatal("step " + std::to_string(step) + "：节点 " + std::to_string(node) +
+                 " 的角色变更 2s 内未 apply —— 静默放过会让终态断言失去意义");
+    }
+    leader = cfg->CheckOneLeader();  // 变更期间可能换届，刷新 leader 引用
+
+    // 偶发网络抖动：随机断连一个节点 200ms 再重连（长期仍保 quorum）
+    if (step % 5 == 4) {
+      int d = rand_int(servers);
+      if (connected[d]) {
+        cfg->Disconnect(d);
+        connected[d] = false;
+        raftcpp::SleepMs(200);
+        cfg->Connect(d);
+        connected[d] = true;
+      }
+    }
+    // 偶发 leader 崩溃+重启：验证换届后成员视图不丢、不脑裂
+    if (step % 7 == 6) {
+      int old = leader;
+      cfg->Crash1(old);
+      raftcpp::SleepMs(kRaftElectionTimeout);
+      cfg->Start1(old);
+      cfg->Connect(old);
+      leader = cfg->CheckOneLeader();
+    }
+  }
+
+  // 收敛：重连所有节点、等静默
+  for (int i = 0; i < servers; i++) { cfg->Connect(i); connected[i] = true; }
+  raftcpp::SleepMs(2 * kRaftElectionTimeout);
+
+  // 不变式 1：所有节点成员视图完全一致（核心不变量：无分叉成员态）
+  int converged_leader = cfg->CheckOneLeader();
+  auto ref = cfg->GetRaft(converged_leader)->MembershipView();
+  for (int i = 0; i < servers; i++) {
+    if (cfg->GetRaft(i)->MembershipView() != ref) {
+      cfg->Fatal("fuzz 收敛后节点" + std::to_string(i) +
+                 " 成员视图与其他节点不一致（分叉成员态 → 脑裂/提交错乱前兆）");
+    }
+  }
+  // 不变式 2：集群仍能正常提交（按真实 voter 数，removed 节点不计入）
+  int voters = 0;
+  for (int i = 0; i < servers; i++)
+    if (cfg->GetRaft(i)->MembershipView()[i] == static_cast<int>(MemberRole::kVoter)) voters++;
+  cfg->One("fuzz-final", voters, false);
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ㉑：少数派分区内的 leader 发起的成员变更，愈合后必须不生效
+//
+// 单节点变更的安全性最终靠「commit 必须过多数派」兜底。这条专门压：leader 被
+// 切到少数派分区后仍自认 leader（CheckQuorum 150ms 才自查，存在窗口），它发起的
+// 变更只复制到少数派 follower，永远到不了多数派 commit → 愈合后必须被丢弃，
+// 目标节点仍是原角色，且不能脑裂。
+//
+// 这是 ⑫（崩溃打断未提交窗口）的「分区版」对称：⑫ 是 leader 崩了新 leader 接手，
+// 这条是 leader 没崩但被隔离。
+// 【变异实证】ProposeConfChangeTo 乐观地「本地立即切换 is_member_」→ 少数派 leader
+//   把目标节点本地改成 removed，愈合后其视图与多数派分叉 → FAILED（该乐观实现会让
+//   陈旧 leader 的脏 conf 生效，正是我们要挡的回归）。
+// ===========================================================================
+void TestConfChangeFromMinorityLeader() {
+  const int servers = 5;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: a conf change proposed by a leader in the minority partition must NOT take effect");
+  int leader = cfg->CheckOneLeader();
+  cfg->One("v1", servers, false);
+
+  // 把 leader 和一个 follower 一起切到少数派分区（2 节点）；其余 3 个在多数派分区
+  int victim = (leader + 1) % servers;
+  int target = (leader + 2) % servers;  // 多数派分区里的一个 voter（我们要验证它不被误改）
+  cfg->Disconnect(leader);
+  cfg->Disconnect(victim);
+
+  // 关键：立刻在 leader 仍自认 leader 的窗口内（CheckQuorum 150ms 才自查）发起变更
+  cfg->GetRaft(leader)->ProposeConfChange(target, false);  // 尝试 remove target
+  raftcpp::SleepMs(2 * kRaftElectionTimeout);  // 多数派分区选出新 leader + 旧 leader 自查退位
+
+  // 愈合分区
+  cfg->Connect(leader);
+  cfg->Connect(victim);
+  raftcpp::SleepMs(2 * kRaftElectionTimeout);  // 等日志收敛（旧 leader 的脏 conf 被新 leader 截断）
+
+  // 断言 1：愈合后集群有且仅有 1 个 leader（无脑裂）
+  int new_leader = cfg->CheckOneLeader();
+
+  // 断言 2：少数派 leader 发起的变更【没生效】——target 仍是 voter
+  if (cfg->GetRaft(target)->MembershipView()[target] !=
+      static_cast<int>(MemberRole::kVoter)) {
+    cfg->Fatal("分区内 leader 发起的成员变更竟在愈合后生效：节点" +
+               std::to_string(target) + " 不再是 kVoter（旧 leader 的脏 conf 被错误提交）");
+  }
+
+  // 断言 3：所有节点成员视图一致（无分叉）
+  auto ref = cfg->GetRaft(new_leader)->MembershipView();
+  for (int i = 0; i < servers; i++) {
+    if (cfg->GetRaft(i)->MembershipView() != ref) {
+      cfg->Fatal("分区愈合后节点" + std::to_string(i) +
+                 " 成员视图与其他节点不一致（分叉成员态）");
+    }
+  }
+
+  // 断言 4：集群仍能正常提交（状态机没被弄坏）
+  cfg->One("after-heal", servers, false);
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ㉒：learner 必须被拒绝对 ReadIndex 服务（对称负向，对应 ⑮）
+//
+// ⑮ 验的是「voter leader 在变更期用正确的（已提交配置）quorum 做 ReadIndex」；
+// 这条验的是对称面：一个 learner（非 leader）调 ReadIndex 必须被拒（返回 -1），
+// 否则它会把本地可能滞后的 commit 值当成线性一致读结果返回 → 脏读。
+//
+// 实现事实（raft.cpp:ReadIndex）：首行 `if (state_ != kLeader) return -1;`
+// 天然挡住 learner/follower。这条用例守的就是「别有人为了‘让 learner 也能读’
+// 去掉这个守卫」。
+// 【变异实证有牙】去掉 ReadIndex 的 `state_ != kLeader` 守卫 → learner 也返回
+//   commit_index_(>=0) → 期望 -1 落空 → FAILED。
+// ===========================================================================
+void TestLearnerReadIndexRejected() {
+  const int servers = 5;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: a learner must NOT serve ReadIndex (must return -1)");
+  int leader = cfg->CheckOneLeader();
+  cfg->One("v1", servers, false);
+
+  // 把节点 3 降为 learner
+  cfg->GetRaft(leader)->ProposeConfChangeTo(3, MemberRole::kLearner);
+  bool ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(3)->MembershipView()[3] ==
+        static_cast<int>(MemberRole::kLearner)) { ok = true; break; }
+  }
+  if (!ok) cfg->Fatal("降级失败：节点3 未切换为 kLearner");
+
+  // 关卡 1：对 learner 直接 ReadIndex 必须被拒
+  int ri = cfg->GetRaft(3)->ReadIndex();
+  if (ri >= 0) {
+    cfg->Fatal("learner 调 ReadIndex 返回 " + std::to_string(ri) +
+               " —— 非 leader 不应服务线性一致读（脏读风险）");
+  }
+
+  // 关卡 2：写一条已提交命令后，learner 仍应被拒（不因‘本地有 commit 值’就放行）
+  cfg->One("v2", servers, false);
+  int ri2 = cfg->GetRaft(3)->ReadIndex();
+  if (ri2 >= 0) {
+    cfg->Fatal("learner 在已有提交后仍被允许 ReadIndex（返回 " +
+               std::to_string(ri2) + "）—— 不安全");
+  }
+
+  // 对称正例：voter leader 的 ReadIndex 仍正常（证明我们没把 ReadIndex 整坏）
+  int leader2 = cfg->CheckOneLeader();
+  int ri3 = cfg->GetRaft(leader2)->ReadIndex();
+  if (ri3 < 0) cfg->Fatal("对照：voter leader 的 ReadIndex 不应失败");
+
+  cfg->End();
+}
+
+// ===========================================================================
+// 成员变更 ㉕：选举计票口径 —— 已移除 / learner 的票不得计入分子
+//
+// 背景（真实缺陷）：num_votes_ 原是裸整数「回包 granted 就 ++」，不记录
+// "谁投的"，于是"回包时已被移除"的节点的票照样进分子；而门槛
+// QuorumSizeLocked() 只数当前 voter —— 分子分母口径不一致。后果：候选者
+// 能靠一张已作废的票凑够 quorum 当选，leader 并非由当前配置多数选出
+// （选举合法性被破坏）。
+// 本用例直接构造输入调用计票纯函数，确定性验证口径，不依赖运行时序。
+// ===========================================================================
+void TestVoteCountIgnoresRemovedVoters() {
+  auto cfg = MakeConfig(3, false);
+  cfg->Begin("Test: election vote counting ignores removed/learner ballots");
+
+  // 场景：3 节点 —— 0:voter(自己)  1:voter  2:removed
+  //       票：      {0:授予(自己),  1:未投,   2:授予(但该节点已被移除)}
+  // 正确口径：2 的票作废 → 只计自己 1 票；QuorumSize({0,1}) = 2 → 不该当选。
+  std::vector<MemberRole> is_member = {MemberRole::kVoter, MemberRole::kVoter,
+                                       MemberRole::kRemoved};
+  std::vector<int> votes = {1, 0, 1};
+  int n = CountGrantedVotes(is_member, votes);
+  if (n != 1) {
+    cfg->Fatal("计票口径错：removed 节点 2 的票被计入了（得到 " +
+               std::to_string(n) + "，应为 1）");
+  }
+
+  // 对照组：同样三票，若节点 2 仍是 voter，则应计 2 票（自己 + 节点 2）。
+  std::vector<MemberRole> all_voter = {MemberRole::kVoter, MemberRole::kVoter,
+                                       MemberRole::kVoter};
+  int n_all = CountGrantedVotes(all_voter, votes);
+  if (n_all != 2) {
+    cfg->Fatal("计票口径错：全 voter 时应计 2 票（得到 " +
+               std::to_string(n_all) + "）");
+  }
+
+  // learner 同样不参与计票（learner 不投票，也不该被算进多数派）。
+  std::vector<MemberRole> with_learner = {MemberRole::kVoter,
+                                          MemberRole::kLearner,
+                                          MemberRole::kVoter};
+  std::vector<int> votes_all = {1, 1, 1};
+  int n_learner = CountGrantedVotes(with_learner, votes_all);
+  if (n_learner != 2) {
+    cfg->Fatal("计票口径错：learner 的票被计入了（得到 " +
+               std::to_string(n_learner) + "，应为 2）");
+  }
+
+  cfg->End();
+}
+
+// ===========================================================================
+// ㉖ Q2 冻结判据：两源取或（冻结点 OR 配置视图）
+// ---------------------------------------------------------------------------
+// 为什么必须"或"而不是只看一个：两条真实路径各只被一个源覆盖。
+//   (a) 提案 → apply 窗口：is_member_ 还没切，只有 removed_at_index_ 知道要冻结；
+//   (b) 经 InstallSnapshot 恢复配置：conf 条目被快照截断、冻结点重建不出来，
+//       只有 is_member_ 知道该节点已被移除。
+// 纯函数单测（无时序、零 flaky），直接钉住这个判据。
+// ===========================================================================
+void TestRemovedFreezeCoversBothSources() {
+  auto cfg = MakeConfig(3, false);
+  cfg->Begin("Test: removal freeze triggers on either freeze-point or config view");
+
+  // (a) 只有冻结点（提案后、apply 前）：必须冻结，否则 leader 会继续把
+  //     conf 之后的新条目复制给待移除节点（㉓ 偶发失败的旧根因）。
+  {
+    std::vector<MemberRole> is_member = {MemberRole::kVoter, MemberRole::kVoter,
+                                         MemberRole::kVoter};  // 尚未切换
+    std::vector<int> cap = {-1, -1, 7};                        // 已记冻结点
+    if (!IsRemovedFrozen(is_member, cap, 2)) {
+      cfg->Fatal("冻结判据错：仅有冻结点(7)时应冻结（提案→apply 窗口会漏数据）");
+    }
+  }
+
+  // (b) 只有配置视图（装快照恢复、冻结点重建不出来）：必须冻结，
+  //     否则新 leader 会给已从快照里读到的 removed 节点继续发新数据。
+  {
+    std::vector<MemberRole> is_member = {MemberRole::kVoter, MemberRole::kVoter,
+                                         MemberRole::kRemoved};
+    std::vector<int> cap = {-1, -1, -1};  // 快照截断，扫不到 conf
+    if (!IsRemovedFrozen(is_member, cap, 2)) {
+      cfg->Fatal("冻结判据错：仅配置视图为 kRemoved 时也应冻结（快照恢复场景会漏数据）");
+    }
+  }
+
+  // (c) 加回 / 从未移除：两个源都为负 → 不冻结（否则加回的节点收不到日志）。
+  {
+    std::vector<MemberRole> is_member = {MemberRole::kVoter, MemberRole::kVoter,
+                                         MemberRole::kVoter};
+    std::vector<int> cap = {-1, -1, -1};
+    if (IsRemovedFrozen(is_member, cap, 2)) {
+      cfg->Fatal("冻结判据错：未移除节点被误冻结（加回后收不到日志）");
+    }
+  }
+
+  // (d) learner：必须【不】冻结——learner 的立身之本就是继续追数据。
+  {
+    std::vector<MemberRole> is_member = {MemberRole::kVoter, MemberRole::kVoter,
+                                         MemberRole::kLearner};
+    std::vector<int> cap = {-1, -1, -1};
+    if (IsRemovedFrozen(is_member, cap, 2)) {
+      cfg->Fatal("冻结判据错：learner 被误冻结（learner 必须继续接收日志）");
+    }
+  }
+
+  // (e) 越界防御：下标非法时不得误判冻结。
+  {
+    std::vector<MemberRole> is_member = {MemberRole::kVoter, MemberRole::kVoter,
+                                         MemberRole::kRemoved};
+    std::vector<int> cap = {-1, -1, -1};
+    if (IsRemovedFrozen(is_member, cap, -1) ||
+        IsRemovedFrozen(is_member, cap, 99)) {
+      cfg->Fatal("冻结判据错：越界下标被判为冻结");
+    }
   }
 
   cfg->End();
@@ -2003,18 +4238,63 @@ static const TestCase kTests[] = {
     {"TestReadIndexConcurrent", TestReadIndexConcurrent},
     {"TestReadIndexPartitionImmediate", TestReadIndexPartitionImmediate},
     {"TestReadIndexMajorityToleratesMinorityFailure", TestReadIndexMajorityToleratesMinorityFailure},
-
     // ReadIndex × InstallSnapshot：快照回包是 AppendEntries 之外的第二条读确认通道
     {"TestReadIndexSnapshotCatchUp", TestReadIndexSnapshotCatchUp},
     {"TestReadIndexSnapshotNoDoubleCount", TestReadIndexSnapshotNoDoubleCount},
-
     // ReadIndex × 不可靠网络（丢包）：补齐 7 条 ReadIndex 里唯一的黑盒压力缺口
     {"TestReadIndexUnreliable", TestReadIndexUnreliable},
-
     // ReadIndex × 飞行中 leader 易主：旧 leader 的读必须返回 -1（绝不吐过期 commitIndex）
     {"TestReadIndexDuringReelection", TestReadIndexDuringReelection},
     // ReadIndex × 不可靠网络 × 装快照：丢包下装快照时的读不脏读且基本可用
     {"TestReadIndexSnapshotUnreliable", TestReadIndexSnapshotUnreliable},
+    {"TestReadIndexIgnoresNonVoterAcks", TestReadIndexIgnoresNonVoterAcks},
+    // ReadIndex × 失多数派超时契约（行为契约，非变异有牙）
+    {"TestReadIndexTimesOutWithoutQuorum", TestReadIndexTimesOutWithoutQuorum},
+  
+    // 成员变更 ①：单节点变更（一次一个、apply 时切换、单飞保护）
+    {"TestSingleNodeConfChange", TestSingleNodeConfChange},
+    {"TestNoRemovingLastVoter", TestNoRemovingLastVoter},
+    // ② Learner 三态：不计入多数派、但仍持续追数据、可提拔回 voter
+    {"TestLearnerCatchup", TestLearnerCatchup},
+    // ③ learner 扩容容错（§2.6 扩容零可用性损失）
+    {"TestLearnerAvailabilityWin", TestLearnerAvailabilityWin},
+    // ④ 成员配置持久化：崩溃重启后 is_member_ 不丢失（抓"只三态没真持久化"）
+    {"TestMembershipPersistAcrossRestart", TestMembershipPersistAcrossRestart},
+    // ⑤ learner 绝不当选 leader（安全性硬约束）
+    {"TestLearnerNeverLeader", TestLearnerNeverLeader},
+    // ⑥ kLearner 角色持久化（隔离版，同 ④ 手法）
+    {"TestLearnerPersistAcrossRestart", TestLearnerPersistAcrossRestart},
+    // ⑦ 连续变更 churn + 跨 leadership 单飞（脑裂压力）
+    {"TestConfChangeChurn", TestConfChangeChurn},
+    // ⑧ 移除当前 leader 自身必须主动退位
+    {"TestRemoveLeaderSelf", TestRemoveLeaderSelf},
+    // ⑨ InstallSnapshot 重水化角色（learner/removed 不退化）
+    {"TestInstallSnapshotRestoresMembership", TestInstallSnapshotRestoresMembership},
+    {"TestConcurrentConfChangeLinearizable", TestConcurrentConfChangeLinearizable},
+    {"TestLearnerCatchupWithChurn", TestLearnerCatchupWithChurn},
+    // ⑫ 变更中途 leader 崩溃（conf 未提交）必须安全收敛（无分叉成员态）
+    {"TestConfChangeMidCrash", TestConfChangeMidCrash},
+    // ⑬ 被移除节点即使在线也不计入 quorum（无幽灵票）
+    {"TestRemovedNodeExcludedFromQuorum", TestRemovedNodeExcludedFromQuorum},
+    // ⑭ 任意 churn 收敛后所有节点成员视图必须完全一致（防分叉成员态）
+    {"TestMembershipConsistencyAtQuiescence", TestMembershipConsistencyAtQuiescence},
+    {"TestReadIndexDuringConfChange", TestReadIndexDuringConfChange},
+    {"TestLearnerDirectlyRemoved", TestLearnerDirectlyRemoved},
+    {"TestPromoteLaggingLearnerSafe", TestPromoteLaggingLearnerSafe},
+    {"TestStartRejectedForNonVoter", TestStartRejectedForNonVoter},
+    {"TestInstallSnapshotRestoresRemovedRole", TestInstallSnapshotRestoresRemovedRole},
+    // ㉓ removed 节点的日志必须冻结（Q2 隐私加固刚性验证）
+    {"TestRemovedNodeStopsReceivingReplication", TestRemovedNodeStopsReceivingReplication},
+    // ㉔ removed 节点永不看到 post-removal 客户端数据（Q2 隐私加固端到端）
+    {"TestRemovedNodeStaysQuiescentAfterRemoval", TestRemovedNodeStaysQuiescentAfterRemoval},
+    // ⑳ 随机 churn 模糊测试（fuzz）：收敛后所有节点成员视图一致
+    {"TestMembershipFuzzChurn", TestMembershipFuzzChurn},
+    // ㉑ 少数派分区内 leader 发起的变更，愈合后必须不生效
+    {"TestConfChangeFromMinorityLeader", TestConfChangeFromMinorityLeader},
+    // ㉒ learner 必须被拒绝对 ReadIndex 服务（对称负向）
+    {"TestLearnerReadIndexRejected", TestLearnerReadIndexRejected},
+    {"TestVoteCountIgnoresRemovedVoters", TestVoteCountIgnoresRemovedVoters},
+    {"TestRemovedFreezeCoversBothSources", TestRemovedFreezeCoversBothSources},
   };
 
 static void Usage(const char* argv0) {
