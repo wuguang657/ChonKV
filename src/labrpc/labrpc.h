@@ -182,6 +182,21 @@ class Server {
 // ---------------------------------------------------------------------------
 // Network：整个模拟网络
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// C3 生产加固：单条 RPC 消息字节上限
+// ---------------------------------------------------------------------------
+// 限制【单条 RPC 请求】序列化后的字节数。超限的消息不会被投递给服务端，
+// 而是立即以失败回信（ok=false）返回调用方，形成"拒绝服务"而非"内存被打爆"。
+//
+// 为什么要这条：Raft 的 InstallSnapshot 载荷就是整个状态机快照，一旦上层
+// 状态机膨胀（或收到畸形的超大条目），单条消息可以轻易到 GB 级 —— 发送侧
+// 要整块序列化、接收侧要整块反序列化，两侧内存同时被顶穿，且没有任何
+// 协议层面的兜底。etcd 的 --max-request-bytes（默认 1.5MiB）就是同一道闸门。
+//
+// 默认 64MiB 是刻意放宽的：lab 的快照用例远小于此，现有 67 个用例零行为变更；
+// 生产部署或测试可用 SetMaxMessageBytes() 收紧。
+constexpr size_t kMaxRpcMessageBytesDefault = 64u * 1024u * 1024u;  // 64 MiB
+
 class Network {
  public:
   Network();
@@ -210,6 +225,14 @@ class Network {
   int GetCount(int servername);   // 某台的入站 RPC 数
   int GetTotalCount() const;      // 全网发出的 RPC 总数
   int64_t GetTotalBytes() const;  // 全网传输的总字节数
+
+  // ---- C3 单条消息字节上限 ----
+  // 设置单条 RPC 请求的字节上限（0 表示不限制）。默认 kMaxRpcMessageBytesDefault。
+  void SetMaxMessageBytes(size_t n);
+  size_t MaxMessageBytes() const;
+  // 因超过字节上限而被拒收的消息条数（观测/测试用：证明闸门真的在拦，
+  // 而不是"碰巧没发出去"）。
+  int64_t OversizedDropped() const;
 
   void Cleanup();  // 停线程、唤醒所有还在等的人
 
@@ -266,6 +289,13 @@ class Network {
 
   std::atomic<int> count_{0};
   std::atomic<int64_t> bytes_{0};
+
+  // ---- C3 单条消息字节上限 ----
+  // 运行期可改（默认 kMaxRpcMessageBytesDefault），故用 atomic 而非 constexpr，
+  // 这样测试能把闸门压到很小来断言"超限被拒"，而不必改代码重编译。
+  std::atomic<size_t> max_message_bytes_{kMaxRpcMessageBytesDefault};
+  // 被字节闸门拒收的消息条数。
+  std::atomic<int64_t> oversized_dropped_{0};
 
   // 定时器线程
   std::multimap<raftcpp::TimePoint, std::shared_ptr<TimerEvent>> timers_;

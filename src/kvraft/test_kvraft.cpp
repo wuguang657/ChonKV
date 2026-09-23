@@ -232,6 +232,22 @@ class AsyncOp {
   std::thread th_;
 };
 
+// 轮询等集群选出 leader（cfg.Leader() 只查当前状态不阻塞，构造后选主需几十~几百 ms）。
+// 返回 true 时 *out 填 leader 编号。供白盒测试（重定向 / 背压）在"有 leader 之后"再动作。
+static bool WaitForLeader(Config& cfg, int* out, int budget_ms = 5000) {
+  const int step_ms = 50;
+  int steps = budget_ms / step_ms;
+  for (int i = 0; i < steps; i++) {
+    int lid = -1;
+    if (cfg.Leader(&lid) && lid >= 0) {
+      if (out) *out = lid;
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(step_ms));
+  }
+  return false;
+}
+
 // ===========================================================================
 // 3A：基础功能
 // ===========================================================================
@@ -248,6 +264,174 @@ void TestBasic3A() {
   //    改回调 GenericTest 补回覆盖（与 TestConcurrent3A 的做法一致）。
   GenericTest("3A", /*nclients=*/1, /*unreliable=*/false, /*crash=*/false,
               /*partitions=*/false, /*maxraftstate=*/-1);
+}
+
+// ===========================================================================
+// 生产化：WrongLeader 重定向（reply 带 leader 地址）
+// ===========================================================================
+// 验证两件事：
+//   1) follower 收到 Get / PutAppend 时，reply 应当填 kWrongLeader 且 leader_id ==
+//      真实 leader 编号（客户端据此直连、省掉一轮盲目轮询）；
+//   2) leader 自身写应当 kOK，且绝不回填 leader_id（重定向只针对"找错人"）。
+// 用 kvserver(i) 白盒直调 handler，直接断言 reply.err / reply.leader_id。
+void TestKVRedirectLeaderId() {
+  const int nservers = 3;
+  Config cfg(nservers, false, -1);
+  cfg.Begin("Test: WrongLeader reply carries redirect leader id (3A)");
+
+  int leader = -1;
+  if (!WaitForLeader(cfg, &leader)) {
+    cfg.Cleanup();
+    Fatal("no leader elected");
+  }
+  // 等 follower 收到 leader 的心跳、认知到 leader 是谁（GetLeaderId 才会是有效值）。
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  int follower = (leader + 1) % nservers;  // 必非 leader
+
+  // ---- follower 收到 PutAppend → kWrongLeader + 正确 leader_id ----
+  PutAppendArgs pa;
+  pa.key = "k";
+  pa.value = "v";
+  pa.op = "Put";
+  pa.client_id = 80001;
+  pa.seq_id = 1;
+  PutAppendReply par;
+  cfg.kvserver(follower)->PutAppend(pa, par);
+  if (par.err != Err::kWrongLeader) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "follower PutAppend should be kWrongLeader, got %s",
+                  ErrName(par.err));
+    Fatal(buf);
+  }
+  if (par.leader_id != leader) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "follower PutAppend leader_id should be %d, got %d", leader,
+                  par.leader_id);
+    Fatal(buf);
+  }
+
+  // ---- follower 收到 Get → kWrongLeader + 正确 leader_id ----
+  GetArgs ga;
+  ga.key = "k";
+  ga.client_id = 80002;
+  ga.seq_id = 1;
+  GetReply gar;
+  cfg.kvserver(follower)->Get(ga, gar);
+  if (gar.err != Err::kWrongLeader) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "follower Get should be kWrongLeader, got %s",
+                  ErrName(gar.err));
+    Fatal(buf);
+  }
+  if (gar.leader_id != leader) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "follower Get leader_id should be %d, got %d", leader,
+                  gar.leader_id);
+    Fatal(buf);
+  }
+
+  // ---- leader 自身写 → kOK，且不回填 leader_id（重定向只针对找错人）----
+  PutAppendArgs pa2;
+  pa2.key = "k";
+  pa2.value = "v2";
+  pa2.op = "Put";
+  pa2.client_id = 80003;
+  pa2.seq_id = 1;
+  PutAppendReply par2;
+  cfg.kvserver(leader)->PutAppend(pa2, par2);
+  if (par2.err != Err::kOK) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "leader's own PutAppend should be kOK, got %s",
+                  ErrName(par2.err));
+    Fatal(buf);
+  }
+  if (par2.leader_id != -1) {
+    Fatal("leader's own op must not carry a redirect hint");
+  }
+
+  cfg.End();
+  cfg.Cleanup();
+}
+
+// ===========================================================================
+// 生产化：背压返回 kBusy（而不是被误判成 kWrongLeader）
+// ===========================================================================
+// 这个用例是上一轮"语义 bug"的回归测试：超过未提交日志阈值时，原本一律返回
+// kWrongLeader，客户端于是换台重试 —— 但背压恰恰发生在 leader 身上，换台毫无意义，
+// 反而让本应稍后重试的请求在节点间空转、甚至触发 GiveUp 丢写。修复后应当返回
+// 专用的 kBusy，且 leader_id == -1（不应带重定向 hint，否则客户端又会跑去别处）。
+//
+// 触发方式：2 节点，隔离 leader 与另一台（leader 从此提交不了，但在 CheckQuorum
+// 退位 ~150ms 之前仍是 leader），把未提交上限调到 1。第 1 条写会卡在 WaitOp 里
+// （uncommitted=1），第 2 条写此刻发起 → 立刻收到 kBusy。
+void TestKVBackpressureBusy() {
+  const int nservers = 2;
+  Config cfg(nservers, false, -1);
+  cfg.Begin("Test: backpressure returns kBusy (not kWrongLeader) (3A)");
+
+  int leader = -1;
+  if (!WaitForLeader(cfg, &leader)) {
+    cfg.Cleanup();
+    Fatal("no leader elected");
+  }
+
+  // 隔离 leader 与另一台：leader 从此提交不了，但在 CheckQuorum 退位（~150ms）
+  // 之前仍是 leader —— 足够让第 1 条写塞进日志、堆出 uncommitted=1。
+  std::vector<int> others;
+  for (int i = 0; i < nservers; i++)
+    if (i != leader) others.push_back(i);
+  cfg.Partition({leader}, others);
+
+  // 把 leader 的未提交上限调到 1：第 1 条提交不了（分区），第 2 条就必须背压。
+  cfg.kvserver(leader)->raft_for_test()->SetMaxUncommittedEntries(1);
+
+  // 第 1 条写：白盒直打 leader，它会在 WaitOp 里阻塞等提交（永远等不到）。
+  // 独立线程跑，避免主线程卡死；等它把 index 1 塞进日志（uncommitted=1）即可。
+  PutAppendArgs a1;
+  a1.key = "x";
+  a1.value = "1";
+  a1.op = "Put";
+  a1.client_id = 70001;
+  a1.seq_id = 1;
+  PutAppendReply r1;
+  std::thread t1([&] { cfg.kvserver(leader)->PutAppend(a1, r1); });
+
+  // 等 leader 把第 1 条塞进日志（未提交计数达到 1）。50ms 足矣，且远在 CheckQuorum
+  // 退位（~150ms）之前，leader 身份稳定。
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // 第 2 条写：同机直打。此刻 uncommitted=1 >= max=1 → 应立刻返回 kBusy，
+  // 而不是 kWrongLeader（那是之前的 bug）。
+  PutAppendArgs a2;
+  a2.key = "y";
+  a2.value = "2";
+  a2.op = "Put";
+  a2.client_id = 70002;
+  a2.seq_id = 1;
+  PutAppendReply r2;
+  cfg.kvserver(leader)->PutAppend(a2, r2);
+
+  if (r2.err != Err::kBusy) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "backpressure should return ErrBusy, got %s", ErrName(r2.err));
+    Fatal(buf);
+  }
+  if (r2.leader_id != -1) {
+    Fatal("ErrBusy must NOT carry a leader hint (leader_id should be -1)");
+  }
+
+  // 收尾：恢复网络让第 1 条最终能提交，线程自然返回，再清理。
+  cfg.ConnectAll();
+  if (t1.joinable()) t1.join();
+  cfg.End();
+  cfg.Cleanup();
 }
 
 // 多个客户端并发写【各自的 key】。
@@ -824,6 +1008,9 @@ struct TestEntry {
 const TestEntry kTests[] = {
     // ---- 3A ----
     {"TestBasic3A", TestBasic3A},
+    // ---- 生产化：重定向 + 背压（User 要求新增）----
+    {"TestKVRedirectLeaderId", TestKVRedirectLeaderId},
+    {"TestKVBackpressureBusy", TestKVBackpressureBusy},
     {"TestConcurrent3A", TestConcurrent3A},
     {"TestUnreliable3A", TestUnreliable3A},
     {"TestUnreliableOneKey3A", TestUnreliableOneKey3A},

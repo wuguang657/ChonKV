@@ -91,6 +91,11 @@ class Config {
   int RpcTotal() { return net_->GetTotalCount(); }
   int64_t BytesTotal() { return net_->GetTotalBytes(); }
 
+  // ---------- C3 单条消息字节上限（转发给 labrpc::Network）----------
+  // net_ 是私有的，测试要压低闸门必须经这里转发，避免为此放宽封装。
+  void SetMaxRpcMessageBytes(size_t n) { net_->SetMaxMessageBytes(n); }
+  int64_t OversizedDropped() { return net_->OversizedDropped(); }
+
   // ---------- 给测试用例直接访问 ----------
   std::shared_ptr<Raft> GetRaft(int i);
   bool Connected(int i);

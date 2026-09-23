@@ -17,6 +17,7 @@
 #   ./test_part.sh CheckQuorum    生产级扩展：CheckQuorum 全部 7 条
 #   ./test_part.sh ReadIndex      生产级扩展：ReadIndex 全部 10 条
 #   ./test_part.sh Membership   生产级扩展：Membership 全部 27 条
+#   ./test_part.sh MaxMessageSize 生产级扩展：MaxMessageSize 全部 3 条
 #
 # 跑非 TSan 的日常版（快 5~15 倍）：
 #   BIN=./build/raft_test COUNT=100 ./test_part.sh 2B
@@ -74,6 +75,8 @@ case "$PART" in
   3A)
     DEFAULT_BIN=./build-tsan/kv_test
     TESTS=(
+      TestKVRedirectLeaderId
+      TestKVBackpressureBusy
       TestBasic3A
       TestConcurrent3A
       TestUnreliable3A
@@ -162,8 +165,15 @@ case "$PART" in
       TestVoteCountIgnoresRemovedVoters
       TestRemovedFreezeCoversBothSources
     ) ;;
+  MaxMessageSize)
+    DEFAULT_BIN=./build-tsan/raft_test
+    TESTS=(
+      TestMaxUncommittedBackpressure
+      TestRpcMaxMessageBytes
+      TestRemovedNodeQuiesces
+    ) ;;
   *)
-    echo "未知 part: ${PART}（只支持 2A/2B/2C/3A/3B/CheckQuorum/ReadIndex）" >&2
+    echo "未知 part: ${PART}（只支持 2A/2B/2C/3A/3B/CheckQuorum/ReadIndex/Membership/MaxMessageSize）" >&2
     exit 2 ;;
 esac
 

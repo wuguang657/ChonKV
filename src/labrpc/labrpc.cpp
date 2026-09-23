@@ -156,7 +156,34 @@ Network::EndInfo Network::ReadEndInfo(const std::string& endname) {
   return info;
 }
 
+// ---- C3 单条消息字节上限（访问器）----
+void Network::SetMaxMessageBytes(size_t n) { max_message_bytes_.store(n); }
+size_t Network::MaxMessageBytes() const { return max_message_bytes_.load(); }
+int64_t Network::OversizedDropped() const { return oversized_dropped_.load(); }
+
 void Network::SendReq(std::shared_ptr<ReqMsg> req) {
+  // ---- C3 单条消息字节上限：超限直接拒收，不投递给服务端 ----
+  // 放在 SendReq 而不是 ClientEnd::Call 里，是因为 SendReq 是同步 Call 与
+  // 异步 CallAsync 的【唯一共同入口】—— 一处拦住即覆盖全网全部 RPC。
+  // 拒收方式沿用下面"断连/服务器不存在"的既有失败路径：投递一个 ok=false
+  // 的回信事件，调用方（Call 返回 false / CallAsync 回调收到 ok=false）
+  // 与"网络不通"表现一致，Raft 侧无需任何改动即可自然重试或放弃。
+  //
+  // 注意闸门必须在 count_/bytes_ 累加【之前】：被拒收的消息从未真正上网，
+  // 不该计入"全网传输字节数"（TestRPCBytes2B 之类断言的是真实传输量）。
+  size_t limit = max_message_bytes_.load();
+  if (limit > 0 && req->args.size() > limit) {
+    oversized_dropped_.fetch_add(1);
+    auto dropped = std::make_shared<TimerEvent>();
+    dropped->slot = req->slot;
+    dropped->cb = req->cb;
+    dropped->cancel = req->cancel;
+    dropped->kind = EventKind::kDeliverReply;
+    dropped->ok = false;
+    Schedule(dropped, 0);
+    return;
+  }
+
   count_.fetch_add(1);
   bytes_.fetch_add(static_cast<int64_t>(req->args.size()));
 

@@ -89,6 +89,13 @@ class Config {
   // 所有 server 的编号。测试里常写成 MakeClient(cfg.All()) 表示"能连所有机器"。
   std::vector<int> All() const;
 
+  // 仅供测试用：直接拿第 i 台 KVServer 实例（白盒断言 reply.err / leader_id 用）。
+  // ⚠️ 生产代码绝不该这么拿；这是测试脚手架的逃生舱口。
+  std::shared_ptr<KVServer> kvserver(int i) const {
+    return (i >= 0 && i < static_cast<int>(kvservers_.size())) ? kvservers_[i]
+                                                               : nullptr;
+  }
+
   // 校验所有副本的状态机是否一致（3A/3B 的核心断言）
   bool CheckConsistency(std::string* err);
 

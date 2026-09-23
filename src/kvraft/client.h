@@ -70,6 +70,16 @@ class Clerk {
   int client_id_ = 0;
   int seq_id_ = 0;
   int leader_id_ = 0;  // 上次成功那台的编号，下次优先试它
+  // 重定向兜底用的 round-robin 游标：保证"一定能遍历到所有节点"。
+  // 客户端每次失败都让 rr_ 前移 1，所以即便 hint 全是陈旧的（在 0<->2 之间
+  // 互指、绕开真正的 leader），也能靠 rr_ 兜底覆盖到真正的 leader。
+  // used_hint_：是否已经采纳过 hint 快路。逻辑是"首次错 leader 且 hint 有效
+  // 就直连它走一步；一旦采纳过，就【永久抑制后续 hint、强制纯轮询】直到本操作
+  // 成功"。原因：某个节点若持续返回陈旧 hint 指向非 leader 节点，朴素"一直信
+  // hint"会把客户端锁死在 1<->2 互指（Concurrent3A 实测卡死 60s GiveUp）。
+  // 绝大多数情况下首条 hint 即真 leader 一步直达，只有选举抖动期才退化轮询。
+  int rr_ = 0;
+  int used_hint_ = 0;
 
   // 是否在 Put/Append 上触发过 GiveUp（供 CheckLinearizability 判断 history 可信度）
   std::atomic<bool> gave_up_on_write_{false};

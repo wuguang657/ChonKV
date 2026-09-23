@@ -100,11 +100,14 @@ class KVServer {
   void ApplierLoop();
 
   // 把一条 Op 交给 raft，等它被 apply。
-  // 返回 kOK 表示这条命令确实生效了；kWrongLeader 表示得换台机器重试。
+  // 返回 kOK 表示这条命令确实生效了；kWrongLeader 表示得换台机器重试；
+  // kBusy 表示"我是 leader 但被背压限流，稍后重试同一台即可"。
+  // out_leader_id：当返回 kWrongLeader 时，回填"本节点认知到的 leader 编号"
+  // （供客户端重定向直连）；kOK/kBusy/未知时为 -1。
   //
   // （早期版本有两个 out_value / out_err 出参，用来给 Get 回传"apply 那瞬间"
   //  的状态机值。Get 改走 ReadIndex 直读后不再需要，已删除。）
-  Err WaitOp(const Op& op);
+  Err WaitOp(const Op& op, int* out_leader_id);
 
   // ---- 以下三个都要求调用方【持有 mu_】（名字以 Locked 结尾）----
   // 把状态机编码成快照字节：kv_store_ + last_seq_

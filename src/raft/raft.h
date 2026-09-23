@@ -100,6 +100,27 @@ constexpr int kMinSendIntervalMs = 10;
 // 带日志的 AppendEntries 发出去后，超过这个时间还没回音就重发
 // （回信丢了也要能恢复，否则日志永远推不过去）
 constexpr int kLogRetryMs = 300;
+// 流水线（滑动窗口）：单条 AppendEntries 携带的日志条目上限。
+// 同时修复"单条 AE 条目无上限"的缺口 —— follower 落后 100 万条时不再一条 RPC 全塞。
+constexpr int kMaxEntriesPerRpc = 1024;
+// 流水线窗口：允许在途（已发未确认）的日志条目上限。
+// 在途条目数 = next_index_[s] - 1 - match_index_[s]，超过则暂停发新批，
+// 直到收到 ACK（match_index_ 推进）或超时重发。设为 kMaxEntriesPerRpc 整数倍
+// → 即"8 批在途"，跨 10ms RTT 时吞吐从 1/RTT 提升到 8/RTT。
+constexpr int kPipelineMaxInFlight = 8 * kMaxEntriesPerRpc;
+
+// ---------------------------------------------------------------------------
+// C1 生产加固：未提交 entry 上限（背压 / 防 OOM）
+// ---------------------------------------------------------------------------
+// leader 侧允许积压的【未提交日志条目】数上限。
+//   未提交条目数 = LastLogIndex() - commit_index_
+// 超过则 Start() 拒绝新提案（返回 backpressure=true），形成背压，
+// 防止海量并发写时 leader 把未提交日志无限堆在内存里撑爆（etcd 的
+// MaxUncommittedEntries 同款语义，etcd 按字节算，这里按条目数算更贴合 lab）。
+//
+// 默认 10000 条：lab 规模永远触发不到 → 现有 67 个用例零行为变更。
+// 生产部署或测试可用 SetMaxUncommittedEntries() 调低（<=0 表示不限制）。
+constexpr int kMaxUncommittedEntriesDefault = 10000;
 
 // ---------------------------------------------------------------------------
 // 数据结构
@@ -288,6 +309,10 @@ struct StartResult {
   bool is_leader = false;
   int index = -1;
   int term = 0;
+  // C1 背压标记：本节点【确实是 leader】，但因未提交 entry 已达上限而拒绝提案。
+  // 与 is_leader=false 区分开 —— 后者可能是"我不是 leader"，本标记专指"我是
+  // leader 但被限流了"，调用方可据此选择"稍后重试"而不是"换 leader 重试"。
+  bool backpressure = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -337,6 +362,12 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // 返回 (currentTerm, 我是否是 leader)
   std::pair<int, bool> GetState();
 
+  // 重定向用：返回本节点"认知到的 leader 编号"。
+  // 收到合法 AppendEntries（含心跳）时记下 args.leader_id；自己当选时记 me_。
+  // 初始 -1（尚未认知任何 leader）。KVServer 据此在 kWrongLeader 的 reply 里
+  // 回填 leader 地址，让客户端直连、省掉一轮盲目轮询。
+  int GetLeaderId() const;
+
   // 上层服务（比如 KV 服务器）提交一条命令。
   // 不是 leader 就返回 is_leader=false。
   StartResult Start(const Command& command);
@@ -366,6 +397,23 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // 用来验证"learner 不计入多数派"：4 节点里 1 个是 learner 时，
   // 有效 voter=3 → 阈值 2（而不是 4 节点的 3）。
   int QuorumSize() const;
+
+  // ---- C1 未提交 entry 上限（背压）----
+  // 设置上限（<=0 表示不限制）。默认 kMaxUncommittedEntriesDefault，
+  // 生产/测试可下调以验证背压行为。
+  void SetMaxUncommittedEntries(int n);
+  int MaxUncommittedEntries() const;
+  // 当前未提交条目数 = LastLogIndex() - commit_index_（调试/测试用）。
+  int UncommittedCount() const;
+
+  // ---- C5 被移除节点主动退场 ----
+  // 本节点是否已被配置变更移除（apply 到"移除自己"那条 conf 条目之后为真）。
+  // 被移除的节点会主动静默：不发起选举、不接受客户端写、不提供线性一致读，
+  // 防止它继续当 candidate 干扰多数派（etcd 同款行为）。
+  // 若后续配置又把本节点加回（kLearner / kVoter），本值自动恢复为 false。
+  bool IsRemovedSelf();
+  // 因"已被移除"而被主动抑制的选举次数（证明定时器确实在静默，而非偶然没触发）。
+  int ElectionSuppressedCount() const;
   // 调试/测试：本节点日志最新下标。
   // 用来验证"learner 虽不投票，但仍在持续接收并追加日志（追数据）"。
   int LastLogIndex() const;
@@ -607,9 +655,13 @@ class Raft : public std::enable_shared_from_this<Raft> {
 
   // 每个 follower：上次真正发出 AppendEntries 的时刻（用于节流）
   std::vector<raftcpp::TimePoint> last_send_time_;
-  // 是否已经有一份"带日志"的 AppendEntries 在途（在途就先只发空心跳，
-  // 避免同一批日志被重复发送 —— TestRPCBytes2B 会数字节）
-  std::vector<bool> inflight_log_;
+  // 流水线（滑动窗口）实现说明：
+  //   在途（已发未确认）条目数 = next_index_[s] - 1 - match_index_[s]。
+  //   next_index_ 是【发送指针】，仅"发送新批次"时前进；
+  //   match_index_ 是【确认指针】，仅收到成功 ACK 时前进（单调）。
+  //   二者之差即窗口占用；> kPipelineMaxInFlight 时暂停发新批。
+  //   不再需要 bool 在途标记：超时重发只需把发送指针回退到 match_index_+1（幂等重发）。
+  // inflight_log_time_：最近一次"发出带日志 AE"的时刻，用于超时重发判定。
   std::vector<raftcpp::TimePoint> inflight_log_time_;
 
   // ---- 生产级扩展 ①：CheckQuorum / Leader Lease / ReadIndex ----
@@ -675,6 +727,26 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // -1 表示无冻结点（节点是 voter/learner，或刚重启尚未从 ApplyLoop 重建）。
   // 不持久化：重启后节点本就从日志重放拿到过移除条目，cap<0 → 直接冻结即可，无需补发。
   std::vector<int> removed_at_index_;
+
+  // ---- C1 未提交 entry 上限（背压）----
+  // 由 SetMaxUncommittedEntries() 修改；默认 kMaxUncommittedEntriesDefault。
+  // 受 mu_ 保护（只在 Start() 内读、由 SetMaxUncommittedEntries() 写）。
+  int max_uncommitted_entries_ = kMaxUncommittedEntriesDefault;
+
+  // ---- 重定向用：本节点认知的 leader 编号 ----
+  // 收到合法 AppendEntries（含心跳）时记为 args.leader_id；自己当选时记为 me_。
+  // 初始 -1（尚未认知任何 leader）。受 mu_ 保护（只在 AppendEntries /
+  // BecomeLeaderIfQuorumLocked / GetLeaderId 内读写）。
+  int leader_id_ = -1;
+
+  // ---- C5 被移除节点主动退场 ----
+  // 因"自己已被移除"而被主动抑制的选举次数，只在选举定时器里自增。
+  // 存在的意义：证明静默逻辑【真的生效了】，而不是"碰巧没触发选举"——
+  // 没有它，删除 C5 的检查后测试依然全绿（假通过），mutation 检验抓不出来。
+  std::atomic<int> election_suppressed_{0};
+  // 锁内版本：调用方必须已持有 mu_（Start()/ReadIndex() 内部用）。
+  bool IsRemovedSelfLocked() const;
+
   // Start() 追加日志、或心跳计数变化时 notify_all() 唤醒所有复制线程
   std::condition_variable replicator_cv_;
   std::condition_variable apply_cv_;

@@ -129,19 +129,46 @@ std::string Clerk::Get(const std::string& key) {
     switch (reply.err) {
       case Err::kOK:
         leader_id_ = leader;
+        rr_ = (leader + 1) % static_cast<int>(servers_.size());
+        used_hint_ = 0;
         // 记录成功的 Get（只有这条进了 history；ErrWrongLeader/kTimeout 那
         // 些次不算操作 —— Go 版同样不记）
         RecordGet(key, reply.value, MonoNs(t_call), MonoNs(t_return));
         return reply.value;
       case Err::kNoKey:
         leader_id_ = leader;
+        rr_ = (leader + 1) % static_cast<int>(servers_.size());
+        used_hint_ = 0;
         RecordGet(key, "", MonoNs(t_call), MonoNs(t_return));
         return "";
-      case Err::kWrongLeader:
-      case Err::kTimeout:
+      case Err::kBusy:
+        // 背压：本节点就是 leader 但被限流，应稍后重试【同一台】，不要换 leader，
+        // 也不要走 hint（hint 指向别处只会让请求在节点间空转、甚至触发 GiveUp 丢写）。
+        used_hint_ = 0;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        leader = (leader + 1) % static_cast<int>(servers_.size());
         continue;
+      case Err::kWrongLeader:
+      case Err::kTimeout: {
+        // 重定向："首次"错 leader 时若带有效 hint（且不是当前节点自己），直连它走快路；
+        // 但一旦采纳过 hint，就【抑制后续 hint、强制纯 round-robin】直到本操作成功。
+        // 原因：某个节点若持续返回陈旧 hint（指向一个根本不是 leader 的节点），
+        // 每轮都信它就会把客户端锁死在"1<->2"互指里（Concurrent3A 实测卡死）。
+        // 抑制 hint 后，rr_ 游标会坚定不移地遍历全部节点，一定能覆盖到真 leader。
+        // 绝大多数情况下首条 hint 就是真 leader，一步直达；只有选举抖动期才会退化成轮询。
+        int n = static_cast<int>(servers_.size());
+        int next;
+        if (reply.leader_id >= 0 && reply.leader_id != leader && !used_hint_) {
+          next = reply.leader_id;   // 一次性尝试 hint 指向的 leader
+          used_hint_ = 1;           // 之后抑制 hint，强制轮询直到成功
+        } else {
+          next = rr_;               // 纯轮询兜底：保证覆盖全部节点
+          // 注意：此处不把 used_hint_ 清零——保持抑制状态，直到 kOK/kBusy 才放行
+        }
+        rr_ = (next + 1) % n;
+        leader = next;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        continue;
+      }
     }
   }
 }
@@ -186,18 +213,41 @@ void Clerk::PutAppend(const std::string& key, const std::string& value,
     const auto t_return = std::chrono::steady_clock::now();
     switch (reply.err) {
       case Err::kOK:
+        rr_ = (leader_id_ + 1) % static_cast<int>(servers_.size());
+        used_hint_ = 0;
         RecordPutAppend(key, value, op_code, MonoNs(t_call), MonoNs(t_return));
         return;
       case Err::kNoKey:
         // Put/Append 不该返回这个；当成"换台重试"处理，避免死循环
+        rr_ = (leader_id_ + 1) % static_cast<int>(servers_.size());
+        used_hint_ = 0;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         leader_id_ = (leader_id_ + 1) % static_cast<int>(servers_.size());
+        continue;
+      case Err::kBusy:
+        // 背压：本节点就是 leader 但被限流，重试【同一台】，不换 leader、不走 hint。
+        used_hint_ = 0;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
         continue;
       case Err::kWrongLeader:
-      case Err::kTimeout:
+      case Err::kTimeout: {
+        // 重定向：与 Get 同一策略——"首次"错 leader 且带有效 hint 时直连快路，
+        // 一旦采纳过 hint 就抑制后续 hint、强制纯 round-robin 直到成功，
+        // 避免被某个节点的陈旧 hint 锁死在互指循环里。
+        int n = static_cast<int>(servers_.size());
+        int next;
+        if (reply.leader_id >= 0 && reply.leader_id != leader_id_ && !used_hint_) {
+          next = reply.leader_id;   // 一次性尝试 hint 指向的 leader
+          used_hint_ = 1;           // 之后抑制 hint，强制轮询直到成功
+        } else {
+          next = rr_;               // 纯轮询兜底：保证覆盖全部节点
+          // 不把 used_hint_ 清零（保持抑制，直到 kOK/kBusy 才放行）
+        }
+        rr_ = (next + 1) % n;
+        leader_id_ = next;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        leader_id_ = (leader_id_ + 1) % static_cast<int>(servers_.size());
         continue;
+      }
     }
   }
 }

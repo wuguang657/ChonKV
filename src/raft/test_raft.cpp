@@ -4188,6 +4188,186 @@ void TestRemovedFreezeCoversBothSources() {
 }
 
 // ===========================================================================
+// C1 未提交 entry 上限（背压）—— leader 未提交日志积压到上限后必须拒绝新提案
+//
+// 为什么需要：Start() 之前对"leader 能堆多少未提交日志"完全没有约束，海量并发
+// 写（或 follower 全断）时这些条目全部堆在内存里，直到 OOM。etcd 的
+// MaxUncommittedEntries 就是这道闸门。
+//
+// 变异检验（双向，缺一不可）：
+//   · 删掉 Start() 里的背压判断        → 永远观测不到 backpressure=true → 本用例失败
+//   · 把判断改成无条件触发（if(true)）  → 正常集群一条都提交不了 → 回归用例失败
+// ===========================================================================
+void TestMaxUncommittedBackpressure() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: max uncommitted entries backpressure (C1)");
+
+  int leader = cfg->CheckOneLeader();
+
+  // 断开两个 follower：leader 拿不到多数派 → 日志只增不提交，未提交数必然单调上涨。
+  // ⚠️ CheckQuorum 会在 ~150ms 后让 leader 主动退位，所以下面这场 Start() 暴雨
+  //    必须【紧跟着断开】在毫秒级内打完，否则测的就是"退位"而不是"背压"。
+  for (int i = 0; i < servers; i++) {
+    if (i != leader) cfg->Disconnect(i);
+  }
+  if (!cfg->GetRaft(leader)->GetState().second) {
+    cfg->Fatal("准备阶段失败：断开 follower 后 leader 已提前退位");
+  }
+
+  const int limit = 10;
+  cfg->GetRaft(leader)->SetMaxUncommittedEntries(limit);
+
+  int accepted = 0;
+  int backpressured = 0;
+  for (int i = 0; i < 60; i++) {
+    auto r = cfg->GetRaft(leader)->Start("c1-cmd-" + std::to_string(i));
+    if (r.backpressure) {
+      backpressured++;
+    } else if (r.is_leader) {
+      accepted++;
+    }
+  }
+
+  if (backpressured <= 0) {
+    cfg->Fatal("背压未生效：60 次 Start() 中没有一次返回 backpressure=true");
+  }
+  if (accepted > limit) {
+    cfg->Fatal("背压失效：被接受的提案数 " + std::to_string(accepted) +
+               " 超过上限 " + std::to_string(limit));
+  }
+  // 背压是"拒绝"，不是"丢弃"：日志里必须恰好只多出 accepted 条，一条不多。
+  int uncommitted = cfg->GetRaft(leader)->UncommittedCount();
+  if (uncommitted > limit) {
+    cfg->Fatal("未提交条目数 " + std::to_string(uncommitted) + " 突破上限 " +
+               std::to_string(limit));
+  }
+
+  // 恢复：闸门调回默认 + 重新连网，集群必须自愈并能正常提交。
+  cfg->GetRaft(leader)->SetMaxUncommittedEntries(kMaxUncommittedEntriesDefault);
+  for (int i = 0; i < servers; i++) {
+    if (i != leader) cfg->Connect(i);
+  }
+  cfg->One("after-backpressure", servers, false);
+  cfg->End();
+}
+
+// ===========================================================================
+// C3 单条消息字节上限 —— 超限的 RPC 必须被拒收（而不是把两端内存顶穿）
+//
+// 为什么需要：InstallSnapshot 的载荷是整个状态机快照。上层状态机一旦膨胀（或
+// 收到畸形超大条目），单条消息可以轻易到 GB 级：发送侧整块序列化、接收侧整块
+// 反序列化，两侧内存同时被顶穿，而协议层没有任何兜底。etcd 的
+// --max-request-bytes（默认 1.5MiB）是同一道闸门。
+//
+// 变异检验：
+//   · 删掉 SendReq 里的超限判断 → OversizedDropped() 恒为 0 → 本用例失败
+// ===========================================================================
+void TestRpcMaxMessageBytes() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: RPC message byte cap drops oversized messages (C3)");
+
+  int leader = cfg->CheckOneLeader();
+  (void)leader;
+  cfg->One("before-cap", servers, false);
+
+  // 默认闸门（64MiB）下不该有任何消息被拒 —— 否则说明闸门默认值定得太小，
+  // 会误伤正常的快照流量。
+  if (cfg->OversizedDropped() != 0) {
+    cfg->Fatal("默认闸门下不应有消息被拒收，实际 = " +
+               std::to_string(cfg->OversizedDropped()));
+  }
+
+  // 压到 4 字节：连最小的心跳都会超限 → 全网消息全部被拒收。
+  //
+  // ⚠️ 这里不能想当然写"64 字节"。args 用 zigzag varint 编码（codec.h:43），
+  //    小数值只占 1 字节 —— 一个空 AppendEntries 心跳是 7 个字段 ≈ 7 字节。
+  //    第一版就是照直觉写了 64，结果闸门一条都没拦到（OversizedDropped=0），
+  //    用例红着才发现。所以闸门值必须按【实际编码尺寸】选，不是拍脑袋。
+  cfg->SetMaxRpcMessageBytes(4);
+  raftcpp::SleepMs(kRaftElectionTimeout);
+
+  int64_t dropped = cfg->OversizedDropped();
+  if (dropped <= 0) {
+    cfg->Fatal("字节闸门未生效：被拒收的消息数 = 0（应为多条）");
+  }
+
+  // 恢复闸门后集群必须自愈（证明闸门只是"拒收"，没有把状态机搞坏）。
+  cfg->SetMaxRpcMessageBytes(labrpc::kMaxRpcMessageBytesDefault);
+  cfg->One("after-cap-recovered", servers, false);
+  cfg->End();
+}
+
+// ===========================================================================
+// C5 被移除节点主动退场 —— apply 到"移除自己"的配置条目后必须停止参选
+//
+// 现状说明（重要，避免误判为"从零新增"）：不起选 / 不投票 / 拒绝写入这三件事
+// 本来就被 IsVoter 守卫覆盖了（raft.cpp:460/557/774）。真正缺的是【入口处主动
+// 静默 + 可观测】：原来要"进了 StartElection() 才被拦"，白跑一趟 Pre-Vote 广播，
+// 而且没有任何证据能区分"主动静默"和"碰巧没超时"。
+//
+// 因此本用例断言的是新增的 ElectionSuppressedCount() —— 它只在"选举定时器已
+// 超时、但因自己已被移除而主动放弃"时自增。
+//
+// ⚠️ 必须断开 victim：removed 节点【仍会收到心跳】（raft.cpp:1146 明确这么设计，
+//    它要靠心跳推进 commit_index_ 才能 apply 到移除自己的那条 conf）。不断开则
+//    last_heartbeat_ 一直被刷新，定时器永不超时 → 计数器恒为 0 → 用例假失败。
+//
+// 变异检验：
+//   · 删掉选举定时器里的 IsRemovedSelf() 判断 → 计数器恒为 0 → 本用例失败
+//     （注意：删掉后集群行为仍然正确，因为 StartElection 里的 !IsVoter 兜底
+//       还在 —— 所以必须用计数器断言，用"它是不是 leader"断言会假通过）
+// ===========================================================================
+void TestRemovedNodeQuiesces() {
+  int servers = 5;  // 移除 1 台后剩 4 台，多数派 3，留足余量
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: removed node stops campaigning (C5)");
+
+  int leader = cfg->CheckOneLeader();
+  int victim = (leader + 1) % servers;
+
+  // ① 先（在连网状态下）让 victim apply 到移除自己的配置条目
+  cfg->GetRaft(leader)->ProposeConfChange(victim, false);
+  bool removed_ok = false;
+  for (int t = 0; t < 100; t++) {
+    raftcpp::SleepMs(100);
+    if (cfg->GetRaft(victim)->MembershipView()[victim] ==
+        static_cast<int>(MemberRole::kRemoved)) {
+      removed_ok = true;
+      break;
+    }
+  }
+  if (!removed_ok) cfg->Fatal("移除失败：victim 的 is_member_ 未切换为 kRemoved");
+  if (!cfg->GetRaft(victim)->IsRemovedSelf()) {
+    cfg->Fatal("IsRemovedSelf() 未报告 true");
+  }
+
+  // ② 断开它，逼选举定时器反复超时（见上方 ⚠️ 说明）
+  cfg->Disconnect(victim);
+  raftcpp::SleepMs(3 * kRaftElectionTimeout);
+
+  if (cfg->GetRaft(victim)->ElectionSuppressedCount() <= 0) {
+    cfg->Fatal("被移除节点没有主动静默：ElectionSuppressedCount() == 0");
+  }
+  if (cfg->GetRaft(victim)->GetState().second) {
+    cfg->Fatal("被移除节点竟然成了 leader");
+  }
+
+  // ③ 其余节点不应被误判为"已移除"
+  for (int i = 0; i < servers; i++) {
+    if (i == victim) continue;
+    if (cfg->GetRaft(i)->IsRemovedSelf()) {
+      cfg->Fatal("节点 " + std::to_string(i) + " 被误报为 IsRemovedSelf");
+    }
+  }
+
+  // ④ 剩余集群仍可正常提交
+  cfg->One("after-remove", servers - 1, false);
+  cfg->End();
+}
+
+// ===========================================================================
 // 测试主程序
 // ===========================================================================
 
@@ -4295,6 +4475,14 @@ static const TestCase kTests[] = {
     {"TestLearnerReadIndexRejected", TestLearnerReadIndexRejected},
     {"TestVoteCountIgnoresRemovedVoters", TestVoteCountIgnoresRemovedVoters},
     {"TestRemovedFreezeCoversBothSources", TestRemovedFreezeCoversBothSources},
+
+    // ---- 细节级生产加固 C1 / C3 / C5 ----
+    // C1 未提交 entry 上限（背压，防 leader 内存被未提交日志撑爆）
+    {"TestMaxUncommittedBackpressure", TestMaxUncommittedBackpressure},
+    // C3 单条 RPC 消息字节上限（防超大 snapshot/畸形条目顶穿收发两端内存）
+    {"TestRpcMaxMessageBytes", TestRpcMaxMessageBytes},
+    // C5 被移除节点主动退场（入口处静默 + 可观测，不再白跑 Pre-Vote 广播）
+    {"TestRemovedNodeQuiesces", TestRemovedNodeQuiesces},
   };
 
 static void Usage(const char* argv0) {

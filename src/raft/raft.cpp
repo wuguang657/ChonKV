@@ -192,7 +192,6 @@ Raft::Raft(std::vector<std::shared_ptr<labrpc::ClientEnd>> peers, int me,
   // last_send_time_[s] / inflight_log_[s] / inflight_log_time_[s] 在空 vector
   // 上越界读 → 段错误（2A 一启动就崩）。
   last_send_time_.assign(peers_.size(), raftcpp::TimePoint{});   // 复制线程上次发包时刻，用于节流
-  inflight_log_.assign(peers_.size(), false);                    // 是否有带日志的 RPC 在途
   inflight_log_time_.assign(peers_.size(), raftcpp::TimePoint{});// 在途 RPC 发出时刻，用于超时重发
 
   // 重启后从磁盘恢复 raft state（含快照边界，见 ReadPersist）。
@@ -250,6 +249,11 @@ void Raft::Kill() {
 std::pair<int, bool> Raft::GetState() {
   std::lock_guard<std::mutex> lk(mu_);
   return {current_term_, state_ == ServerState::kLeader};
+}
+
+int Raft::GetLeaderId() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return leader_id_;
 }
 
 std::string Raft::LogStatus() {
@@ -429,6 +433,19 @@ void Raft::ElectionTimerLoop() {
     }
     if (killed_.load()) return;
     if (!should_start) continue;
+
+    // ---- C5：自己已被配置移除 → 主动静默，不发起选举 ----
+    // StartElection() 内部本来就有 !IsVoter 的兜底 return（raft.cpp:460），
+    // 但那是"进了门才被拦"。这里在【入口】拦掉并计数，意义有三：
+    //   1) 不自增 term 去打断正常集群（防旧节点捣乱多数派，etcd 同款）；
+    //   2) 不白跑一趟 Pre-Vote 广播（省掉无用 RPC 与 CPU）；
+    //   3) 计数可被测试断言 —— 证明静默真的生效，而非"碰巧没超时"。
+    // 用 continue 而非 break/return：保留定时器循环，若后续配置把本节点加回
+    // （kLearner/kVoter），IsRemovedSelf() 转假后能立刻恢复参选能力。
+    if (IsRemovedSelf()) {
+      election_suppressed_.fetch_add(1);
+      continue;
+    }
 
     // TODO(2A)：超时了，该发起选举了。
     //
@@ -704,6 +721,7 @@ void Raft::BecomeLeaderIfQuorumLocked() {
     // 读安全点设好前误判 commit_index_ >= read_safe_commit_(旧值0) 而提前放行读。
     // （整段都在 mu_ 锁内，ReadIndex 也取锁，所以不存在真正并发；此处仅为语义清晰。）
     state_ = ServerState::kLeader;
+    leader_id_ = me_;  // 自己就是 leader，重定向回填直接用自己
     // 新当选：作废任何残留的"待退位"意图——它属于上一任的身份结论，带过来会让
     // 一个刚当选的合法 leader 拒收写/拒接读、并在宽限到点后无故自我退位。
     // 当前所有调用路径上都已由 ConvertToFollowerLocked 清过，此处属防御性兜底。
@@ -867,6 +885,12 @@ void Raft::AppendEntries(const AppendEntriesArgs& args,
   // 规则 1：任期比我小 → 拒绝
   if (args.term < current_term_) return;
 
+  // 走到这里说明发来的是【合法（同任期或更新任期）的 leader】→ 记下它的编号，
+  // 供上层做 WrongLeader 重定向（kvraft 的 Get/PutAppend reply 回填 leader_id）。
+  // 即便随后因为任期更大而退位，这条消息的发送方也确实是当前/更新任期的合法
+  // leader，记它没错；下一任 leader 的心跳会把 leader_id_ 覆盖成正确值。
+  leader_id_ = args.leader_id;
+
   // 收到合法 leader 的消息 → 续命
   last_heartbeat_ = raftcpp::Now();
   tick_cv_.notify_all();
@@ -964,6 +988,25 @@ StartResult Raft::Start(const Command& command) {
   if (killed_.load() || state_ != ServerState::kLeader || pending_stepdown_)
     return result;
 
+  // ---- C5 纵深防御：已被配置移除的节点不得再接受客户端写 ----
+  // 正常路径上 pending_stepdown_ / !IsVoter 已经拦过，这里再拦一次是防止
+  // 那些守卫被后续改动绕过（被移除的节点不该再往日志里塞任何东西）。
+  if (IsRemovedSelfLocked()) return result;
+
+  // ---- C1 背压：未提交 entry 达上限 → 拒绝新提案 ----
+  // 必须在 push_back【之前】判定，否则超限那一刻还会多塞一条进去。
+  // 语义同 etcd MaxUncommittedEntries：我确实是 leader（所以 is_leader 语义
+  // 上仍为真），但出于内存保护拒绝本次提案，调用方看到 backpressure=true
+  // 应当"稍后重试"，而不是"换节点重试"。
+  // 注意：result.is_leader 保持 false —— kvraft/server.cpp:259 据此返回
+  // Err::kWrongLeader，Clerk 会重试；默认上限 10000 在 lab 规模永不触发，
+  // 因此现有用例零行为变更。
+  if (max_uncommitted_entries_ > 0 &&
+      (LastLogIndexLocked() - commit_index_) >= max_uncommitted_entries_) {
+    result.backpressure = true;
+    return result;
+  }
+
   int index = LastLogIndexLocked() + 1;
   logs_.push_back(LogEntry{current_term_, index, command});
   PersistLocked();
@@ -1040,11 +1083,19 @@ void Raft::ReplicateLoop(int server) {
           return false;  // 节流中
         }
         if (heartbeat_seq_ != last_heartbeat_seq_[s]) return true;
-        // 有新日志要发？
-        if (next_index_[s] > LastLogIndexLocked()) return false;
-        if (!inflight_log_[s]) return true;
-        return raftcpp::Now() - inflight_log_time_[s] >
-               std::chrono::milliseconds(kLogRetryMs);
+        // 流水线窗口判断：在途条目数 = next_index_ - 1 - match_index_
+        bool has_new = next_index_[s] <= LastLogIndexLocked();
+        int64_t inflight =
+            static_cast<int64_t>(next_index_[s]) - 1 - match_index_[s];
+        bool timed_out =
+            inflight > 0 &&
+            (raftcpp::Now() - inflight_log_time_[s] >
+             std::chrono::milliseconds(kLogRetryMs));
+        // 窗口已满且非超时重发 → 等 ACK（释放窗口）
+        if (inflight >= kPipelineMaxInFlight && !timed_out) return false;
+        // 既无新日志、又无需超时重发 → 等待
+        if (!has_new && !timed_out) return false;
+        return true;
       });
 
       if (killed_.load()) return;
@@ -1091,10 +1142,14 @@ void Raft::ReplicateLoop(int server) {
           (s < removed_at_index_.size()) ? removed_at_index_[s] : -1;
 
       bool has_more = next_index_[s] <= LastLogIndexLocked();
-      bool may_send_log = has_more &&
-                          (!inflight_log_[s] ||
-                           raftcpp::Now() - inflight_log_time_[s] >
-                               std::chrono::milliseconds(kLogRetryMs));
+      int64_t inflight =
+          static_cast<int64_t>(next_index_[s]) - 1 - match_index_[s];
+      bool window_ok = inflight < kPipelineMaxInFlight;
+      bool timed_out =
+          inflight > 0 &&
+          (raftcpp::Now() - inflight_log_time_[s] >
+           std::chrono::milliseconds(kLogRetryMs));
+      bool may_send_log = (has_more && window_ok) || timed_out;
       if (removed) {
         // 超过冻结点（含移除条目本身）的日志一律不发；cap<0 则连移除条目都不补发（冻结）
         if (removed_cap < 0 || next_index_[s] > removed_cap) may_send_log = false;
@@ -1109,7 +1164,10 @@ void Raft::ReplicateLoop(int server) {
       last_heartbeat_seq_[s] = heartbeat_seq_;
       last_send_time_[s] = raftcpp::Now();
 
-      int next = next_index_[s];
+      // 超时重发：把发送指针回退到 match_index_+1（重发未确认区间，幂等）
+      int send_from = next_index_[s];
+      if (timed_out) send_from = match_index_[s] + 1;
+      int next = send_from;
       if (next <= 0) next = 1;
 
       // 该 follower 落后到快照点之前 → 改发 InstallSnapshot 而非 AppendEntries。
@@ -1152,11 +1210,17 @@ void Raft::ReplicateLoop(int server) {
           // Q2：removed 节点最多发到冻结点（含移除条目），绝不越过泄漏新客户端数据。
           if (removed && removed_cap >= 0 && last > removed_cap)
             last = removed_cap;
+          // 单条 RPC 条目上限：截断到最多 kMaxEntriesPerRpc 条，
+          // 既限制单包大小，也定义"一批"的粒度（窗口以条目计，等价于若干批在途）。
+          if (last - next + 1 > kMaxEntriesPerRpc)
+            last = next + kMaxEntriesPerRpc - 1;
           for (int i = next; i <= last; i++) {
             args.entries.push_back(
                 logs_[static_cast<size_t>(i) - snapshot_index_]);
           }
-          inflight_log_[s] = true;
+          // 流水线核心：发送指针只在"真正发出新批"时前进，绝不因 ACK 回退。
+          // 窗口占用由 (next_index_ - 1 - match_index_) 自动释放，无需显式清 bool。
+          next_index_[s] = last + 1;
           inflight_log_time_[s] = raftcpp::Now();
         }
         // 否则就是纯心跳：只带 prevLog 做一致性检查，不带任何日志
@@ -1208,13 +1272,11 @@ void Raft::ReplicateLoop(int server) {
           if (ok) self->cq_consec_fail_[s] = 0;
           else {
             if (self->cq_consec_fail_[s] < kCQMaxConsecFail) self->cq_consec_fail_[s]++;
-            if (!args.entries.empty())
-              self->inflight_log_[s] = false;    // 立刻清标记（丢包 / 对方挂了）
-            return;
+            return;  // 丢包 / 对方挂了，下一轮重发（封顶防无界增长）
           }
 
           // 这一批在途日志已经有了结论（无论成败），可以再发下一批了
-          if (!args.entries.empty()) self->inflight_log_[s] = false;
+          // （流水线：窗口占用由 next_index_ - match_index_ 自动释放，无需显式清 bool）
 
           if (reply.term > self->current_term_) {
             self->ConvertToFollowerLocked(reply.term);
@@ -1247,7 +1309,10 @@ void Raft::ReplicateLoop(int server) {
             if (new_match > self->match_index_[s]) {
               self->match_index_[s] = new_match;
             }
-            self->next_index_[s] = self->match_index_[s] + 1;
+            // 流水线：不再把发送指针拽回 match+1（否则已提前的发送指针被回退
+            // → 重发已发批次 → 流水线名存实亡）。next_index_ 只在"发送新批次"时前进
+            // （见发送分支）；此处只推进确认指针 match_index_。
+            // self->next_index_[s] = self->match_index_[s] + 1;  // 删除
             // Leader Lease：只要多数派在最近一个选举超时窗口内确认过我，
             // 就把租约往后推。租约 = "我确信这段时间里没人能选出新 leader"。
             // 续租依赖近实时 ack：CountRecentAcksLocked 数的是 last_ack_time_ 在 kElectionTimeoutMin 内刷新的 voter；不可靠网回包延迟会让它过于保守→租约建不起来→退化慢路径（安全取舍，非 bug）。
@@ -1741,6 +1806,45 @@ int Raft::QuorumSize() const {
 int Raft::LastLogIndex() const {
   std::lock_guard<std::mutex> lk(mu_);
   return LastLogIndexLocked();
+}
+
+// ===========================================================================
+// C1 未提交 entry 上限（背压）访问器
+// ===========================================================================
+void Raft::SetMaxUncommittedEntries(int n) {
+  std::lock_guard<std::mutex> lk(mu_);
+  max_uncommitted_entries_ = n;
+}
+
+int Raft::MaxUncommittedEntries() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return max_uncommitted_entries_;
+}
+
+int Raft::UncommittedCount() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return LastLogIndexLocked() - commit_index_;
+}
+
+// ===========================================================================
+// C5 被移除节点主动退场
+// ===========================================================================
+// 【设计选择】从 is_member_ 派生，不新增持久化字段：
+//   · 省掉 PersistLocked/ReadPersist 的字节流兼容负担（见 raft-cpp-port §3）；
+//   · 天然与"配置变更在 apply 时切换本地配置"保持同一时刻同步；
+//   · 节点被加回（kLearner/kVoter）时自动转假，无需额外清理逻辑。
+bool Raft::IsRemovedSelfLocked() const {
+  if (me_ < 0 || me_ >= static_cast<int>(is_member_.size())) return false;
+  return is_member_[me_] == MemberRole::kRemoved;
+}
+
+bool Raft::IsRemovedSelf() {
+  std::lock_guard<std::mutex> lk(mu_);
+  return IsRemovedSelfLocked();
+}
+
+int Raft::ElectionSuppressedCount() const {
+  return election_suppressed_.load();
 }
 
 // 两态便捷入口：add=true → kVoter；add=false → kRemoved。

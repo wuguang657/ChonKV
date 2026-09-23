@@ -195,7 +195,15 @@ void KVServer::Get(const GetArgs& args, GetReply& reply) {
   // 线性化点：ReadIndex 内部已保证"仅 leader 且凑齐多数派"才返回 >-1 的下标。
   // 非 leader / 凑不齐多数派返回 -1，让 Clerk 换台。
   int ri = rf_->ReadIndex();
-  if (ri < 0) { reply.err = Err::kWrongLeader; return; }
+  if (ri < 0) {
+    // 非 leader：把认知到的 leader 编号回填，供 Clerk 重定向直连。
+    // 但若是"自认为是 leader 却被隔离"（ri<0 仅因凑不齐多数派），GetLeaderId()
+    // 会返回 me_ 自己 —— 回填会让 Clerk 重定向回本节点死循环，故置 -1 退回轮询。
+    int lid = rf_->GetLeaderId();
+    reply.leader_id = (lid == me_ || lid < 0) ? -1 : lid;
+    reply.err = Err::kWrongLeader;
+    return;
+  }
 
   std::unique_lock<std::mutex> lk(mu_);
 
@@ -229,6 +237,10 @@ void KVServer::Get(const GetArgs& args, GetReply& reply) {
     });
 
     if (std::chrono::steady_clock::now() - wait_start > kWaitTimeout) {
+      // 超时：本节点自认为是 leader 但被隔离（凑不齐多数派）—— 此时 leader_id_
+      // 指向的是"自己"，若回填会让 Clerk 重定向回同一台死循环。故显式置 -1，
+      // 让 Clerk 退回盲目轮询去另找活着的 leader。
+      reply.leader_id = -1;
       reply.err = Err::kWrongLeader;
       return;
     }
@@ -243,7 +255,9 @@ void KVServer::PutAppend(const PutAppendArgs& args, PutAppendReply& reply) {
   op.client_id = args.client_id;
   op.seq_id = args.seq_id;
 
-  reply.err = WaitOp(op);
+  int leader = -1;
+  reply.err = WaitOp(op, &leader);
+  reply.leader_id = leader;  // 仅 kWrongLeader 分支会填成有效编号，其余为 -1
 }
 
 // ---------------------------------------------------------------------------
@@ -254,9 +268,26 @@ void KVServer::PutAppend(const PutAppendArgs& args, PutAppendReply& reply) {
 //   一个少数派 leader 提交了日志但永远凑不齐多数派 → 这条日志永远不会被提交。
 //   如果 RPC handler 死等，客户端就永久挂住。Go 版的注释也写了这一点：
 //   "当Start发给少数派领导在分区修复后卸任时，阻塞的RPC处理器将永远无法解除阻塞"。
-Err KVServer::WaitOp(const Op& op) {
+Err KVServer::WaitOp(const Op& op, int* out_leader_id) {
+  if (out_leader_id) *out_leader_id = -1;  // 默认"不知道 leader"
+
   raft::StartResult r = rf_->Start(op.Serialize());
-  if (!r.is_leader) return Err::kWrongLeader;
+  // ---- C1 背压：我是 leader 但被限流 → 返回 kBusy ----
+  // 关键点：之前这里只判 !r.is_leader，会把"背压限流"也当成 kWrongLeader，
+  // 客户端于是换台重试 —— 但背压恰恰发生在 leader 身上，换台毫无意义，
+  // 反而可能把本应稍后重试的请求在节点间打转、甚至触发 GiveUp 丢写。
+  // 现在区分开：backpressure=true 专指"我是 leader、稍后重试同一台即可"。
+  if (r.backpressure) return Err::kBusy;
+  if (!r.is_leader) {
+    // 真不是 leader：把认知到的 leader 编号回填，客户端据此重定向直连。
+    // 自环守卫：若本节点误以为自己是 leader（leader_id_==me_，选举瞬间的
+    // 陈旧认知），回填会让客户端重定向回自己死循环 —— 置 -1 退回轮询。
+    if (out_leader_id) {
+      int lid = rf_->GetLeaderId();
+      *out_leader_id = (lid == me_ || lid < 0) ? -1 : lid;
+    }
+    return Err::kWrongLeader;
+  }
 
   std::unique_lock<std::mutex> lk(mu_);
   msg_replies_[r.index] = NotifyMsg{false, false, op.client_id, op.seq_id};
@@ -287,7 +318,14 @@ Err KVServer::WaitOp(const Op& op) {
       // 返回 WrongLeader 让 Clerk 换台重试。
       bool ok = it->second.ok;
       msg_replies_.erase(it);
-      return ok ? Err::kOK : Err::kWrongLeader;
+      if (ok) return Err::kOK;
+      // 被新 leader 覆盖了：把新 leader 编号回填，客户端重定向直连。
+      // 同样加自环守卫（见上方 !r.is_leader 分支），避免把"自己"当重定向地址。
+      if (out_leader_id) {
+        int lid = rf_->GetLeaderId();
+        *out_leader_id = (lid == me_ || lid < 0) ? -1 : lid;
+      }
+      return Err::kWrongLeader;
     }
 
     // ⚠️ 总超时（见上方说明）：被隔离的旧 leader 上 WaitOp 不能无限等。

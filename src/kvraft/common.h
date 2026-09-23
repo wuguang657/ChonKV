@@ -20,6 +20,8 @@ enum class Err {
   kNoKey,        // Get 的 key 不存在
   kWrongLeader,  // 找错人了，客户端该换台机器重试
   kTimeout,      // 等 raft 提交超时（本实现自定义，Go 版没有）
+  kBusy,        // 我是 leader，但因未提交日志达上限被限流（背压）。
+                // 客户端应"稍后重试同一台"，而不是"换 leader 重试"。
 };
 
 inline const char* ErrName(Err e) {
@@ -28,6 +30,7 @@ inline const char* ErrName(Err e) {
     case Err::kNoKey: return "ErrNoKey";
     case Err::kWrongLeader: return "ErrWrongLeader";
     case Err::kTimeout: return "ErrTimeout";
+    case Err::kBusy: return "ErrBusy";
   }
   return "???";
 }
@@ -89,10 +92,12 @@ struct GetArgs {
 struct GetReply {
   Err err = Err::kOK;
   std::string value;
+  int leader_id = -1;  // 重定向：当 err==kWrongLeader 时，这里填"认知到的 leader
+                       // 编号"；客户端据此直连 leader。-1 表示"不知道/别重定向"。
 
   std::string Serialize() const {
     labrpc::Encoder e;
-    e.Int(static_cast<int>(err)).Bytes(value);
+    e.Int(static_cast<int>(err)).Int(leader_id).Bytes(value);
     return e.Take();
   }
   bool Deserialize(const std::string& s) {
@@ -100,6 +105,7 @@ struct GetReply {
     int e = 0;
     if (!d.Int(e)) return false;
     err = static_cast<Err>(e);
+    if (!d.Int(leader_id)) return false;
     if (!d.Bytes(value)) return false;
     return d.Ok();
   }
@@ -133,10 +139,12 @@ struct PutAppendArgs {
 
 struct PutAppendReply {
   Err err = Err::kOK;
+  int leader_id = -1;  // 重定向：err==kWrongLeader 时填认知到的 leader 编号；
+                       // -1 表示"不知道/别重定向"。
 
   std::string Serialize() const {
     labrpc::Encoder e;
-    e.Int(static_cast<int>(err));
+    e.Int(static_cast<int>(err)).Int(leader_id);
     return e.Take();
   }
   bool Deserialize(const std::string& s) {
@@ -144,6 +152,7 @@ struct PutAppendReply {
     int e = 0;
     if (!d.Int(e)) return false;
     err = static_cast<Err>(e);
+    if (!d.Int(leader_id)) return false;
     return d.Ok();
   }
 };
