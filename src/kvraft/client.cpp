@@ -148,7 +148,8 @@ std::string Clerk::Get(const std::string& key) {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         continue;
       case Err::kWrongLeader:
-      case Err::kTimeout: {
+      case Err::kTimeout:
+      case Err::kSessionGone: {  // Get 不会被服务端 fencing（读不改会话），万一出现按重试处理
         // 重定向："首次"错 leader 时若带有效 hint（且不是当前节点自己），直连它走快路；
         // 但一旦采纳过 hint，就【抑制后续 hint、强制纯 round-robin】直到本操作成功。
         // 原因：某个节点若持续返回陈旧 hint（指向一个根本不是 leader 的节点），
@@ -173,9 +174,9 @@ std::string Clerk::Get(const std::string& key) {
   }
 }
 
-void Clerk::PutAppend(const std::string& key, const std::string& value,
+Err Clerk::PutAppend(const std::string& key, const std::string& value,
                       const std::string& op) {
-  if (servers_.empty()) return;
+  if (servers_.empty()) return Err::kOK;
 
   seq_id_++;
   PutAppendArgs args;
@@ -199,7 +200,7 @@ void Clerk::PutAppend(const std::string& key, const std::string& value,
       // 标记 history 不可信：这次写可能已经在服务端生效，但没进 history。
       // Config::CheckLinearizability 会据此跳过判定，避免假 Illegal。
       gave_up_on_write_.store(true);
-      return;
+      return Err::kOK;
     }
     PutAppendReply reply;
     bool ok = servers_[leader_id_]->CallTyped("KVServer.PutAppend", args, reply);
@@ -216,7 +217,18 @@ void Clerk::PutAppend(const std::string& key, const std::string& value,
         rr_ = (leader_id_ + 1) % static_cast<int>(servers_.size());
         used_hint_ = 0;
         RecordPutAppend(key, value, op_code, MonoNs(t_call), MonoNs(t_return));
-        return;
+        return Err::kOK;
+      case Err::kSessionGone:
+        // 服务端协议兜底触发：本会话已被淘汰。服务端保证"这条命令其实已在状态机
+        // 执行过一次"，所以【绝不重发】它（用新会话重发会二次执行）。正确做法是
+        // 开【新会话】（换 client_id、seq 归零）供后续命令使用，当前这条当作
+        // "结果未知"返回给调用方。这样淘汰窗口内语义是 at-least-once，绝不重复执行。
+        // 注意：不进 history——它的效果已在状态机里，记录与否不影响线性一致性判定。
+        client_id_ = static_cast<int>(NRand() & 0x7fffffff);
+        seq_id_ = 0;
+        used_hint_ = 0;
+        rr_ = (leader_id_ + 1) % static_cast<int>(servers_.size());
+        return Err::kSessionGone;
       case Err::kNoKey:
         // Put/Append 不该返回这个；当成"换台重试"处理，避免死循环
         rr_ = (leader_id_ + 1) % static_cast<int>(servers_.size());
@@ -252,12 +264,12 @@ void Clerk::PutAppend(const std::string& key, const std::string& value,
   }
 }
 
-void Clerk::Put(const std::string& key, const std::string& value) {
-  PutAppend(key, value, "Put");
+Err Clerk::Put(const std::string& key, const std::string& value) {
+  return PutAppend(key, value, "Put");
 }
 
-void Clerk::Append(const std::string& key, const std::string& value) {
-  PutAppend(key, value, "Append");
+Err Clerk::Append(const std::string& key, const std::string& value) {
+  return PutAppend(key, value, "Append");
 }
 
 // ---------------------------------------------------------------------------

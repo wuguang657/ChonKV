@@ -35,8 +35,8 @@ class Clerk {
 
   // 取一个 key 的值；不存在返回 ""
   std::string Get(const std::string& key);
-  void Put(const std::string& key, const std::string& value);
-  void Append(const std::string& key, const std::string& value);
+  Err Put(const std::string& key, const std::string& value);
+  Err Append(const std::string& key, const std::string& value);
 
   int client_id() const { return client_id_; }
   int seq_id() const { return seq_id_; }
@@ -55,7 +55,7 @@ class Clerk {
 
  private:
   // Put / Append 共用
-  void PutAppend(const std::string& key, const std::string& value,
+  Err PutAppend(const std::string& key, const std::string& value,
                  const std::string& op);
 
   // 把一次成功返回的 op 追加到 history_。

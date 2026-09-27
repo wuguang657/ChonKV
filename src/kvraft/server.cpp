@@ -112,18 +112,43 @@ void KVServer::Kill() {
 // 快照编解码
 // ---------------------------------------------------------------------------
 
-// 格式：[kv 条数][k,v]*[lastSeq 条数][cid,sid]*
+// 格式：[kv 条数][k,v]*  [会话条数][cid,seq,last_index]*  [fence 条数][cid,last_seq]*
 // 全部用 length-prefixed 的 Bytes，value 里含任意字节都不会解析错。
+// ⚠️ 两条确定性硬约束（状态机可重现、副本间不发散的前提）：
+//   (1) 顺序确定：会话按 LRU（ForEach）编码、fence 按 fence_fifo_（插入序）编码，
+//       绝不能遍历 unordered_map 的哈希序 —— 哈希序不确定会让"快照恢复"与"日志
+//       回放"两条路径的 fence_fifo_ 顺序分歧 → kFenceCap 封顶时踢掉不同 cid →
+//       fenced_ 发散 → apply 查墓碑结果不同 → 状态机发散。
+//   (2) 字段完整：会话必须带 last_index（不只 last seq），否则 InstallSnapshot 后
+//       lastApplied 推进与日志回放不一致。
 std::string KVServer::EncodeSnapshotLocked() const {
   labrpc::Encoder e;
   e.Int(static_cast<int>(kv_store_.size()));
   for (const auto& p : kv_store_) {
     e.Bytes(p.first).Bytes(p.second);
   }
-  e.Int(static_cast<int>(last_seq_.size()));
-  for (const auto& p : last_seq_) {
-    e.Int(p.first).Int(p.second);
+  // 会话表必须按 LRU 顺序（ForEach）编码，不能按 entries_ 哈希序 —— 见上方 ⚠️(1)。
+  // last_index 一并持久化（见 ⚠️(2)）。
+  e.Int(static_cast<int>(sessions_.Size()));
+  sessions_.ForEach([&](int cid, int seq, uint64_t last_index) {
+    e.Int(cid).Int(seq).Varint(last_index);
+  });
+  // fencing 集合（cid + 墓碑 last_seq）也要持久化，重启 / InstallSnapshot 后不丢，
+  // 否则一个在旧 leader 上被淘汰的会话换节点后迟到重试会被当成新命令重执行。
+  //
+  // ⚠️ 必须按 fence_fifo_（插入顺序）编码，不能按 unordered_map 的哈希序遍历：
+  //    哈希序不确定 → "从快照恢复"的副本 fence_fifo_ 顺序与"从日志回放"的副本
+  //    不一致 → 将来 kFenceCap 封顶时会踢掉不同的 cid → 副本间 fenced_ 内容发散
+  //    → apply 查墓碑的结果不同（一边去重、一边执行）→ 状态机发散。
+  //    （与 sessions_ 用 ForEach 按 LRU 顺序编码是同一条确定性原则。）
+  std::vector<std::pair<int, int>> fence_recs;
+  fence_recs.reserve(fence_fifo_.size());
+  for (int cid : fence_fifo_) {
+    auto it = fenced_.find(cid);
+    if (it != fenced_.end()) fence_recs.push_back({cid, it->second});
   }
+  e.Int(static_cast<int>(fence_recs.size()));
+  for (const auto& fr : fence_recs) { e.Int(fr.first); e.Int(fr.second); }
   return e.Take();
 }
 
@@ -143,17 +168,46 @@ void KVServer::ApplySnapshotLocked(const std::string& blob) {
 
   int m = 0;
   if (!d.Int(m) || m < 0) return;
-  std::map<int, int> seq;
+  struct SessRec {
+    int cid;
+    int seq;
+    uint64_t last_index;
+  };
+  std::vector<SessRec> seqs;
+  seqs.reserve(m > 0 && m < 1000000 ? static_cast<size_t>(m) : 0);
   for (int i = 0; i < m; i++) {
     int cid = 0, sid = 0;
-    if (!d.Int(cid) || !d.Int(sid)) return;
-    seq[cid] = sid;
+    uint64_t li = 0;
+    if (!d.Int(cid) || !d.Int(sid) || !d.Varint(li)) return;
+    seqs.push_back(SessRec{cid, sid, li});
+  }
+
+  // 恢复 fencing 集合（与会话表同序、确定性恢复；封顶由运行期 Reap 维护）。
+  int f = 0;
+  if (!d.Int(f) || f < 0) return;
+  struct FenceRec {
+    int cid;
+    int seq;  // 墓碑：淘汰时记录的 last_seq，必须与 cid 配对读写
+  };
+  std::vector<FenceRec> fenced;
+  fenced.reserve(f > 0 && f < 1000000 ? static_cast<size_t>(f) : 0);
+  for (int i = 0; i < f; i++) {
+    int cid = 0, seq = 0;
+    if (!d.Int(cid) || !d.Int(seq)) return;
+    fenced.push_back(FenceRec{cid, seq});
   }
 
   if (!d.Ok()) return;
 
   kv_store_ = std::move(store);
-  last_seq_ = std::move(seq);
+  // 严格按编码顺序（最旧 -> 最新）装载，重建出与日志回放路径一致的 LRU 队列。
+  sessions_.Clear();
+  for (const auto& s : seqs) sessions_.Load(s.cid, s.seq, s.last_index);
+  fenced_.clear();
+  fence_fifo_.clear();
+  for (const auto& fr : fenced) {
+    if (fenced_.insert({fr.cid, fr.seq}).second) fence_fifo_.push_back(fr.cid);
+  }
 }
 
 // 在 KV 锁内判断要不要压缩、并把快照字节编码好。
@@ -248,6 +302,14 @@ void KVServer::Get(const GetArgs& args, GetReply& reply) {
 }
 
 void KVServer::PutAppend(const PutAppendArgs& args, PutAppendReply& reply) {
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (fenced_.count(args.client_id)) {
+      reply.err = Err::kSessionGone;
+      reply.leader_id = -1;
+      return;
+    }
+  }
   Op op;
   op.key = args.key;
   op.value = args.value;
@@ -373,16 +435,46 @@ void KVServer::ApplierLoop() {
         // ---- exactly-once 语义 ----
         // 客户端重试会产生重复命令，靠 (client_id, seq_id) 去重。
         // 只有严格更大的 seq 才执行，保证"至少一次提交 + 至多一次执行"。
-        if (op.seq_id > last_seq_[op.client_id]) {
+        // now_index 是【逻辑时钟】读数：同一条日志在所有副本上取值相同。
+        // 会话淘汰必须基于它，绝不能用墙上时钟（理由见 SessionTable 注释）。
+        uint64_t now_index =
+            m.command_index > 0 ? static_cast<uint64_t>(m.command_index) : 0;
+        int existing = sessions_.Get(op.client_id, now_index);
+        if (existing == 0) {                          // 记录已擦除 → 查墓碑
+          auto fit = fenced_.find(op.client_id);
+          if (fit != fenced_.end()) existing = fit->second;
+          // 双亡窗口分析：仅当某旧 client_id 的 RPC 包「在墓碑被挤出之后」才到达服务端，才可能放行。
+          // 但 ① 客户端拿到 kSessionGone 即旋转新 client_id（client.cpp:227）且绝不再用旧 cid 重发，
+          //    能到达旧 cid 的只能是网络滞留包；② kClerkGiveUpTimeout{60} 硬上界保证 live 客户端
+          //    60s 后即放弃，而墓碑被挤出需数千万条 fencing（数十分钟~小时），远超 60s；
+          //    ③ cid 空间 ~21 亿，滞留包恰好撞上被挤出墓碑的 cid 概率可忽略。
+          // 两道独立屏障 + 大 cid 空间，工程上不可能撞双亡放行。
+        } 
+        if (op.seq_id > existing) {
           if (op.method == "Put") {
             kv_store_[op.key] = op.value;
           } else if (op.method == "Append") {
             kv_store_[op.key] += op.value;
           }
           // 只有 Put / Append 两种：Get 走 ReadIndex 直读，不会进这个分支。
-          last_seq_[op.client_id] = op.seq_id;
+          sessions_.Put(op.client_id, op.seq_id, now_index);
         }
-
+        // 每次 apply 顺手回收：空闲淘汰（逻辑时钟）+ LRU 容量淘汰，两者都确定性。
+        // 被淘汰的 client_id 登记进 fencing 集合 —— 它后续的迟到重试将被 RPC 入口
+        // 拒绝（见 PutAppend handler），不会被重复执行。
+        
+        sessions_.Reap(now_index, [this](int cid, int last_seq) {
+          // 被踢时执行
+          auto pr = fenced_.insert({cid, last_seq});   // 墓碑：cid -> last_seq
+          if (pr.second) {
+            fence_fifo_.push_back(cid);
+            if (fence_fifo_.size() > kFenceCap) {
+              int old = fence_fifo_.front();
+              fence_fifo_.pop_front();
+              fenced_.erase(old);
+            }
+          }
+        });
         // ---- 通知等待者 ----
         // 必须校验身份：这个 index 上的命令可能已经被新 leader 覆盖成别的了。
         // 身份不符就告诉等待者"你这条没生效"，让它换 leader 重试。

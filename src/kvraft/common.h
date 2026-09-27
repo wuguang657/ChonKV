@@ -22,6 +22,8 @@ enum class Err {
   kTimeout,      // 等 raft 提交超时（本实现自定义，Go 版没有）
   kBusy,        // 我是 leader，但因未提交日志达上限被限流（背压）。
                 // 客户端应"稍后重试同一台"，而不是"换 leader 重试"。
+  kSessionGone, // 会话已被淘汰并 fencing：客户端应开【新会话】后重试，
+                // 但【绝不要】重发当前这条"丢失的命令"。
 };
 
 inline const char* ErrName(Err e) {
@@ -31,6 +33,7 @@ inline const char* ErrName(Err e) {
     case Err::kWrongLeader: return "ErrWrongLeader";
     case Err::kTimeout: return "ErrTimeout";
     case Err::kBusy: return "ErrBusy";
+    case Err::kSessionGone: return "ErrSessionGone";
   }
   return "???";
 }

@@ -27,12 +27,17 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>       // std::deque（fence_fifo_）：以前靠传递包含才编过，显式补上
+#include <functional>  // std::function（Reap/Evict 的 on_evict 回调）
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>  // std::pair（FenceOrderedForTest 的返回值）
 #include <vector>
+#include <unordered_map>
+#include <list>
 
 #include "../common/chan.h"
 #include "../labrpc/labrpc.h"
@@ -55,6 +60,129 @@ struct NotifyMsg {
   bool ok = false;    // 身份匹配 → 这条命令确实生效了
   int client_id = 0;
   int seq_id = 0;
+};
+
+class SessionTable {
+  public:
+    static constexpr uint64_t kNoIdleLimit = ~static_cast<uint64_t>(0);  // 一个会话空闲多少条日志未活动就淘汰, ~是按位取反
+    explicit SessionTable(size_t cap = 1024 * 1024,
+                          uint64_t max_idle_index = 100000):
+        cap_(cap), max_idle_index_(max_idle_index) {}
+
+    int Get(int cid, uint64_t now_index){
+      auto it = entries_.find(cid);
+      if (it == entries_.end()) return 0;
+      Touch(it, now_index);
+      return it->second.last_seq;
+    }
+    // 写入新的最大 seq（apply 了更大 seq 之后调用），并刷新为"刚访问"。
+   void Put(int cid, int seq, uint64_t now_index) {
+      auto it = entries_.find(cid);
+      if (it == entries_.end()) {
+        SessionEntry e;
+        e.last_seq = seq;
+        e.last_index = now_index;
+        e.lru_it = lru_.insert(lru_.begin(), cid);
+        entries_.emplace(cid, std::move(e)); // 原地构造，省深拷贝
+      } else{
+        it->second.last_seq = seq;
+        Touch(it, now_index);
+      }
+   }
+  // 快照恢复专用：按给定的 last_index 装载，【不】走 Touch。
+  // 调用方必须按快照里的顺序（最旧 -> 最新）依次调用，这样 push_front 重建出的
+  // LRU 队列与"从日志逐条 apply 过来"的副本完全一致。
+  void Load(int cid, int seq, uint64_t last_index) {
+    auto it = entries_.find(cid);
+    if (it == entries_.end()) {
+      SessionEntry e;
+      e.last_seq = seq;
+      e.last_index = last_index;
+      e.lru_it = lru_.insert(lru_.begin(), cid);
+      entries_.emplace(cid, std::move(e));
+    } else {
+      it->second.last_seq = seq;
+      it->second.last_index = last_index;  // 已在队首，位置不变
+    }
+  }
+
+  // 回收：先按逻辑时钟淘汰空闲过久的，再按容量淘汰最久未访问的。
+  // now_index = 当前 apply 的 command_index，即逻辑时钟的"现在"。
+  // on_evict：每淘汰一个 client_id 时回调（KVServer 用它做 fencing），可为空。
+  // on_evict 装一个lambda表达式， 例如：[this](int cid) { this->fence(cid); }
+  void Reap(uint64_t now_index, std::function<void(int,int)> on_evict = {}) {
+    // 1) 空闲淘汰：lru_.back() 恒为 last_index 最小者，它不满足就能整段跳出。
+    while (!lru_.empty()) {
+      auto it = entries_.find(lru_.back());
+      if (it == entries_.end()) {
+        lru_.pop_back();  // 防御性清理（正常不会出现）
+        continue;
+      }
+      uint64_t idle = now_index >= it->second.last_index
+                          ? now_index - it->second.last_index
+                          : 0;
+      if (idle <= max_idle_index_) break;
+      Evict(it, on_evict);
+    }
+    // 2) 容量淘汰：插入只由日志触发，故 size 的演化对所有副本完全一致。
+    while (!lru_.empty() && entries_.size() > cap_) {
+      auto it = entries_.find(lru_.back());
+      if (it == entries_.end()) {
+        lru_.pop_back();
+        continue;
+      }
+      Evict(it, on_evict);
+    }
+  }
+
+  void Clear() {
+    entries_.clear();
+    lru_.clear();
+  }
+  size_t Size() const { return entries_.size(); }
+  size_t Capacity() const { return cap_; }
+  uint64_t Evicted() const { return evicted_; }
+
+  template <typename F>
+  void ForEach(F f) const {
+    for (auto it = lru_.rbegin(); it != lru_.rend(); ++it) {
+      auto e = entries_.find(*it);
+      if (e == entries_.end()) continue;
+      f(*it, e->second.last_seq, e->second.last_index);
+    }
+  }
+
+  void SetLimit(size_t cap, uint64_t max_idle_index) {
+    cap_ = cap;
+    max_idle_index_ = max_idle_index;
+  }
+
+  private:
+    struct SessionEntry {
+      int last_seq = 0;
+      uint64_t last_index = 0; // 最后一次访问的 index,长时间没访问就淘汰
+      std::list<int>::iterator lru_it;  // lru_ 中的迭代器
+    };
+    void Touch(std::unordered_map<int, SessionEntry>::iterator it,
+               uint64_t now_index) {
+      it->second.last_index = now_index;   // ？
+      lru_.splice(lru_.begin(), lru_, it->second.lru_it);
+    }
+    void Evict(std::unordered_map<int, SessionEntry>::iterator it,
+             std::function<void(int,int)> on_evict = {}) {
+      int cid = it->first;
+      int last_seq = it->second.last_seq;   // 淘汰前取出，供墓碑使用
+      lru_.erase(it->second.lru_it);
+      entries_.erase(it);
+      evicted_++;
+      if (on_evict) on_evict(cid, last_seq);
+    } 
+
+    size_t cap_;
+    uint64_t max_idle_index_;
+    uint64_t evicted_ = 0;  // 累计淘汰次数，压测可观测
+    std::unordered_map<int, SessionEntry> entries_;
+    std::list<int> lru_;  // front = 最近访问（last_index 最大），back = 最久未访问
 };
 
 class KVServer {
@@ -87,6 +215,61 @@ class KVServer {
   // 直接读状态机（测试校验一致性用）。调用方需要自己保证并发安全，
   // 测试里只在"没有客户端在跑"的时候调。
   std::map<std::string, std::string> SnapshotStore() const;
+
+  // ---- 会话表淘汰 / fencing 调试用（白盒）----
+  // ⚠️ 这几个都加锁：ApplierLoop 会在另一个线程里并发改 sessions_ / fenced_，
+  //    测试线程无锁直读是 data race（TSan 会报），必须走这里的访问器。
+  size_t SessionSizeForTest() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return sessions_.Size();
+  }
+  uint64_t SessionEvictedForTest() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return sessions_.Evicted();
+  }
+  // 该 client_id 是否已被 fencing（会话被淘汰后，迟到重试应被拒绝）。
+  bool IsFencedForTest(int cid) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return fenced_.count(cid) > 0;
+  }
+  size_t FenceSizeForTest() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return fenced_.size();
+  }
+  // 读某个被 fencing 的 cid 的【墓碑值】（淘汰那一刻的 last_seq）。
+  // 未 fence 返回 false。这条是验证"墓碑 tombstone"正确性的唯一入口：
+  // 若 Evict 回调漏传 last_seq、或快照编解码丢 seq，这里就会读到错误的值。
+  bool FenceLastSeqForTest(int cid, int* out_seq) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = fenced_.find(cid);
+    if (it == fenced_.end()) return false;
+    if (out_seq) *out_seq = it->second;
+    return true;
+  }
+  // 按 fence_fifo_（淘汰先后）导出整个 fenced_，用于比对【副本间顺序一致性】。
+  // 只比对 size 是不够的：若各副本编码/回放顺序不同，封顶 kFenceCap 时会踢掉
+  // 不同的 cid → 状态机随时间发散，而 size 恰恰相等。
+  std::vector<std::pair<int, int>> FenceOrderedForTest() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::vector<std::pair<int, int>> out;
+    out.reserve(fence_fifo_.size());
+    for (int cid : fence_fifo_) {
+      auto it = fenced_.find(cid);
+      if (it != fenced_.end()) out.emplace_back(cid, it->second);
+    }
+    return out;
+  }
+  // cap = 容量上限；max_idle_index = 空闲多少条日志未活动即淘汰
+  // （传 SessionTable::kNoIdleLimit 关闭空闲淘汰）。
+  void SetSessionLimitForTest(size_t cap, uint64_t max_idle_index) {
+    std::lock_guard<std::mutex> lk(mu_);
+    sessions_.SetLimit(cap, max_idle_index);
+  }
+  // 已应用到状态机的最高 cmd index（逻辑时钟读数），供副本一致性比对。
+  int LastCmdIndexForTest() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return last_cmd_index_;
+  }
 
   // ---- 仅供测试脚手架使用 ----
   // 脚手架需要把 Raft 也挂到同一个网络节点上（Go 版是 srv.AddService(rfsvc)）
@@ -128,7 +311,15 @@ class KVServer {
 
   // ---- 状态机：快照要持久化的就是这两个 ----
   std::map<std::string, std::string> kv_store_;
-  std::map<int, int> last_seq_;  // clientId -> 已 apply 的最大 seqId
+  // std::map<int, int> last_seq_;  // clientId -> 已 apply 的最大 seqId   改为定期清理会话
+  SessionTable sessions_;
+  // fenced_ 同时是"淘汰挡板"和"last_seq 墓碑"：key=被淘汰 client_id，
+  // value=淘汰时记录的 last_seq。apply 去重时若会话记录已被擦除，仍可用墓碑
+  // 里的 last_seq 去重，堵住"入口 fence 有 TOCTOU、重试滑过、记录擦除后才 apply"
+  // 导致的双执行窄窗。受 kFenceCap + fence_fifo_ 约束，内存有界。
+  std::unordered_map<int, int> fenced_;
+  std::deque<int> fence_fifo_;
+  static constexpr size_t kFenceCap = 4 * 1024 * 1024;   // 保证黑名单有界
 
   // applier 已应用到状态机的最高 cmd index。
   // 注意与 raft.last_applied_ 的区别：raft 的在【派发时】推进，

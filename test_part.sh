@@ -77,6 +77,13 @@ case "$PART" in
     TESTS=(
       TestKVRedirectLeaderId
       TestKVBackpressureBusy
+      TestKVSessionsEviction
+      TestKVSessionsSnapshotRoundTrip
+      TestKVSessionsDeterminismWithSnapshots
+      TestKVSessionsFenceStopsReplay
+      TestKVSessionsClientProtocol
+      TestKVSessionsTombstoneValue
+      TestKVSessionsTombstoneSnapshot
       TestBasic3A
       TestConcurrent3A
       TestUnreliable3A

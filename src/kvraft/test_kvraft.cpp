@@ -434,6 +434,392 @@ void TestKVBackpressureBusy() {
   cfg.Cleanup();
 }
 
+// ===========================================================================
+// 生产化：会话表淘汰（防 last_seq_ 无限增长）
+// ===========================================================================
+// 【为什么淘汰必须用逻辑时钟】会话表是状态机的一部分（编进快照、每个副本 apply
+// 同一条日志时各自更新）。淘汰一旦依赖墙上时钟，各副本淘汰时机就不同 → 一边忘了
+// 去重记忆（重复执行）、一边还记得（去重）→ kv_store_ 发散。这是安全性事故。
+// 所以这里淘汰只用 Raft 日志下标（command_index）当逻辑时钟，配 LRU 容量兜底。
+//
+// 本用例验证三件事：
+//   1) LRU 容量淘汰：海量不同 client 各写一条后，size 不超过 cap，且确实淘汰过；
+//   2) 逻辑时钟空闲淘汰：闲置超过 max_idle_index 条日志的会话被回收；
+//   3) 副本一致：集群静默后各节点会话表 size 完全相同（淘汰行为一致，非发散）。
+// 白盒直打 leader（绕过客户端路由），每条用互不相同的 client_id 制造新会话。
+void TestKVSessionsEviction() {
+  const int nservers = 3;
+  Config cfg(nservers, false, -1);
+  cfg.Begin("Test: session table eviction is bounded and deterministic (3A)");
+
+  int leader = -1;
+  if (!WaitForLeader(cfg, &leader)) {
+    cfg.Cleanup();
+    Fatal("no leader elected");
+  }
+
+  // 生产里所有副本配置必须一致 —— 不一致本身就足以让淘汰行为分叉，
+  // 所以这里也对【每个】节点下同样的限。
+  auto set_all = [&](size_t cap, uint64_t max_idle) {
+    for (int i = 0; i < nservers; i++) {
+      cfg.kvserver(i)->SetSessionLimitForTest(cap, max_idle);
+    }
+  };
+  // ⚠️ 不可靠网络下 200 次顺序写可能跨越一次选举：目标 leader 中途易主，
+  //    直写旧 leader 会偶发 ErrWrongLeader。生产 Clerk 会自动换 leader 重试，
+  //    这里裸写必须自己处理 —— 否则该用例在部分 seed 下必红（已实测
+  //    SEED=100268241 在 client 160 处炸）。拿到 ErrWrongLeader 就重新找当前
+  //    leader 再试，并同步更新外层 `leader`（final 测量也用它），保证"写"和
+  //    "测"落在同一台。注意：这不改变测试意图——仍是往"当前 leader"灌 200 个
+  //    不同 client 把会话表撑爆，单台不变量的断言完全成立。
+  auto write_one = [&](int cid, int seq, const std::string& key) {
+    PutAppendArgs pa;
+    pa.key = key;
+    pa.value = "v";
+    pa.op = "Put";
+    pa.client_id = cid;
+    pa.seq_id = seq;
+    for (int attempt = 0; attempt < 50; attempt++) {
+      PutAppendReply par;
+      cfg.kvserver(leader)->PutAppend(pa, par);
+      if (par.err != Err::kWrongLeader) return par.err;
+      // leader 易主：重新定位当前 leader 后重试
+      int newl = -1;
+      if (cfg.Leader(&newl) && newl >= 0) leader = newl;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    PutAppendReply par;
+    cfg.kvserver(leader)->PutAppend(pa, par);
+    return par.err;
+  };
+
+  // ---- 阶段 A：LRU 容量淘汰 ----
+  // 先关掉空闲淘汰（kNoIdleLimit），隔离出纯容量行为。
+  const size_t cap = 8;
+  set_all(cap, SessionTable::kNoIdleLimit);
+
+  const int nclients = 200;
+  for (int i = 0; i < nclients; i++) {
+    Err e = write_one(90000 + i, 1, "k" + std::to_string(i));
+    if (e != Err::kOK) {
+      char buf[256];
+      std::snprintf(buf, sizeof(buf),
+                    "leader PutAppend (client %d) should be kOK, got %s", i,
+                    ErrName(e));
+      Fatal(buf);
+    }
+  }
+  size_t after_cap = cfg.kvserver(leader)->SessionSizeForTest();
+  if (after_cap > cap) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "session table exceeded cap: size=%zu cap=%zu", after_cap,
+                  cap);
+    Fatal(buf);
+  }
+  if (cfg.kvserver(leader)->SessionEvictedForTest() == 0) {
+    Fatal("capacity eviction never triggered: cap limit is not effective");
+  }
+
+  // ---- 阶段 B：逻辑时钟空闲淘汰 ----
+  // max_idle_index = 10：一个会话隔了 10 条日志没活动就被回收。
+  // 注意这里【不 sleep】—— 淘汰由日志推进驱动，与时间无关，这是关键差异。
+  const uint64_t max_idle = 10;
+  set_all(1024, max_idle);
+  size_t before_idle = cfg.kvserver(leader)->SessionSizeForTest();
+  uint64_t evicted_before = cfg.kvserver(leader)->SessionEvictedForTest();
+
+  // 只反复写同一个 client：它被不断 Touch，其余老会话随 index 前进陆续过期。
+  for (int i = 0; i < 60; i++) {
+    Err e = write_one(95000, i + 1, "hot");
+    if (e != Err::kOK) {
+      char buf[256];
+      std::snprintf(buf, sizeof(buf),
+                    "leader PutAppend (idle phase %d) should be kOK, got %s", i,
+                    ErrName(e));
+      Fatal(buf);
+    }
+  }
+  size_t after_idle = cfg.kvserver(leader)->SessionSizeForTest();
+  if (after_idle >= before_idle) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "idle eviction should shrink session table: before=%zu "
+                  "after=%zu (max_idle=%llu)",
+                  before_idle, after_idle,
+                  static_cast<unsigned long long>(max_idle));
+    Fatal(buf);
+  }
+  if (cfg.kvserver(leader)->SessionEvictedForTest() <= evicted_before) {
+    Fatal("idle eviction never triggered: logical clock is not effective");
+  }
+
+  // 强不变量（补丁 kvraft_eviction_consistency_check）：淘汰计数器增量（毛淘汰）
+  // 必须 >= 表项净缩小量（净淘汰）。若有人改坏 Reap（例如只 evicted_++ 却漏
+  // entries_.erase），计数器会超前于实际缩表；上面两个弱检查（缩表 + 计数增加）
+  // 在"净缩 7 但计数进 8"时都会通过，正好漏掉该回归，故此处加强护栏。
+  size_t removed = before_idle - after_idle;
+  uint64_t evicted_delta =
+      cfg.kvserver(leader)->SessionEvictedForTest() - evicted_before;
+  if (evicted_delta < static_cast<uint64_t>(removed)) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "eviction under-counted: table shrank by %zu but evicted "
+                  "counter advanced by %llu",
+                  removed, static_cast<unsigned long long>(evicted_delta));
+    Fatal(buf);
+  }
+
+  // ---- 阶段 C：各副本淘汰行为一致 ----
+  // 等所有节点 apply 到同一条日志，再比对会话表规模。
+  // 只要淘汰是确定性的，这里必然相等；一旦有人引入时钟/哈希序，这里就会炸。
+  int target = cfg.kvserver(leader)->LastCmdIndexForTest();
+  bool converged = false;
+  for (int retry = 0; retry < 200 && !converged; retry++) {
+    converged = true;
+    for (int i = 0; i < nservers; i++) {
+      if (cfg.kvserver(i)->LastCmdIndexForTest() < target) {
+        converged = false;
+        break;
+      }
+    }
+    if (!converged) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  if (!converged) {
+    Fatal("replicas did not converge to the same applied index");
+  }
+  size_t want = cfg.kvserver(leader)->SessionSizeForTest();
+  for (int i = 0; i < nservers; i++) {
+    size_t got = cfg.kvserver(i)->SessionSizeForTest();
+    if (got != want) {
+      char buf[256];
+      std::snprintf(buf, sizeof(buf),
+                    "session table diverged: server %d has %zu, leader has %zu",
+                    i, got, want);
+      Fatal(buf);
+    }
+  }
+
+  cfg.End();
+  cfg.Cleanup();
+}
+
+// ===========================================================================
+// 生产化：会话表的"快照恢复"必须与"日志回放"完全等价
+// ===========================================================================
+// 这是硬伤 2 的定点防御：快照若按 unordered_map 的哈希序编码，从快照恢复的副本
+// 会重建出与"从日志逐条 apply"的副本【不同】的 LRU 队列，于是后续淘汰对象不同
+// → 一边忘掉某会话（重复执行）、一边还记得（去重）→ kv_store_ 发散。
+//
+// 用 SessionTable 直接做等价性验证：不启网络、无时序、零 flaky，秒级出结果。
+void TestKVSessionsSnapshotRoundTrip() {
+  const size_t cap = 4;
+  const uint64_t max_idle = 5;
+
+  // ---- 路径 A：模拟"从日志逐条 apply" ----
+  // 访问序列故意带重复，让 LRU 顺序不等于插入顺序。
+  SessionTable replay(cap, max_idle);
+  const int visits[] = {1, 2, 1, 3, 2, 4, 1, 5, 3, 6};
+  uint64_t idx = 1;
+  for (int cid : visits) {
+    int s = replay.Get(cid, idx);
+    replay.Put(cid, s + 1, idx);
+    replay.Reap(idx);
+    ++idx;
+  }
+
+  // ---- 路径 B：导出成快照，再按同样顺序装回另一张表 ----
+  struct Rec {
+    int cid;
+    int seq;
+    uint64_t li;
+  };
+  std::vector<Rec> recs;
+  replay.ForEach([&](int cid, int seq, uint64_t li) {
+    recs.push_back(Rec{cid, seq, li});
+  });
+
+  SessionTable restored(cap, max_idle);
+  for (const auto& r : recs) restored.Load(r.cid, r.seq, r.li);
+
+  auto dump = [](const SessionTable& t) {
+    std::vector<std::pair<int, uint64_t>> out;
+    t.ForEach([&](int cid, int seq, uint64_t li) {
+      out.emplace_back(cid, (static_cast<uint64_t>(seq) << 32) | li);
+    });
+    return out;
+  };
+
+  // 1) 刚装载完，LRU 顺序必须逐位相同（这是旧实现会失败的第一处）
+  if (dump(replay) != dump(restored)) {
+    Fatal("snapshot round-trip changed session LRU order");
+  }
+
+  // 2) 后续喂完全相同的日志序列，两者淘汰行为必须步步一致
+  //    （淘汰数比【增量】，因为 restored 是从快照重建的、历史计数不同）
+  uint64_t base_a = replay.Evicted();
+  uint64_t base_b = restored.Evicted();
+  for (int i = 0; i < 60; i++) {
+    int cid = 100 + (i % 7);
+    uint64_t now = idx + static_cast<uint64_t>(i);
+    auto feed = [&](SessionTable& t) {
+      int s = t.Get(cid, now);
+      t.Put(cid, s + 1, now);
+      t.Reap(now);
+    };
+    feed(replay);
+    feed(restored);
+
+    if (replay.Size() != restored.Size() ||
+        (replay.Evicted() - base_a) != (restored.Evicted() - base_b) ||
+        dump(replay) != dump(restored)) {
+      char buf[256];
+      std::snprintf(buf, sizeof(buf),
+                    "replay and snapshot-restored diverged at step %d "
+                    "(size %zu vs %zu)",
+                    i, replay.Size(), restored.Size());
+      Fatal(buf);
+    }
+  }
+}
+
+// ===========================================================================
+// 生产化：靠 InstallSnapshot 追上来的副本，会话表必须和 leader 一模一样
+// ===========================================================================
+// 上一条 TestKVSessionsSnapshotRoundTrip 是【单元级】等价性验证，这条是【集成级】：
+// 真开快照（maxraftstate 很小）、真隔离一个副本让它落后到只能靠 InstallSnapshot
+// 追赶，再比对它的会话表和状态机是否与 leader 完全一致。
+//
+// 能同时抓住两个坑：
+//   · 快照按哈希序编码 → 恢复出的 LRU 队列不同 → 后续淘汰对象不同；
+//   · 快照不带 last_index → 恢复出的会话全被当成"刚访问" → 空闲淘汰时机不同。
+// 两者都会让这个副本的会话表与 leader 分叉（进而丢去重记忆 → 重复执行）。
+void TestKVSessionsDeterminismWithSnapshots() {
+  const int nservers = 3;
+  Config cfg(nservers, false, /*maxraftstate=*/512);
+  cfg.Begin("Test: snapshot-installed replica rebuilds identical sessions (3B)");
+
+  int leader = -1;
+  if (!WaitForLeader(cfg, &leader)) {
+    cfg.Cleanup();
+    Fatal("no leader elected");
+  }
+
+  // cap 必须给得足够大，让【容量淘汰永不触发】——否则它会掩盖空闲淘汰的差异：
+  // 一旦容量淘汰主导，快照里 last_index 写错也看不出来（老会话反正会被挤掉）。
+  // 只有让空闲淘汰成为唯一机制，last_index 的正确性才被真正检验到。
+  const size_t cap = 4096;
+  const uint64_t max_idle = 15;
+  for (int i = 0; i < nservers; i++) {
+    cfg.kvserver(i)->SetSessionLimitForTest(cap, max_idle);
+  }
+
+  // 挑一个【非 leader】的副本当落后节点：隔离它之后 leader 仍在多数派，能继续提交。
+  int victim = -1;
+  for (int i = 0; i < nservers; i++) {
+    if (i != leader) {
+      victim = i;
+      break;
+    }
+  }
+  if (victim < 0) {
+    cfg.Cleanup();
+    Fatal("could not pick a non-leader replica");
+  }
+
+  auto write = [&](int cid, const std::string& key) {
+    PutAppendArgs pa;
+    pa.key = key;
+    pa.value = "v";
+    pa.op = "Put";
+    pa.client_id = cid;
+    pa.seq_id = 1;
+    PutAppendReply par;
+    // 不可靠网下可能中途换 leader：遇 ErrWrongLeader 重定位并重试（与生产 Clerk 同套路），
+    // 否则某次裸写撞选举会直接 Fatal 误判。重试不改测试意图：仍是往"当前 leader"灌。
+    int tries = 0;
+    while (true) {
+      cfg.kvserver(leader)->PutAppend(pa, par);
+      if (par.err != Err::kWrongLeader) break;
+      if (++tries > 50) break;
+      int newl = -1;
+      if (cfg.Leader(&newl) && newl >= 0) leader = newl;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return par.err;
+  };
+
+  // ---- 阶段 1：先写一批，让 leader 攒出快照 ----
+  for (int i = 0; i < 80; i++) {
+    if (write(80000 + i, "a" + std::to_string(i)) != Err::kOK) {
+      Fatal("leader PutAppend (phase 1) should be kOK");
+    }
+  }
+
+  // ---- 阶段 2：隔离落后节点，继续写到日志被截断 ----
+  std::vector<int> others;
+  for (int i = 0; i < nservers; i++) {
+    if (i != victim) others.push_back(i);
+  }
+  cfg.Partition(std::vector<int>{victim}, others);
+  for (int i = 0; i < 120; i++) {
+    if (write(81000 + i, "b" + std::to_string(i)) != Err::kOK) {
+      Fatal("leader PutAppend (phase 2) should be kOK");
+    }
+  }
+  cfg.ConnectAll();
+
+  // ---- 阶段 3：等所有副本追平 ----
+  int target = cfg.kvserver(leader)->LastCmdIndexForTest();
+  bool converged = false;
+  for (int retry = 0; retry < 400 && !converged; retry++) {
+    converged = true;
+    for (int i = 0; i < nservers; i++) {
+      if (cfg.kvserver(i)->LastCmdIndexForTest() < target) {
+        converged = false;
+        break;
+      }
+    }
+    if (!converged) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  if (!converged) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "replicas did not converge after reconnect (target=%d)",
+                  target);
+    Fatal(buf);
+  }
+
+  // ---- 阶段 4：逐个副本比对状态机 + 会话表 ----
+  // 此刻没有客户端在写，读 SnapshotStore() 是安全的（见其注释）。
+  std::map<std::string, std::string> want_store =
+      cfg.kvserver(leader)->SnapshotStore();
+  size_t want_sessions = cfg.kvserver(leader)->SessionSizeForTest();
+  for (int i = 0; i < nservers; i++) {
+    std::map<std::string, std::string> got_store =
+        cfg.kvserver(i)->SnapshotStore();
+    if (got_store != want_store) {
+      char buf[256];
+      std::snprintf(buf, sizeof(buf),
+                    "kv_store_ diverged: server %d has %zu keys, leader has %zu",
+                    i, got_store.size(), want_store.size());
+      Fatal(buf);
+    }
+    size_t got_sessions = cfg.kvserver(i)->SessionSizeForTest();
+    if (got_sessions != want_sessions) {
+      char buf[256];
+      std::snprintf(buf, sizeof(buf),
+                    "session table diverged: server %d has %zu sessions, "
+                    "leader has %zu",
+                    i, got_sessions, want_sessions);
+      Fatal(buf);
+    }
+  }
+
+  cfg.End();
+  cfg.Cleanup();
+}
+
 // 多个客户端并发写【各自的 key】。
 // 考的是：线性读、exactly-once、各副本最终一致。
 // 对齐 Go 版：Go 的 TestConcurrent3A 走 GenericTest(t,"3A",5,false,false,false,-1)，
@@ -997,6 +1383,440 @@ void TestSnapshotSize3B() {
 }
 
 // ===========================================================================
+// 生产化：会话 fencing（客户端协议兜底的【服务端挡刀】）
+// ===========================================================================
+// 验证：一个 client_id 的会话被淘汰（fenced）后，携带【同一 (client_id, seq)】的
+// 迟到重试在 RPC 入口就被拒绝（Err::kSessionGone），【不写日志、不执行】 ——
+// 从而不会把已经执行过一次的写重复执行（at-least-once，绝不重复）。
+// 用 Append 而非 Put 才能观测到"重复执行"：若 fencing 失效，重试会再追加一次。
+void TestKVSessionsFenceStopsReplay() {
+  const int nservers = 3;
+  Config cfg(nservers, false, -1);
+  cfg.Begin("Test: session fencing blocks replay of evicted client (3A)");
+
+  int leader = -1;
+  if (!WaitForLeader(cfg, &leader)) {
+    cfg.Cleanup();
+    Fatal("no leader elected");
+  }
+  // 关掉空闲淘汰（极大 max_idle），只靠容量淘汰：确定性最强、不依赖时序。
+  for (int i = 0; i < nservers; i++)
+    cfg.kvserver(i)->SetSessionLimitForTest(/*cap=*/4,
+                                            /*max_idle=*/(uint64_t)1 << 60);
+
+  // 不可靠网下裸写可能偶发 ErrWrongLeader（中途选举）：和生产 Clerk 同套路重定位后重试，
+  // 否则单次裸写也可能误判失败。fencing 是每台 server 各自 apply 出的，换 leader 后期望
+  // 语义（kOK / kSessionGone）不变。
+  auto safe_put = [&](PutAppendArgs pa) -> Err {
+    PutAppendReply par;
+    for (int attempt = 0; attempt < 50; attempt++) {
+      cfg.kvserver(leader)->PutAppend(pa, par);
+      if (par.err != Err::kWrongLeader) return par.err;
+      int newl = -1;
+      if (cfg.Leader(&newl) && newl >= 0) leader = newl;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    cfg.kvserver(leader)->PutAppend(pa, par);
+    return par.err;
+  };
+
+  // ---- 步骤 1：client_id=777 写一次 Append("x","B")，应执行一次 ----
+  {
+    PutAppendArgs pa;
+    pa.key = "x";
+    pa.value = "B";
+    pa.op = "Append";
+    pa.client_id = 777;
+    pa.seq_id = 1;
+    Err e = safe_put(pa);
+    if (e != Err::kOK) {
+      char buf[256];
+      std::snprintf(buf, sizeof(buf), "first Append should be kOK, got %s",
+                    ErrName(e));
+      Fatal(buf);
+    }
+  }
+  if (cfg.kvserver(leader)->SnapshotStore()["x"] != "B") {
+    Fatal("after first Append, x should be \"B\"");
+  }
+
+  // ---- 步骤 2：灌入海量不同 client_id，把 777 的会话按 LRU 挤掉并 fencing ----
+  for (int i = 0; i < 60; i++) {
+    PutAppendArgs pa;
+    pa.key = "k" + std::to_string(i);
+    pa.value = "v";
+    pa.op = "Append";
+    pa.client_id = 1000 + i;
+    pa.seq_id = 1;
+    PutAppendReply par;
+    cfg.kvserver(leader)->PutAppend(pa, par);
+  }
+  if (!cfg.kvserver(leader)->IsFencedForTest(777)) {
+    Fatal("client 777 should be fenced after its session was evicted");
+  }
+
+  // ---- 步骤 3：用【同一 (client_id, seq)】重试 Append("x","B") ----
+  // 这是"丢 ack 后的迟到重试"的真实形态。若 fencing 失效：服务端当新命令再执行一次
+  // → x 变成 "BB"。正确行为：入口拒绝，x 保持 "B"。
+  {
+    PutAppendArgs pa;
+    pa.key = "x";
+    pa.value = "B";
+    pa.op = "Append";
+    pa.client_id = 777;
+    pa.seq_id = 1;
+    Err e = safe_put(pa);
+    if (e != Err::kSessionGone) {
+      char buf[256];
+      std::snprintf(buf, sizeof(buf),
+                    "replay of evicted client should be kSessionGone, got %s",
+                    ErrName(e));
+      Fatal(buf);
+    }
+  }
+  if (cfg.kvserver(leader)->SnapshotStore()["x"] != "B") {
+    Fatal("fencing failed: replay re-executed Append, x should stay \"B\"");
+  }
+
+  cfg.End();
+  cfg.Cleanup();
+}
+
+// ===========================================================================
+// 生产化：客户端协议 —— 会话被淘汰后 Clerk 自动开新会话、且不重发丢失命令
+// ===========================================================================
+// 验证客户端协议兜底：Clerk 的会话被服务端淘汰并 fencing 后，它下一次写会拿到
+// Err::kSessionGone，于是（1）自动开【新会话】（换 client_id）供后续使用；
+// （2）【不重发】当前这条丢失的命令。因此那条命令不会被执行两次，淘汰窗口内
+// 语义是 at-least-once，绝不重复执行污染数据。
+void TestKVSessionsClientProtocol() {
+  const int nservers = 3;
+  Config cfg(nservers, false, -1);
+  cfg.Begin("Test: client rotates session after kSessionGone (3A)");
+
+  int leader = -1;
+  if (!WaitForLeader(cfg, &leader)) {
+    cfg.Cleanup();
+    Fatal("no leader elected");
+  }
+  for (int i = 0; i < nservers; i++)
+    cfg.kvserver(i)->SetSessionLimitForTest(/*cap=*/4,
+                                            /*max_idle=*/(uint64_t)1 << 60);
+
+  auto ck = cfg.MakeClient(cfg.All());
+  int old_cid = ck->client_id();
+
+  // 第一次写：Put("x","A")，应执行一次。
+  ck->Put("x", "A");
+  if (cfg.kvserver(leader)->SnapshotStore()["x"] != "A") {
+    Fatal("after Put, x should be \"A\"");
+  }
+
+  // 灌入海量不同 client_id，把 ck 的会话（old_cid）按 LRU 挤掉并 fencing。
+  // 用 old_cid + 偏移生成，保证与 old_cid 及彼此都不冲突（否则会误 Touch ck 的会话）。
+  // ⚠️ client_id 为 [0,2^31) 的 int；old_cid + 1000000 + i 可能越过 INT_MAX，
+  //    触发 signed 整数溢出 UB（UBSan 实锤，实测概率 ~0.047%）。改用 uint32_t 模
+  //    2^32 加法再截断回 int（截断是双射，不丢区分度）；offset 段 [base, base+60)
+  //    与 old_cid 互不重叠，避免 UB 的同时保留去重语义。
+  uint32_t base = static_cast<uint32_t>(old_cid) + 1000000u;
+  for (int i = 0; i < 60; i++) {
+    PutAppendArgs pa;
+    pa.key = "k" + std::to_string(i);
+    pa.value = "v";
+    pa.op = "Append";
+    pa.client_id = static_cast<int>(base + static_cast<uint32_t>(i));
+    pa.seq_id = 1;
+    PutAppendReply par;
+    cfg.kvserver(leader)->PutAppend(pa, par);
+  }
+  if (!cfg.kvserver(leader)->IsFencedForTest(old_cid)) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "clerk client %d should be fenced after eviction", old_cid);
+    Fatal(buf);
+  }
+
+  // 下一次写：Append("x","B")。服务端因 old_cid 被 fencing 返回 kSessionGone，
+  // Clerk 应旋转到新会话、且不重发这条命令。
+  Err e = ck->Append("x", "B");
+  if (e != Err::kSessionGone) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "Append after eviction should return kSessionGone, got %s",
+                  ErrName(e));
+    Fatal(buf);
+  }
+  // 关键不变量：那条 Append("B") 绝不能被重复执行（这里根本不该执行）。
+  if (cfg.kvserver(leader)->SnapshotStore()["x"] != "A") {
+    Fatal("client protocol failed: lost Append was re-executed, x should stay \"A\"");
+  }
+  // 会话已旋转到新 client_id（kSessionGone 分支里换过）。
+  if (ck->client_id() == old_cid) {
+    Fatal("clerk should have rotated to a new client_id after kSessionGone");
+  }
+
+  // 新会话能正常工作：Put("y","Z") 应成功。
+  Err e2 = ck->Put("y", "Z");
+  if (e2 != Err::kOK) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "Put on new session should be kOK, got %s", ErrName(e2));
+    Fatal(buf);
+  }
+  if (cfg.kvserver(leader)->SnapshotStore()["y"] != "Z") {
+    Fatal("Put on new session should have set y=\"Z\"");
+  }
+
+  cfg.End();
+  cfg.Cleanup();
+}
+
+// ===========================================================================
+// 生产化：墓碑（tombstone）的取值必须正确
+// ===========================================================================
+// 【为什么要单独测】会话被 Evict 时登记进 fenced_ 的，不只是一个 cid，还有它
+// 那一刻的 last_seq —— 这就是"墓碑"。它存在的意义是：apply 去重时若会话记录
+// 已被擦除，还能用它挡住"迟到重试"。
+//
+// ⚠️ 上面 5 个用例一个都没验证墓碑的值是否正确。如果 Evict 的 on_evict 回调
+//    忘了传 last_seq（或传错变量），fenced_ 里的 value 会变成 0/垃圾，
+//    IsFencedForTest / FenceSizeForTest 全都还能通过（它们只看 key 在不在），
+//    但 apply 去重会彻底失效 → 迟到重试被重复执行 → 数据被污染。
+//    这条用例就是专门把这个隐患钉死的。
+//
+// 做法：给某个 cid 连写 N 条（让它 last_seq = N），再灌别的 cid 把它挤出去，
+// 然后直接读它的墓碑值，必须正好等于 N。
+void TestKVSessionsTombstoneValue() {
+  const int nservers = 3;
+  Config cfg(nservers, false, -1);
+  cfg.Begin("Test: evicted session leaves correct last_seq tombstone (3A)");
+
+  int leader = -1;
+  if (!WaitForLeader(cfg, &leader)) {
+    cfg.Cleanup();
+    Fatal("no leader elected");
+  }
+  // 关掉空闲淘汰，纯靠容量淘汰：确定性最强、不依赖时序。
+  for (int i = 0; i < nservers; i++)
+    cfg.kvserver(i)->SetSessionLimitForTest(/*cap=*/4,
+                                            /*max_idle=*/SessionTable::kNoIdleLimit);
+
+  auto write = [&](int cid, int seq, const std::string& key) {
+    PutAppendArgs pa;
+    pa.key = key;
+    pa.value = "v";
+    pa.op = "Put";
+    pa.client_id = cid;
+    pa.seq_id = seq;
+    PutAppendReply par;
+    // 不可靠网下可能中途换 leader：遇 ErrWrongLeader 重定位并重试（与生产 Clerk 同套路），
+    // 否则某次裸写撞选举会直接 Fatal 误判。
+    int tries = 0;
+    while (true) {
+      cfg.kvserver(leader)->PutAppend(pa, par);
+      if (par.err != Err::kWrongLeader) break;
+      if (++tries > 50) break;
+      int newl = -1;
+      if (cfg.Leader(&newl) && newl >= 0) leader = newl;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return par.err;
+  };
+
+  // ---- 步骤 1：目标 cid 连写 3 条，last_seq 应达到 3 ----
+  const int target = 4242;
+  const int want_seq = 3;
+  for (int s = 1; s <= want_seq; s++) {
+    Err e = write(target, s, "t" + std::to_string(s));
+    if (e != Err::kOK) {
+      char buf[256];
+      std::snprintf(buf, sizeof(buf),
+                    "write (cid=%d seq=%d) should be kOK, got %s", target, s,
+                    ErrName(e));
+      Fatal(buf);
+    }
+  }
+
+  // ---- 步骤 2：灌足够多的新 cid，把 target 按 LRU 挤出去 ----
+  for (int i = 0; i < 60; i++) {
+    Err e = write(500000 + i, 1, "k" + std::to_string(i));
+    if (e != Err::kOK) {
+      char buf[256];
+      std::snprintf(buf, sizeof(buf), "filler write %d should be kOK, got %s",
+                    i, ErrName(e));
+      Fatal(buf);
+    }
+  }
+
+  // ---- 步骤 3：target 必须已被 fencing，且【墓碑值正好是 3】----
+  if (!cfg.kvserver(leader)->IsFencedForTest(target)) {
+    Fatal("target session should be fenced after eviction");
+  }
+  int got_seq = -1;
+  if (!cfg.kvserver(leader)->FenceLastSeqForTest(target, &got_seq)) {
+    Fatal("fenced cid is missing its last_seq tombstone");
+  }
+  if (got_seq != want_seq) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "wrong tombstone value: cid %d got last_seq=%d, want %d "
+                  "(Evict callback must carry the pre-eviction last_seq)",
+                  target, got_seq, want_seq);
+    Fatal(buf);
+  }
+
+  cfg.End();
+  cfg.Cleanup();
+}
+
+// ===========================================================================
+// 生产化：墓碑必须随快照完整恢复（编解码对称性 + 顺序确定性）
+// ===========================================================================
+// 【这条在测什么】就是你合进来的那份 kvraft_fence_tombstone_fix.patch：
+//   · 编码端必须把 (cid, last_seq) 成对写出，不能只写 cid；
+//   · 编码顺序必须是 fence_fifo_（淘汰先后），不能是 unordered_map 的哈希序。
+//
+// 【为什么原有用例抓不到】上面所有 3B / 会话用例都只比对 kv_store_ 和
+// SessionSizeForTest —— 没人看过 fenced_ 恢复回来变成什么样。于是：
+//   · 若编码漏了 last_seq → 恢复出的墓碑全是 0 → apply 去重失效（静默双执行）；
+//   · 若按哈希序编码 → 各副本 fence_fifo_ 顺序不同 → kFenceCap 封顶时踢掉
+//     不同的 cid → 副本随时间发散（而 FenceSizeForTest 恰好相等，看不出来）。
+//
+// 做法：小 maxraftstate 逼出快照 + 隔离一个副本逼出 InstallSnapshot，等它追平后
+// 逐个比对墓碑的【有序内容】是否与 leader 完全一致。
+void TestKVSessionsTombstoneSnapshot() {
+  const int nservers = 3;
+  Config cfg(nservers, false, /*maxraftstate=*/512);
+  cfg.Begin("Test: fencing tombstones survive InstallSnapshot identically (3B)");
+
+  int leader = -1;
+  if (!WaitForLeader(cfg, &leader)) {
+    cfg.Cleanup();
+    Fatal("no leader elected");
+  }
+  // cap 很小 → 频繁淘汰 → fenced_ 真的攒出内容（否则这个测试是空转）。
+  for (int i = 0; i < nservers; i++)
+    cfg.kvserver(i)->SetSessionLimitForTest(/*cap=*/4,
+                                            /*max_idle=*/SessionTable::kNoIdleLimit);
+
+  int victim = -1;
+  for (int i = 0; i < nservers; i++) {
+    if (i != leader) {
+      victim = i;
+      break;
+    }
+  }
+  if (victim < 0) {
+    cfg.Cleanup();
+    Fatal("could not pick a non-leader replica");
+  }
+
+  auto write = [&](int cid, const std::string& key) {
+    PutAppendArgs pa;
+    pa.key = key;
+    pa.value = "v";
+    pa.op = "Put";
+    pa.client_id = cid;
+    pa.seq_id = 1;
+    PutAppendReply par;
+    // 不可靠网下可能中途换 leader：遇 ErrWrongLeader 重定位并重试（与生产 Clerk 同套路），
+    // 否则某次裸写撞选举会直接 Fatal 误判。
+    int tries = 0;
+    while (true) {
+      cfg.kvserver(leader)->PutAppend(pa, par);
+      if (par.err != Err::kWrongLeader) break;
+      if (++tries > 50) break;
+      int newl = -1;
+      if (cfg.Leader(&newl) && newl >= 0) leader = newl;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return par.err;
+  };
+
+  // ---- 阶段 1：写一批不同 cid，制造大量被淘汰（进 fenced_）的会话 ----
+  for (int i = 0; i < 90; i++) {
+    if (write(610000 + i, "a" + std::to_string(i)) != Err::kOK) {
+      Fatal("leader PutAppend (phase 1) should be kOK");
+    }
+  }
+  // 前置条件：此时 leader 上必须真的有墓碑，否则后面的比对毫无意义。
+  size_t fence_before = cfg.kvserver(leader)->FenceSizeForTest();
+  if (fence_before == 0) {
+    Fatal("no session was evicted: this test would be vacuous");
+  }
+
+  // ---- 阶段 2：隔离落后节点，继续写，逼 leader 截断日志并生成快照 ----
+  std::vector<int> others;
+  for (int i = 0; i < nservers; i++) {
+    if (i != victim) others.push_back(i);
+  }
+  cfg.Partition(std::vector<int>{victim}, others);
+  for (int i = 0; i < 150; i++) {
+    if (write(620000 + i, "b" + std::to_string(i)) != Err::kOK) {
+      Fatal("leader PutAppend (phase 2) should be kOK");
+    }
+  }
+  cfg.ConnectAll();
+
+  // ---- 阶段 3：等所有副本追平 ----
+  int target = cfg.kvserver(leader)->LastCmdIndexForTest();
+  bool converged = false;
+  for (int retry = 0; retry < 400 && !converged; retry++) {
+    converged = true;
+    for (int i = 0; i < nservers; i++) {
+      if (cfg.kvserver(i)->LastCmdIndexForTest() < target) {
+        converged = false;
+        break;
+      }
+    }
+    if (!converged) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  if (!converged) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "replicas did not converge after reconnect (target=%d)",
+                  target);
+    Fatal(buf);
+  }
+
+  // ---- 阶段 4：逐个副本比对墓碑的【有序内容】 ----
+  auto want_fence = cfg.kvserver(leader)->FenceOrderedForTest();
+  for (int i = 0; i < nservers; i++) {
+    auto got_fence = cfg.kvserver(i)->FenceOrderedForTest();
+    if (got_fence.size() != want_fence.size()) {
+      char buf[256];
+      std::snprintf(buf, sizeof(buf),
+                    "fence table size diverged: server %d has %zu, leader has "
+                    "%zu (tombstones lost or partially decoded)",
+                    i, got_fence.size(), want_fence.size());
+      Fatal(buf);
+    }
+    for (size_t k = 0; k < want_fence.size(); k++) {
+      if (got_fence[k] != want_fence[k]) {
+        char buf[320];
+        std::snprintf(
+            buf, sizeof(buf),
+            "fence table diverged at position %zu: server %d has "
+            "(cid=%d,seq=%d), leader has (cid=%d,seq=%d) — fence_fifo_ order "
+            "or last_seq is not deterministic across the snapshot boundary",
+            k, i, got_fence[k].first, got_fence[k].second, want_fence[k].first,
+            want_fence[k].second);
+        Fatal(buf);
+      }
+    }
+    // 顺带确认 kv_store_ 也没发散：快照整条链路都健康。
+    if (cfg.kvserver(i)->SnapshotStore() != cfg.kvserver(leader)->SnapshotStore()) {
+      char buf[256];
+      std::snprintf(buf, sizeof(buf), "kv_store_ diverged on server %d", i);
+      Fatal(buf);
+    }
+  }
+
+  cfg.End();
+  cfg.Cleanup();
+}
+
+// ===========================================================================
 // 测试注册表（照抄 raft_test 的范式）
 // ===========================================================================
 
@@ -1011,6 +1831,14 @@ const TestEntry kTests[] = {
     // ---- 生产化：重定向 + 背压（User 要求新增）----
     {"TestKVRedirectLeaderId", TestKVRedirectLeaderId},
     {"TestKVBackpressureBusy", TestKVBackpressureBusy},
+    {"TestKVSessionsEviction", TestKVSessionsEviction},
+    {"TestKVSessionsSnapshotRoundTrip", TestKVSessionsSnapshotRoundTrip},
+    {"TestKVSessionsDeterminismWithSnapshots",
+     TestKVSessionsDeterminismWithSnapshots},
+    {"TestKVSessionsFenceStopsReplay", TestKVSessionsFenceStopsReplay},
+    {"TestKVSessionsClientProtocol", TestKVSessionsClientProtocol},
+    {"TestKVSessionsTombstoneValue", TestKVSessionsTombstoneValue},
+    {"TestKVSessionsTombstoneSnapshot", TestKVSessionsTombstoneSnapshot},
     {"TestConcurrent3A", TestConcurrent3A},
     {"TestUnreliable3A", TestUnreliable3A},
     {"TestUnreliableOneKey3A", TestUnreliableOneKey3A},
