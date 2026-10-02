@@ -7,6 +7,26 @@
 
 namespace raft {
 
+// TSan 插桩令 raft 事件处理慢 5~15×。One() 内层等待（原始 2s）在成员变更 / 不可靠网
+// 场景下会被拖超，把“TSan 慢调度”误判成“日志达不成一致”——属于测试侧假阳性，
+// 而非 raft 逻辑 bug（TSan 本身也没报 data race，只报了 agreement 超时）。
+// 仅在 TSan 下放宽内层等待，非 TSan 路径零变化（与 KV 那套“改测试本身”思路一致）。
+#if defined(__SANITIZE_THREAD__) || \
+    (defined(__has_feature) && __has_feature(thread_sanitizer))
+constexpr double kOneInnerWaitSec = 20.0;  // 非 TSan 的 2s ×10，覆盖典型 TSan 减速
+#else
+constexpr double kOneInnerWaitSec = 2.0;
+#endif
+
+// 外层总窗口：必须 >= 内层等待的整数倍，否则内层 20s 会耗尽整个窗口、剥夺 one() 的重试节奏。
+// TSan 下事件处理慢 5~15x，分区愈合类用例(TestRejoin2B)初期 leader 动荡，必须靠多次重试
+// 逮住稳定后的 leader —— 故外层随 TSan 放宽到 40s(内层 20s -> 至少 2 次重试)，非 TSan 保持 10s。
+#if defined(__SANITIZE_THREAD__) || \
+    (defined(__has_feature) && __has_feature(thread_sanitizer))
+constexpr double kOneOuterWaitSec = 40.0;
+#else
+constexpr double kOneOuterWaitSec = 10.0;
+#endif
 // ===========================================================================
 // 构造 / 析构
 // ===========================================================================
@@ -482,7 +502,7 @@ void Config::DumpState(const char* where) {
 int Config::One(const Command& cmd, int expected_servers, bool retry) {
   auto t0 = raftcpp::Now();
   int starts = 0;
-  while (raftcpp::SecondsSince(t0) < 10) {
+  while (raftcpp::SecondsSince(t0) < kOneOuterWaitSec) {
     int index = -1;
     for (int si = 0; si < n_; si++) {
       starts = (starts + 1) % n_;
@@ -501,7 +521,7 @@ int Config::One(const Command& cmd, int expected_servers, bool retry) {
 
     if (index != -1) {
       auto t1 = raftcpp::Now();
-      while (raftcpp::SecondsSince(t1) < 2) {
+      while (raftcpp::SecondsSince(t1) < kOneInnerWaitSec) {
         auto [nd, cmd1] = NCommitted(index);
         if (nd > 0 && nd >= expected_servers && cmd1 && *cmd1 == cmd) {
           return index;

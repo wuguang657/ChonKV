@@ -238,16 +238,17 @@ std::map<std::string, std::string> KVServer::SnapshotStore() const {
 // RPC handler
 // ---------------------------------------------------------------------------
 
-// Get 走 ReadIndex（线性一致读优化，不再为只读请求写一遍 raft 日志）：
-//   1) rf_->ReadIndex() 返回"已提交下标"的线性化点 ri。仅在 leader 且凑齐多数派时
-//      ri >= 0；非 leader / 凑不齐多数派返回 -1，让 Clerk 换台重试。
+//   1) rf_->ReadIndex() 返回"已提交下标"的线性化点 ri。leader 直接验身份 + 多数派心跳
+//      确认；follower 则经 Raft.ReadIndex RPC 向 leader 索要同一读点（Follower ReadIndex，
+//      把读负载平摊到所有节点，解除 leader 读瓶颈）。返回 -1 表示无法确认（非 leader 且
+//      连不上 leader / 凑不齐多数派），让 Clerk 换台重试。
 //   2) 等状态机 apply 到那个下标（last_cmd_index_ >= ri），再【持锁直读】本地状态机。
 //   注意 value / err 必须在【持锁临界区】内拷出：释放锁后再读 kv_store_ 会被
 //   后续已提交的 Put 改写 → 读到比自身 linearization point 更晚的值 →
 //   porcupine 判 Illegal。
 void KVServer::Get(const GetArgs& args, GetReply& reply) {
-  // 线性化点：ReadIndex 内部已保证"仅 leader 且凑齐多数派"才返回 >-1 的下标。
-  // 非 leader / 凑不齐多数派返回 -1，让 Clerk 换台。
+// 线性化点：leader 直接验身份、follower 经 RPC 向 leader 索取，二者都返回经多数派
+// 确认的"已提交下标"ri（>=0 才能读）。连不上 leader / 凑不齐多数派返回 -1，让 Clerk 换台。
   int ri = rf_->ReadIndex();
   if (ri < 0) {
     // 非 leader：把认知到的 leader 编号回填，供 Clerk 重定向直连。
@@ -423,7 +424,26 @@ void KVServer::ApplierLoop() {
 
       Op op;
       // 真实命令：空命令已在上面处理。
-      if (!op.Deserialize(m.command)) continue;
+      //
+      // ⚠️⚠️ 反序列化失败【也必须照样推进 last_cmd_index_】——否则 Get 会永久挂起。
+      // 触发载荷：raft 派发的成员变更条目（raft.cpp 里编码成 "CONF:x:V" 这类字符串），
+      //   而 Op 是 length-prefixed 二进制（common.h），"CONF" 前 4 字节会被当成
+      //   长度 ≈ 11.8 亿 → Deserialize 必然返回 false。
+      // 卡死链：raft 的 last_applied_ 正常推进，但 KV 的 last_cmd_index_ 卡在 conf
+      //   下标之前 → 当 conf 恰为最后一条已提交条目时，ReadIndex 返回的 ri 就落在
+      //   conf 下标上 → Get 的 "等 last_cmd_index_ >= ri"（server.cpp:274）永不成立
+      //   → 每次死等 1s 超时 → 返回 kWrongLeader。成员变更 + 读并发必踩。
+      // 安全性：这类条目根本不写 kv_store_，所以不存在"下标已推进但状态机还没改"
+      //   的窗口 —— 与上面 no-op 分支（server.cpp:416-423）同理，反而【必须】推进。
+      // 不唤醒 msg_replies_：conf 条目走 ProposeConfChangeTo，KV 层不会为它注册 waiter。
+      if (!op.Deserialize(m.command)) {
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+          last_cmd_index_ = m.command_index;
+        }
+        apply_cv_.notify_all();
+        continue;
+      }
 
       bool need_snap = false;
       int snap_index = 0;
@@ -512,9 +532,26 @@ void KVServer::ApplierLoop() {
         if (m.snapshot_index >= last_cmd_index_) {
           ApplySnapshotLocked(m.snapshot);
           last_cmd_index_ = m.snapshot_index;
+
+          // ---- C5：装快照会「吞掉」(旧 last_cmd_index_, snapshot_index] 这段日志 ----
+          // 这段里的命令再也不会走 ApplierLoop 的正常分支，msg_replies_ 里等着它们的
+          // waiter 永远等不到 done=true，只能靠 WaitOp 的 1s 总超时才返回 kWrongLeader
+          // —— 每装一次快照，被覆盖区间上的客户端就白白多等 1s（快照越频繁越明显）。
+          // 处理：把这些被覆盖区间的 waiter 显式置 done=true / ok=false，WaitOp 下一轮
+          // 轮询（100ms）即可返回，客户端马上换台重试，不必干等超时。
+          // ok=false 语义正确：这些下标的命令确实【没有】经由本节点 apply —— 它们是被
+          // 快照整体替代的（可能由旧 leader 提交、也可能已被新 leader 覆盖），与
+          // 「身份不匹配」走同一条重试路径，不会误报成功。
+          for (auto it = msg_replies_.begin(); it != msg_replies_.end(); ++it) {
+            if (it->first <= m.snapshot_index) {
+              it->second.done = true;
+              it->second.ok = false;
+            }
+          }
         }
       }
       // 与 no-op / command 分支保持一致：装快照同样可能让某条 ReadIndex 读成立。
+      // （同时唤醒上面被置 done 的 waiter —— 它们不必再等 1s 超时。）
       apply_cv_.notify_all();
     }
   }

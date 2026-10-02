@@ -13,6 +13,10 @@ bin-release/
 *.ipa
 *.apk
 
+# ChonKV 本地编译产物（build.sh / test_part.sh 生成，勿入库）
+build*/
+testdir/
+
 # Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
 # should NOT be excluded as they contain compiler settings and other important
 # information for Eclipse / Flash Builder.

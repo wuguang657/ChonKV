@@ -428,7 +428,16 @@ void Config::End() {
 
   // 和 raft 测试脚手架一致的超时保护
   // ⚠️ 同样走 Fatal() 翻 g_failed，否则超时也算"通过"。
-  if (secs > 120.0) {
+  // TSan 下插桩慢 5~15×，分区愈合墙钟时间可能暴涨；该死线本是防"真卡死"的兜底，
+  // TSan 模式放宽到 360s（仍远小于全局看门狗 TEST_TIMEOUT_MS），避免把 TSan 调度
+  // 偶发导致的慢愈合误判为 hang。非 TSan 保持 120s 不变（能抓真卡死）。
+  const double kEndTimeoutSec =
+#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
+      360.0;
+#else
+      120.0;
+#endif
+  if (secs > kEndTimeoutSec) {
     Fatal("test took longer than 120 seconds");
   }
 
@@ -563,12 +572,12 @@ bool Config::CheckLinearizability() {
                           ? "GET"
                           : (op.input.op == kvraft::KV_OP_PUT ? "PUT" : "APP");
       (void)m;
-                          // std::printf("      [%zu] client=%d seq=%lld %s key=%s val_in=\"%s\" val_out=\"%s\" "
-                  // "call=%lld ret=%lld\n",
-                  // i, op.client_id, (long long)op.seq_id, m,
-                  // op.input.key.c_str(),
-                  // op.input.value.c_str(), op.output.value.c_str(),
-                  // (long long)op.call_time_ns, (long long)op.return_time_ns);
+                          std::printf("      [%zu] client=%d seq=%lld %s key=%s val_in=\"%s\" val_out=\"%s\" "
+                  "call=%lld ret=%lld\n",
+                  i, op.client_id, (long long)op.seq_id, m,
+                  op.input.key.c_str(),
+                  op.input.value.c_str(), op.output.value.c_str(),
+                  (long long)op.call_time_ns, (long long)op.return_time_ns);
     }
   }
   std::fflush(stdout);

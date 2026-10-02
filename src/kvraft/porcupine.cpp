@@ -1,9 +1,8 @@
 // porcupine.cpp —— 线性一致性检查器实现（移植自 MIT 6.824 src/porcupine/）
 //
-// ⚠️ 一处重要修改：Node 自带 Input/Output 副本（Node<Input, Output> 模板）。
-// 原 Go 版用 entry.value 指向 Operation（生命周期由 history 持有），
-// C++ 这边如果照搬会出现 use-after-free —— MakeEntries 返回的 Entry 里的
-// void* 指向已析构的局部 vector。改成 Node 自带值是最稳的做法。
+// porcupine 的输入只有一条条记录好的操作：(call, ret, input, output)。
+// 它做的事是穷举每个操作能落在 [call, ret] 里的哪个线性化点 τ，然后看"按这些 τ 顺序跑 Kv 模型（PUT=覆盖 / APP=拼接 / GET=返回当前值）
+// "能不能复现出每个操作记录的 output。它从头到尾不联系任何节点、不读 leader 现状、不知道谁是 leader 谁是 follower。
 
 #include "porcupine.h"
 

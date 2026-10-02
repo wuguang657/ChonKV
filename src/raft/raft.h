@@ -273,6 +273,26 @@ struct AppendEntriesReply {
   bool Deserialize(const std::string& s);
 };
 
+// Follower ReadIndex：follower 向 leader 索要一个「经多数派确认」的线性化读点。
+// leader 在自己的 Raft 层做"多数派心跳确认"后，把当前 commit_index_ 回给 follower，
+// follower 等自己的状态机 apply 到该点再本地读 —— 从而把线性一致读从 leader 单点
+// 平摊到所有节点，解除 leader 读瓶颈（不依赖 lease，安全性与 leader-only ReadIndex 等价）。
+// 对应 raft.cpp 的 Raft::ReadIndex()（follower 分支）与 Raft::ReadIndexRPC()（leader 端）。
+struct ReadIndexArgs {
+  int term = 0;  // follower 的 currentTerm，leader 用来判断自己是否过时
+ 
+  std::string Serialize() const;
+  bool Deserialize(const std::string& s);
+};
+
+struct ReadIndexReply {
+  int term = 0;          // leader 的 currentTerm（follower 据此校验 leader 新鲜度）
+  int read_index = -1;   // leader 确认身份后的 commit_index_；<0 表示被拒
+
+  std::string Serialize() const;
+  bool Deserialize(const std::string& s);
+};
+
 // 快照 RPC（Lab 3 日志压缩）：leader 给落后太多的 follower 直接发整块快照，
 // 跳过漫长的日志重放。data 是上层状态机的序列化 blob，Raft 不解析。
 struct InstallSnapshotArgs {
@@ -297,10 +317,12 @@ struct InstallSnapshotReply {
 };
 
 struct ReadIndexCtx {
+  int ctx = 0;         // 自身身份号(0=无在飞读轮),复用作"无"哨兵,与旧 active_read_ctx_ 语义一致
   int term = 0;        // 发起读时的 currentTerm，term 一变该 ctx 作废
   int read_index = 0;  // 发起读那一刻的 commitIndex（本次读至少要看到它）
   std::vector<char> acked_;  // 按 server 下标去重：记录哪些节点已回过 ack（leader 自己那一票在 ReadIndex() 里置位）
   bool done = false;   // 是否已攒够多数派
+  int waiters = 0;     // 【读合并】挂在该 ctx 上的并发读者计数(per-ctx 引用计数,最后一个离开者清理)
 };
 
 // Start() 的返回值。Go 版返回 (index, term, isLeader) 三元组，
@@ -461,6 +483,9 @@ class Raft : public std::enable_shared_from_this<Raft> {
   void SendRequestVoteRPCs();  // 真实投票 RPC 发送(StartRealElection 与 candidate 超时重发共用)
   // TODO(2A)：实现心跳；TODO(2B)：追加日志冲突检测
   void AppendEntries(const AppendEntriesArgs& args, AppendEntriesReply& reply);
+  // Follower ReadIndex 的服务端入口：follower 发来的读请求在这里被 leader 处理。
+  // 内部复用 leader 本地 ReadIndex()（多数派心跳确认 + 等 apply），把 commit_index_ 回给 follower。
+  void ReadIndexRPC(const ReadIndexArgs& args, ReadIndexReply& reply);
 
   // ---- 快照（Lab 3 日志压缩）----
   // 上层状态机（KV 服务）调用：到 index 为止的状态机已持久化，
@@ -555,6 +580,16 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // 回包到达时按 ctx 把这一票记到对应读请求上；攒够多数派就标记 done 并唤醒。
   // 调用前必须持有 mu_。
   void RecordReadAckLocked(int ctx, int server);
+  // 推进 commitIndex：取所有 voter 的 matchIndex 中位数，并要求该下标条目
+  // term == current_term_（Figure 8 守卫）。leader 侧【唯一】提交入口。
+  // 调用前必须持有 mu_。
+  //
+  // ⚠️ 必须由三处调用：AE 回包回调（他人确认后）+ Start() +
+  // ProposeConfChangeTo()（追加日志后）。只靠回包回调的话，当 quorum=1
+  // （单 voter 集群，或其余节点全部不可达 / 已 removed）时没有任何回包到达
+  // → commit_index_ 永不推进 → 写永不提交、ReadIndex 永久返回 -1
+  // → 集群完全不可用。Raft 语义上 leader 自身持有即计入多数派。
+  void AdvanceCommitIndexLocked();
 
   mutable std::mutex mu_;
 
@@ -690,7 +725,14 @@ class Raft : public std::enable_shared_from_this<Raft> {
 
     // 【ReadIndex 读确认：per-request ctx 设计】
   std::atomic<int> next_read_ctx_{1};            // 全局唯一 ctx 号（单调递增，永不复用）
-  std::unordered_map<int, ReadIndexCtx> read_ctxs_;  // ctx -> 该条读的状态，受 mu_ 保护
+  // 【ReadIndex 读合并 · 单槽 + 共享指针】任意时刻【最多一轮】在飞读轮:未完成的轮
+  // (!done)允许并发读者挂入(合并心跳);done 后不再收人——安全性承重件:挂入者的调用
+  // 时刻必须早于多数派 ack 完成时刻,领导权验证才不会过期(否则分区+新主已 ACK 的写
+  // 会被挂入者漏读)。用 shared_ptr 而非值单例:waiter 挂入时持有自己的对象副本,
+  // active_read_ 被新轮覆写后旧 waiter 仍能看到自己轮的 done(值单例下会被"搁浅"
+  // 到超时);末位离开者把 active_read_ 撤下,超时死轮不会吸住重试读者造成羊群效应。
+  // 空指针 = 无在飞读轮。所有解引用均在 mu_ 下。
+  std::shared_ptr<ReadIndexCtx> active_read_;  // 当前在飞读轮(nullptr => 无)
 
   // ReadIndex 线性一致读的硬性前提：本 leader 必须先把一条自己 term 的 entry
   // （no-op，见 become-leader 块）提交，commit_index_ 才能覆盖上任前已提交的 entry。
@@ -789,12 +831,21 @@ inline std::shared_ptr<labrpc::Service> MakeRaftService(
     rf->InstallSnapshot(a, r);
     return r.Serialize();
   };
+  Service::Handler read_index =
+      [rf](const std::string& args) -> std::string {
+    ReadIndexArgs a;
+    a.Deserialize(args);
+    ReadIndexReply r;
+    rf->ReadIndexRPC(a, r);
+    return r.Serialize();
+  };
   return std::make_shared<Service>(
       "Raft", std::unordered_map<std::string, Service::Handler>{
                   {"RequestVote", request_vote},
                   {"RequestPreVote", request_prevote},
                   {"AppendEntries", append_entries},
                   {"InstallSnapshot", install_snapshot},
+                  {"ReadIndex", read_index},
               });
 }
 

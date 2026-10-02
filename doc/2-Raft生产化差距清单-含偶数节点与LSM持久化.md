@@ -6,6 +6,8 @@
 > **方法**：每一条结论都来自今天对你桌面源码的实际 grep / 读码，标注 `文件:行号` 作为铁证，不推测。  
 > **用途**：这份是「待办清单」，后面你一条条实现，每项都带复选框。
 
+> ⚠️ **2026-10-01 复核：本文已部分过期。** 本文写于 2026-09-14，此后已完成成员变更 / Learner 三态 / §2.7 多数派加固 / Follower ReadIndex 等大量工作。本文 **§2.5–§2.7、§3.1 的"缺失"结论已失效**，以文末「§十、2026-10-01 复核更新」为准。偶数节点理论（§2.1–2.4、2.8、2.9）与 tiny-lsm 分析（§7）仍 100% 有效。
+
 ---
 
 
@@ -162,6 +164,8 @@ C_new = {A,B,C,D,E}      quorum_new = 3
 
 ## 2.5 Joint Consensus vs 单节点变更（怎么选）
 
+> ⚠️ **实现状态已过期（见 §十.A）**：本节假设的"`is_member_` 是 bool、表达不了 Learner 第三态"已不成立——当前 `is_member_` 已是 `enum class MemberRole { kRemoved, kLearner, kVoter }` 三态，单节点变更 + Learner 也已实现。仅 **Joint Consensus（两阶段）仍缺失**。
+
 | 维度     | 单节点变更                         | Joint Consensus（论文 §6 原版）                |
 | ------ | ----------------------------- | ---------------------------------------- |
 | 一次能改几个 | **只能 1 个**                    | 任意多个                                     |
@@ -188,6 +192,8 @@ std::vector<MemberRole> role_;
 
 ## 2.6 Learner：让扩容"零可用性损失"的关键
 
+> ⚠️ **实现状态已过期（见 §十.A）**：本节描述的"`is_member_` 是 bool、表达不了 learner"已在后续工作中解决——Learner 三态（`kLearner`）已实现并接入复制/计票/退位守卫。概念部分（扩容零损失原理）仍有效。
+
 **问题**：新节点加入时日志是空的，要从快照追数据（可能几分钟～几小时）。如果它一上来就是 voter：
 
 - 5 节点加 1 → 6 节点（偶数），quorum 从 3 涨到 4
@@ -209,6 +215,8 @@ std::vector<MemberRole> role_;
 
 
 ## 2.7 ★ 当前代码在"偶数节点 + 成员变更"下的**已存在漏洞**（本篇最重要的发现）
+
+> ⚠️ **实现状态已过期（见 §十.A）**：本节描述的"多数派三处漏过滤 `peers_.size()`"炸弹已于后续加固中解除——预投票/正式投票/`CountGrantedVotes`/提交中位数现**全部经 `IsVoter()` 过滤**（raft.cpp:540/628/1050/2150）。原始结论不再成立，请勿据此改动。
 
 我把所有算 majority 的地方都 grep 了一遍，结果是**不一致的**——这是一颗**已经埋好的定时炸弹**：
 
@@ -274,6 +282,8 @@ std::vector<MemberRole> role_;
 # 三、正确性 / 安全性缺口（P0）
 
 ### 3.1 成员变更（Conf Change）—— 最大结构性缺失
+
+> ⚠️ **已过期（见 §十.A）**：成员变更（单步 + apply 时切换 + Learner 三态 + 单飞保护）现已实现，原"全项目唯一赋值处 raft.cpp:188"结论失效。**Joint Consensus（两阶段变更）仍缺失**，属 #4。
 
 - **铁证**：`raft.cpp:188` `is_member_.assign(peers_.size(), true);` —— 全项目**唯一**一处赋值，无任何修改路径。grep `AddServer|RemoveServer|ConfChange|joint` 只命中 `config.cpp:268` 的 `net_->AddServer`（那是 labrpc 静态搭拓扑，不是 Raft 成员变更）。
 - **生产后果**：集群规模**构造时固定**，无法在线扩缩容。换机器、扩容、机房迁移全都要重建集群。这不是"差点意思"，是"不叫分布式系统"。
@@ -557,3 +567,75 @@ std::vector<MemberRole> role_;
 - `sst.h:72` — BloomFilter 已接入
 - `transaction.h:17` / `transation.cpp:197` — SERIALIZABLE 未实现
 - `xmake.lua:109` — `lsm_shared` 静态库目标
+
+---
+
+# 十、2026-10-01 复核更新（本文部分过期，以本节为准）
+
+> 本节基于 2026-10-01 对桌面 `cpp-6.824` 源码的重新 grep 实测，修正本文 §2.5/§2.6/§2.7/§3.1 中已过时的"缺失"结论，并给出**「剔除持久化与网络后」的剩余待做清单**。
+> 本文原写于 2026-09-14；之后已完成成员变更 / Learner 三态 / §2.7 多数派加固 / Follower ReadIndex 等大量工作（详见 `doc/raft生产化待办清单-16项.md` 的更正记录，以及 `doc/code_review_20261001_v3.md` / `doc/readindex_hardening_review_20261001.md`）。
+> 配套工具：`doc/raft生产化待办清单-16项.md`（功能级 16 项 + C/D/E 组 Consolidated Backlog）。
+
+## A. 重大更正（grep 铁证，原结论已失效）
+
+| 原结论（doc/2） | 真实状态 | 铁证（grep 实测） |
+|---|---|---|
+| §2.5/§2.6/§2.7：`is_member_` 是 `bool`（raft.h:555），表达不了 learner 第三态 | ❌ 已推翻：现为 `enum class MemberRole { kRemoved, kLearner, kVoter }` 三态 | `raft.h:151` 枚举定义；`raft.h:157` `IsVoter()`；`raft.h:761` `std::vector<MemberRole> is_member_`；`raft.cpp:210` `is_member_.assign(..., MemberRole::kVoter)` |
+| §3.1 成员变更"最大结构性缺失，全项目唯一赋值处 raft.cpp:188" | ❌ 已推翻：已实现**单步变更 + apply 时切换 + Learner 三态 + 单飞保护** | `raft.cpp:1936` `ProposeConfChangeTo(server, MemberRole)`；`raft.cpp:1982` `pending_conf_index_ = e.index`（单飞）；`raft.cpp:1953` 单飞守卫；ApplyLoop 派发 conf 在 `raft.cpp:1488-1535`（apply 时切 `is_member_`、触发 `pending_stepdown_`） |
+| §2.7 "多数派三处漏过滤 `peers_.size()`" 定时炸弹 | ❌ 已解除：投票/计票/ReadIndex ack/提交中位数**全部经 `IsVoter()` 过滤** | 预投票 `raft.cpp:540/543/547`；正式投票 `raft.cpp:628/631/673`；`CountGrantedVotes` `raft.cpp:2150` 跳过非 voter；提交中位数 `raft.cpp:1050-1052` 只数 `IsVoter`；CheckQuorum `raft.cpp:377` `MemberCountLocked()/2+1` |
+
+> **关键说明**：循环上界仍是 `peers_.size()`（vector 按 peer 数分配），但**循环体已逐处 `IsVoter` 过滤**，所以 §2.7 担心的"被移除节点仍参与计票 → 双 leader / 丢已提交数据"已不存在。原 §2.7 的修复清单（统一 majority）现已自然满足，无需再做。
+
+## B. 仍有效的部分（保留原文，未过期）
+
+- **§2 偶数节点理论**（2.1–2.4、2.8、2.9）：纯理论 / 运维纪律，仍 100% 正确。
+- **§7 tiny-lsm 分析**（7.0–7.5）：持久化层对接分析与 4 个坑仍有效（WAL 仅事务路径写、前台 compaction 阻塞、无 Manifest、`WAL::flush()` 空实现）。
+- 以下"确仍缺失/未做"的小节结论正确，已在 §C 清单中保留：§3.2 快照分块、§3.3 磁盘水位、§3.4 CRC、§4.1 Leader Transfer、§4.2 优雅关闭、§4.4 选举优先级、§5.1 流水线、§5.2 单条 AE 上限、§5.5 锁粒度、§六 session TTL/LRU（注：#9 Session TTL/LRU 已于 2026-09-27 grep 确认已实现，应移出待办）。
+
+## C. 剔除「持久化 + 网络」后的剩余待做清单（2026-10-01）
+
+> **过滤口径**：持久化类（#10 真持久化 tiny-lsm、#11 Group Commit、#7 真·磁盘占比、#6 的 CRC、C4 log CRC、E4 Storage 接口、E5 Ready/Advance、E6 unstable 缓冲、D7 WAL 分离）与网络类（#14 网络流控、C2 字节 inflight、D2 快照限速、D3 Msg 优先级）已剔除。以下为剩下的真·待做。
+
+### 一、raft 算法本身（语义 / 正确性 / 效率，面试含金量最高）
+
+| # | 项 | 优先级 | 盘上 grep 核实（2026-10-01） |
+|---|---|---|---|
+| **#1** | Leadership Transfer 主动让贤 | P0 | `TransferLeader` / `TimeoutNow` / `force_election_` **零命中 → 未做** |
+| **#4** | Joint Consensus 两阶段配置变更 | P1 | `joint` / `JointConsensus` **零命中 → 未做**（单步变更已实现，Joint 仍缺） |
+| **#5** | 选举优先级 + Witness 精确语义 | P1 | `witness` / `priority` **零命中 → 全未做**（清单旧记"仅优先级部分"是误记） |
+| **#16** | Leader Lease 开启 + 时钟防护 | 🟡 几乎已做 | 机制在（`raft.h:76/95/720`、`raft.cpp:1432/2351`），`kEnableLeaseRead=false`（raft.h:95）默认关，翻开关 + 时钟防护即生效 |
+| **E1** | Per-follower Progress 状态机（Probe/Replicate/Snapshot） | - | 仅朴素 `next_/match_index_` + 单 `ReplicateLoop`，无三态 |
+| **E3** | ReadIndex 批量合并 | - | 基础 ReadIndex 有，`batch_read` / `read_index_queue` **零命中** |
+| **E7** | EntryType 分离（EntryNormal/ConfChange/NoOp） | - | 靠 `pending_conf_index_` 特判，无枚举 |
+| **E8** | Node-ID 稳定成员标识 | - | 整数下标，`node_id` / `NodeId` **零命中**（重启/替换会身份错乱） |
+
+### 二、raft 工程化 / 运维（非算法、非持久化、非网络）
+
+| # | 项 | 说明 |
+|---|---|---|
+| **#3** | 优雅关闭 / 重启 | 钩子已有（raft.cpp:236 Kill、config.cpp:77 ShutdownServer），缺"先 Transfer 再 drain"协调逻辑；**依赖 #1** |
+| **#12** | 可观测性 metrics / tracing | 现仅 `fprintf(stderr)` 排错日志 |
+| **#13** | 锁粒度细化 / RCU | 单大锁 `mu_`，改动面大风险高，最后做 |
+| **#15** | Raft log 最小保留窗口 | 落后 follower / learner 追平所需（#15 是"保留下限"细化，非"没截断"） |
+
+### 三、快照传输协议（介于算法与网络之间，单列）
+
+| # | 项 | 说明 |
+|---|---|---|
+| **#8** | 快照分块 / 流式传输 | 当前单 blob 全量，`chunk` / `offset` / `SnapshotChunk` **零命中** |
+| **#6** | abort/restart 机制 | 仅 CRC 部分归持久化；abort/restart 协议本身未做，跟 #8 配套最顺 |
+
+**已做（不在范围，确认移出）**：#2 Session 去重、#9 Session TTL/LRU、C1 未提交上限、C3 消息字节上限、C5 被移除节点退场、D1 leader 重定向，以及本节 A 组三项（成员变更 / Learner 三态 / §2.7 修复）。
+
+## D. 推荐执行顺序
+
+1. **#16 Leader Lease**：几乎白送，翻 `kEnableLeaseRead=true` + 加时钟漂移防护（`kClockDriftBoundMs` 已有）→ 立刻拿 lease read 低延迟收益。
+2. **#1 Leadership Transfer + #3 优雅关闭**：打包做，运维收益最高、自包含无阻塞。
+3. **#4 Joint Consensus**：替换单步变更核心（`ProposeConfChangeTo` / `pending_conf_index_`）。
+4. **#5 选举优先级 + Witness**：Ceph 运维背景对 Witness 见证节点概念现成对标。
+5. **E1 / E3 / E7 / E8**：算法内部机制级打磨（ETCD / dragonboat / TiKV 标配）。
+6. **#8 / #6 快照传输 + #12 / #13 / #15**：工程打磨期。
+
+> ⚠️ **雷区**：动选举路径的 #1 / #4 / #5，交付前必须跑 `test_raft.cpp` 全量 + TSan 硬化用例，确认无 term 暴涨 / 选举活锁回归（test_raft.cpp 已注册 67 用例含 TSan 硬化）。
+
+*—— 本节由 WorkBuddy 于 2026-10-01 基于代码实核查补，非推测。*

@@ -222,11 +222,15 @@ inline const char* SanitizerName() {
   return "TSan(thread)";
 #elif defined(__SANITIZE_ADDRESS__)
   return "ASan(address)";
+#elif defined(__SANITIZE_UNDEFINED__)
+  return "UBSan(undefined)";
 #elif defined(__has_feature)
 #if __has_feature(thread_sanitizer)
   return "TSan(thread)";
 #elif __has_feature(address_sanitizer)
   return "ASan(address)";
+#elif __has_feature(undefined_behavior_sanitizer)
+  return "UBSan(undefined)";
 #else
   return "none（抓不到 data race；要查竞态请 ./tsan.sh）";
 #endif

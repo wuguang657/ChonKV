@@ -13,11 +13,20 @@ been extended well beyond the original labs. It passes the full Lab 2 suite
 (election / log replication / persistence / snapshots) and Lab 3 suite (linearizable KV
 service with snapshots), and adds **Pre-Vote**, **CheckQuorum leader step-down**,
 **ReadIndex + Lease read**, and **dynamic cluster membership change** (learner role, Q2
-removal freeze). The test suite ships **68 Raft tests + 9 KV tests**, including a
-`porcupine`-style linearizability checker and ThreadSanitizer support.
+removal freeze). The test suite ships **73 Raft tests + 34 KV tests (107 total)**, including a
+`porcupine`-style linearizability checker, a ThreadSanitizer/ASan/UBSan build matrix, and a
+parallel stress harness (`test_part.sh`).
 
 > Persistence and transport layers are still in-memory / simulated — see
-> [Roadmap](#路线图--roadmap已知差距) for the productionization gaps.
+> [Roadmap](#roadmap--known-gaps) for the productionization gaps.
+
+### Build & test in 30 seconds
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build -j
+./build/raft_test 2A          # run a Raft test group
+./build/kv_test   3B          # run a KV test group
+```
 
 ---
 
@@ -29,7 +38,8 @@ MIT 6.824（2020）的课程框架，但实现已经显著超出原 lab 范围�
 - 共识核完整覆盖 **Lab 2A~2D**（领导者选举、日志复制、崩溃恢复持久化、快照压缩）；
 - KV 层覆盖 **Lab 3A/3B**（线性一致 KV 服务 + 快照）；
 - 额外自研了多项**生产向**特性（见下）；
-- 配套 **68 个 Raft 测试 + 9 个 KV 测试**，含 porcupine 线性化校验与 ThreadSanitizer 支持。
+- 配套 **107 条测试**（Raft 73 + KV 34），含 porcupine 线性化校验、TSan/ASan/UBSan
+  构建矩阵，以及进程级并发压测脚本（`test_part.sh`）。
 
 > ⚠️ 当前**持久化层（Persister）仍是纯内存**、**传输层（labrpc）仍是软件模拟**，
 > 真实落盘 / 真实网络尚未接入——详见下方路线图。
@@ -69,6 +79,8 @@ MIT 6.824（2020）的课程框架，但实现已经显著超出原 lab 范围�
 - 动态扩容线程池（避免阻塞型 handler 饿死心跳）
 - T2/T3 崩溃窗口双层防护（快照 install 与 KV map 更新非原子问题）
 - `std::chrono::steady_clock` 单调时钟（租约不受墙钟 NTP 回跳影响）
+- **多档构建矩阵**：Debug / Release / LTO，加 TSan / ASan / UBSan 任意组合
+- **并发压测 harness**：每条用例独立进程、换种子多轮、日志分文件、可并发
 
 ---
 
@@ -88,9 +100,13 @@ cpp-6.824/
 ├── doc/                  # 设计 / 差距分析文档（深度，建议阅读）
 │   ├── 1-生产级差距与路线图.md
 │   └── 2-Raft生产化差距清单-含偶数节点与LSM持久化.md
+├── patches/              # 已落地的加固补丁（raft/kv 各 fix，含 ReadIndex 相关）
 ├── CMakeLists.txt        # 构建定义（raft_test / kv_test / labrpc_selftest）
-├── build.sh              # 一键编译 + 跑测试
-├── tsan.sh / test2A.sh / test3B.sh / ...   # 便捷脚本
+├── build.sh              # 一键编译 + 跑测试（支持全套构建变体）
+├── test_part.sh          # 并发压测 harness（通用核心，2A~3B/CheckQuorum/ReadIndex...）
+├── test2A.sh ~ test3B.sh # test_part.sh 的薄封装（只指定 part）
+├── tsan.sh               # ThreadSanitizer 一键体检
+├── build*/  testdir/     # ⚠️ 本地编译产物（已 gitignore，clone 后不会出现）
 ├── LICENSE               # MIT
 └── README.md
 ```
@@ -114,44 +130,160 @@ Apple Silicon Mac 自带的 `clang++`（Xcode Command Line Tools）完全够用�
 
 ### 构建与运行 / Build & Run
 
+`build.sh` 是 `cmake` 的一层薄封装，支持按过滤词跑指定用例、以及全套构建变体：
+
 ```bash
 cd cpp-6.824
-./build.sh                # 编译 + 跑全部测试（Raft Lab2 + KV Lab3）
-./build.sh 2A             # 只跑 2A（按前缀自动识别：2* → raft_test，3* → kv_test）
-./build.sh 2B -count 10   # 2B 跑 10 遍（抓偶发 bug 的必备姿势）
-./build.sh --tsan         # 开 ThreadSanitizer 查数据竞争（慢 5~15 倍）
-./build.sh --clean        # 清空编译产物
+./build.sh                          # 编译 + 跑全部测试（Raft Lab2 + KV Lab3）
+./build.sh 2A                       # 只跑 2A（按前缀自动识别：2* → raft_test，3* → kv_test）
+./build.sh 2B -count 10             # 2B 跑 10 遍（抓偶发 bug 的必备姿势）
+./build.sh --release                # Release 版（-O3 + NDEBUG）
+./build.sh --opt                    # 开 LTO 优化（Debug 下附赠 -O2；可与下面任意组合）
+./build.sh --tsan                   # ThreadSanitizer 查数据竞争（慢 5~15 倍）
+./build.sh --asan                   # AddressSanitizer 查内存越界 / Use-After-Free
+./build.sh --ubsan                  # UBSan 查未定义行为（可与 --asan 组合）
+./build.sh --release --asan --ubsan # 生产级配置下做内存 + UB 体检
+./build.sh --clean                  # 清空全部编译产物（build*/）
 ```
 
-等价于直接用 CMake：
+等价于直接用 CMake（构建变体的 `-D` 开关与脚本一致）：
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j
-./build/raft_test 2A      # 跑指定用例
-./build/kv_test 3B
+./build/raft_test 2A      # 跑指定用例（过滤词即测试名子串）
+./build/kv_test   3B
 ```
 
-> **sanitizer 提醒**：默认二进制**抓不到 data race**（C++ 需另编一个目录）。
-> 请定期跑 `./tsan.sh`（等价于 Go 的 `go test -race`）。`build.sh` 每次启动也会打印
-> 当前 sanitizer 状态横幅，避免忘了这件事。
+> **sanitizer 提醒**：默认二进制（build/）**抓不到 data race**（C++ 需另编一个目录）。
+> 请定期跑 `./tsan.sh` 或 `./build.sh --tsan`（等价于 Go 的 `go test -race`）。
+> `build.sh` / `test_part.sh` 每次启动也会打印当前 sanitizer 状态横幅，避免忘了这件事。
 
 ---
 
 ## 测试 / Testing
 
-测试二进制用**子串匹配**挑选用例：
+### 测试套件构成（实测 107 条）
 
-- 过滤词以 `2` 开头 → 跑 `raft_test`（如 `2A` / `2B` / `ReadIndex`）
+**Raft（`raft_test`，73 条）**
+
+| 分组 | 数量 | 内容 |
+|---|---:|---|
+| 2A 选举 | 2 | InitialElection / ReElection |
+| 2B 日志复制 | 8 | BasicAgree / RPCBytes / FailAgree / FailNoAgree / ConcurrentStarts / Rejoin / Backup / Count |
+| 2C 持久化 | 8 | Persist1/2/3 / Figure8 / UnreliableAgree / Figure8Unreliable / ReliableChurn / UnreliableChurn |
+| 2D 快照 | 4 | SnapshotTruncatesLog / InstallSnapshotCatchUp / SnapshotRestart / SnapshotStateMachine |
+| Ext · CheckQuorum | 7 | 生产向：leader 隔离主动退位、不误杀、分区稳定 |
+| Ext · ReadIndex | 14 | 线性一致读 / 防脏读 / 并发合并 / 快照追赶 / 不可靠网 |
+| Ext · Membership | 27 | 单飞闸 / Learner 提拔 / Q2 冻结 / 并发变更 fuzz / 移除节点隔离 |
+| Ext · MaxMessageSize | 3 | 未提交背压 / 最大消息字节 / 移除节点静默 |
+| **合计** | **73** | |
+
+**KV（`kv_test`，34 条，含 1 个平时跳过的调试入口）**
+
+| 分组 | 数量 | 内容 |
+|---|---:|---|
+| 3A 基础/分区/并发 | 9 | Basic / Concurrent / Unreliable / OneKey / OnePartition / ManyPartitions×1 / ManyPartitions×Many / KVRedirectLeaderId / KVBackpressureBusy |
+| 3A Sessions/FollowerRead | 10 | KVSessions(Eviction/SnapshotRoundTrip/Determinism/Fence/ClientProtocol/Tombstone×2/FollowerRead) / ConcurrentFollowerReadUnreliable / FollowerReadAfterSnapshot |
+| 3A 持久化专项 | 6 | PersistOneClient / PersistConcurrent / PersistConcurrentUnreliable / PersistPartition / PersistPartitionUnreliable / PersistPartitionUnreliableLinearizable |
+| 3B 快照 | 8 | SnapshotRPC / SnapshotSize / Recover / RecoverManyClients / Unreliable / UnreliableRecover / UnreliableRecoverConcurrentPartition / UnreliableRecoverConcurrentPartitionLinearizable |
+| 调试入口 | 1 | kv_mini_lin_dup（设 `KV_MINI_LIN=1` 才跑，平时 skip） |
+| **合计** | **34** | |
+
+> 注：大量 KV 用例以 lambda 包 `GenericTest(...)` 注册进 `kTests[]`（如
+> `TestSnapshotUnreliable3B` = `GenericTest("3B", 5, true, false, false, 1000)`），
+> 并非独立 `void Test*()` 函数——所以光 grep 函数定义会漏数，以二进制启动打印的
+> 「已注册 N 个用例」为准。
+
+### 过滤规则
+
+测试二进制用**子串匹配**挑选用例（与某个用例名**完全相等**则精确只跑那一条）：
+
+- 过滤词以 `2` 开头 → 跑 `raft_test`（如 `2A` / `2B` / `ReadIndex` / `Membership`）
 - 过滤词以 `3` 开头 → 跑 `kv_test`（如 `3A` / `3B`）
 - 不写 → 两个都跑
 
-**规模（实测）**
+### 一键测试：`build.sh`
 
-- Raft：`68` 个测试用例，覆盖 2A~2D 及成员变更 / Learner / ReadIndex / CheckQuorum / Pre-Vote 加固
-- KV：`9` 个测试用例（7×3A + 2×3B），含 porcupine 线性化校验
+最常用的入口。过滤词决定跑哪个二进制，后面可追加测试二进制自己的参数（如 `-count N`
+重复 N 遍抓偶发失败）。
 
-**排错三板斧**
+```bash
+./build.sh 2B -count 20     # 2B 重复 20 遍
+./build.sh 3A               # 跑 KV 3A 全部分组
+./build.sh CheckQuorum      # 只跑 Ext: CheckQuorum 7 条
+./build.sh Membership       # 只跑 Ext: Membership 27 条
+```
+
+### 并发压测：`test_part.sh`
+
+把某一个 part 的**每一条**用例各起一个独立进程并发跑，每条重复 `COUNT` 轮、每轮换随机
+种子，日志按 `part-用例名` 分文件落进 `testdir/`。labrpc 是纯内存模拟网络，进程间零共享，
+因此可以安全并发。这是抓稀有竞态 / 偶发 flake 的主力武器。
+
+```bash
+./test_part.sh 2B                       # 每条 25 轮，并发度 4（TSan 版）
+COUNT=50   ./test_part.sh 2B            # 每条压 50 轮
+PARALLEL=2 ./test_part.sh 3B            # TSan 吃资源，把并发调小
+SAN=none  ./test_part.sh 2B            # 日常版（build/，无 TSan，快 5~15 倍）
+SAN=asan  ./test_part.sh 2B            # ASan 版（build-asan/）
+SAN=asan,ubsan ./test_part.sh 2B       # ASan + UBSan 组合（build-asan-ubsan/）
+RELEASE=1 ./test_part.sh 2B            # Release 版（-O3 + NDEBUG）
+RELEASE=1 OPT=1 COUNT=50 SAN=asan,ubsan ./test_part.sh 3B   # 四合一：生产级 + 内存/UB 体检
+SEED=12345 ./build-tsan/raft_test TestReadIndex   # 固定种子复现某条
+```
+
+支持的环境变量：`PART`（位置参数）、`COUNT`（默认 25）、`PARALLEL`（默认 4）、
+`SAN`（`tsan`/`asan`/`ubsan`/`asan,ubsan`/`none`，默认 `tsan`）、`TSAN`（旧开关，0/1）、
+`RELEASE`（0/1）、`OPT`（0/1）、`SEED`（固定随机种子）、`BIN`（显式指定二进制，
+sanitizer 配置按目录名反推）。
+
+`test2A.sh` ~ `test3B.sh` 是 `test_part.sh` 的薄封装，只指定 part，例如 `./test3B.sh`
+等价于 `./test_part.sh 3B`。
+
+### ThreadSanitizer 体检：`tsan.sh`
+
+等价于 Go 的 `go test -race`，是唯一能自动抓数据竞争的手段。默认只跑一个子集
+（TSan 下慢 5~15 倍，全量可能要几十分钟）。
+
+```bash
+./tsan.sh          # 默认 2A
+./tsan.sh 2B
+./tsan.sh 3A -count 2
+```
+
+### 构建变体速查
+
+| 构建 | 命令 | 目录 | 优化 / 工具 | 用途 |
+|---|---|---|---|---|
+| Debug（默认） | `./build.sh` | `build/` | `-O0 -g`，assert 开 | 日常开发 / 测试基线 |
+| Release | `./build.sh --release` | `build-release/` | `-O3 -DNDEBUG` | 性能评估（关 assert） |
+| LTO | `./build.sh --opt` | `build/`（附 `-O2+LTO`） | `-O2 + LTO` | 接近 Release 性能，仍带 assert |
+| TSan | `./build.sh --tsan` | `build-tsan/` | `-O1 + TSan` | 查数据竞争（慢 5~15×） |
+| ASan | `./build.sh --asan` | `build-asan/` | `-O1 + ASan` | 查内存越界 / UAF |
+| UBSan | `./build.sh --ubsan` | `build-ubsan/` | `-O1 + UBSan` | 查未定义行为（自动 `halt_on_error`） |
+| ASan+UBSan | `./build.sh --asan --ubsan` | `build-asan-ubsan/` | `-O1 + 双` | 内存 + UB 同查 |
+| Release+TSan | `./build.sh --release --tsan` | `build-release-tsan/` | `-O1 + TSan`¹ | 生产级配置下竞态体检 |
+| Release+ASan+UBSan | `./build.sh --release --asan --ubsan` | `build-release-asan-ubsan/` | `-O1 + 双`¹ | 生产级配置下内存/UB 体检 |
+
+> 说明：`--opt` 在 Debug 下附赠 `-O2`，在 Release 下只额外加 LTO（`-O3` 照旧）。
+> 各 sanitizer 独立占目录，避免配置互踩整目录重编。
+> ¹ sanitizer 构建的统一优化级由 `SAN_OPT` 决定（默认 `-O1`，加 `--opt` 升 `-O2`），
+> 它追加在命令行尾部、会覆盖 Release 的 `-O3`；但 Release 的 `-DNDEBUG`（关 assert）仍然生效。
+> 即：开 sanitizer 时有效优化级是 `SAN_OPT`，而非 `-O3`。
+
+### 重要提醒 / Caveats
+
+- **默认二进制抓不到 data race**：必须用 `./tsan.sh` 或带 `--tsan` / `SAN=tsan` 的构建。
+- **TSan 与 ASan 互斥**：clang 编译期直接拒绝同开（`build.sh` 与 CMake 都会提前报错）。
+- **UBSan 必须 `halt_on_error=1`**：否则 UBSan 默认只打印不中断，测试照样"假绿"。
+  脚本已自动设置 `UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1`，手动跑需自行导出。
+- **优化会改变指令时序**：`-O2/-O3` 下结果面可能与 Debug 基线不同，回归时请以 Debug
+  为"已知绿 / 已知挂"基线，优化构建用于性能评估。
+- **sanitizer 慢 5~15 倍**：TSan 下某些实时窗口测试（如 `TestSnapshotUnreliableRecover3B`）
+  偶发活性 flake（概率约 1/250），属调度抖动而非正确性 bug；本地排查可对同种子多跑验证。
+
+### 排错三板斧
 
 ```bash
 ./build.sh 2B -count 20        # 1. 偶发失败？重复跑，把概率性问题变成必现
@@ -225,6 +357,9 @@ RAFT_LOG=1 ./build/raft_test 2B # 3. 看不清状态机？开 trace
 - [MIT 6.824: Distributed Systems](https://pdos.csail.mit.edu/6.824/) — 课程框架与测试用例设计源泉
 - etcd / TiKV / Consul — 生产级 Raft 工程实践的对照参考
 
-## 如何提交
-git push github master:main     # 推送github
-git push origin master         # 推送gitee
+## 推送代码到远程仓库
+
+```bash
+git push github master:main # 推送github 
+git push origin master # 推送gitee
+```

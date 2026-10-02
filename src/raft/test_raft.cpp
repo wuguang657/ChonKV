@@ -1412,7 +1412,8 @@ void TestCheckQuorumSustainedMinorityStable() {
 // ---------------------------------------------------------------------------
 // ReadIndex：线性一致读的基本契约。
 //   * leader 上能拿到合法 readIndex，且它必须【不落后于】最新提交的下标
-//   * follower 上必须失败 —— follower 的日志可能落后，不能服务线性一致读
+//   * follower 通过转发 leader 拿到线性化读点（应成功）；但 follower 被隔离、
+//     够不到 leader 时 ReadIndex 必须返回 -1（拒绝放读，杜绝陈旧读）
 // ---------------------------------------------------------------------------
 void TestReadIndex() {
   int servers = 3;
@@ -1436,13 +1437,50 @@ void TestReadIndex() {
     cfg->Fatal(buf);
   }
 
-  // (2) follower 上必须失败
+  // (2) Follower ReadIndex：follower 转发给 leader 拿线性化读点，应成功。
+  // raft 层只验证 read_index 这个“读点”的合法性与本地可追平；端到端值一致性
+  // 由 KV 层 TestKVSessionsFollowerRead 覆盖。
   int follower = (leader + 1) % servers;
-  if (cfg->GetRaft(follower)->ReadIndex() >= 0) {
-    cfg->Fatal(
-        "follower 上 ReadIndex 应当返回 -1"
-        "（follower 的日志可能落后，不能保证线性一致）");
+  int ri_f = cfg->GetRaft(follower)->ReadIndex();
+  if (ri_f < 0) {
+    cfg->Fatal("follower 上 ReadIndex 应当通过转发成功（返回 >= 0）");
   }
+  if (ri_f < idx) {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+                  "follower ReadIndex=%d 落后于已知已提交下标 %d", ri_f, idx);
+    cfg->Fatal(buf);
+  }
+  // 关键：leader 变量是 (1) 段早期 CheckOneLeader() 抓的，到这步之间若发生换主，
+  // 旧 leader 的 commit 已是过期值，用它做上界会造成“理论 flaky”的误判。
+  // 这里重新抓当前 leader，保证 leader_commit 与 ri_f 同属一个权威任期。
+  int cur = cfg->CheckOneLeader();
+  int leader_commit = cfg->GetRaft(cur)->CommitIndex();
+  if (ri_f > leader_commit) {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+                  "follower ReadIndex=%d 超过 leader commit=%d（转发值不应放大）",
+                  ri_f, leader_commit);
+    cfg->Fatal(buf);
+  }
+  // follower 本地必须能追平到该读点，否则照它读会陈旧。
+  bool applied = false;
+  for (int t = 0; t < 100; t++) {
+    if (cfg->GetRaft(follower)->LastApplied() >= ri_f) { applied = true; break; }
+    raftcpp::SleepMs(50);
+  }
+  if (!applied) {
+    cfg->Fatal("follower 在超时内未能 apply 到 ReadIndex 读点（本地读会陈旧）");
+  }
+
+  // (3) 安全关：follower 与集群隔离后够不到 leader，ReadIndex 必须返回 -1，
+  // 不允许在无法确认 leader 合法性的情况下放读（杜绝陈旧读）。
+  cfg->Disconnect(follower);
+  int ri_iso = cfg->GetRaft(follower)->ReadIndex();
+  if (ri_iso >= 0) {
+    cfg->Fatal("被隔离的 follower 仍返回 ReadIndex>=0 —— 转发失败时应拒绝放读");
+  }
+  cfg->Connect(follower);
 
   cfg->End();
 }
@@ -1481,15 +1519,18 @@ void TestReadIndexNoStale() {
   cfg->End();
 }
 
-// ===== 并发 ReadIndex：证明 per-request ctx 设计下多条读互不踩踏 =====
+// ===== 并发 ReadIndex：证明 active_read_ 单例合并下多条读互不踩踏 =====
 // 旧的单槽位设计（read_index_/read_ack_count_/read_index_term_ 全局共享）在并发下
 // 会把多条读的票混在一起：后到的读覆盖 read_index_、重置 read_ack_count_，导致先到的
-// 读永远凑不齐多数派 → 超时返回 -1；或者计票泄漏、term 戳错位。新设计每条读独立 ctx，
-// 回包按 reply.read_ctx 精确归因，应全部成功、互不干扰。
+// 读永远凑不齐多数派 → 超时返回 -1；或者计票泄漏、term 戳错位。新设计用 active_read_
+// 单例把并发读合并成【一轮】：同一任期内的并发读挂入同一个 active_read_、共享同一个 ctx
+// 与 read_index，只广播一次心跳；每轮独立的 acked_ 去重表 + waiters 引用计数隔离账目，
+// 回包按 reply.read_ctx 精确归因。合并（而非"每条读独立 ctx"）才是互不踩踏的真正机制，
+// 故健康集群里应全部成功、互不干扰。
 void TestReadIndexConcurrent() {
   int servers = 3;
   auto cfg = MakeConfig(servers, false);
-  cfg->Begin("Test (Ext): 并发 ReadIndex 互不踩踏（per-request ctx）");
+  cfg->Begin("Test (Ext): 并发 ReadIndex 互不踩踏（active_read_ 合并）");
 
   int leader = cfg->CheckOneLeader();
   cfg->One("x1", servers, true);
@@ -1515,7 +1556,8 @@ void TestReadIndexConcurrent() {
   // 【阈值 = 100%，fail 必须为 0】
   // 健康集群（可靠网络、全员连通、无分区）里并发读没有任何理由失败：
   // 旧的单槽位设计会踩踏（后到的读覆盖 read_index_、重置 ack 计数），
-  // 新设计每条读独立 ctx、回包按 reply.read_ctx 精确归因，应当【全部成功】。
+  // 新设计用 active_read_ 单例把并发读合并成一轮（共享 ctx + 每轮独立 acked_ 去重），
+  // 应当【全部成功】。
   // 之前这里给的是 90% 余量，等于容忍 40 次失败 —— 那会把踩踏 bug 放过去。
   // 实测（正确实现）多轮 fail 恒为 0，故收紧到 0；若哪天偶发非 0，
   // 先怀疑 ReadIndex 的 ctx 归因/唤醒逻辑，而不是回来放宽阈值。
@@ -1527,10 +1569,109 @@ void TestReadIndexConcurrent() {
                       " fail=" + std::to_string(fail.load()) + " / total=" +
                       std::to_string(total) +
                       "（健康集群应当 100% 成功；旧单槽位设计会踩踏，"
-                      "若新设计仍失败，说明 ctx 归因/唤醒仍有问题）";
+                      "若新设计仍失败，说明合并/ctx 归因/唤醒仍有问题）";
     cfg->Fatal(msg);
   }
 
+  cfg->End();
+}
+
+// ===========================================================================
+// 覆盖缺口 G2（升级·狠版）：不可靠网 + leader/follower 混合并发转发。
+// 原 TestReadIndexConcurrent 只打 leader 且走可靠网；这里开不可靠网、各线程
+// 轮询不同节点（leader/follower 混合），把"RPC 转发 + leader active_read_ 单例
+// 合并"在丢包下反复压。不变式：
+//   - ri<0 是预期的临时失败（重定向/丢包），不计 bad；
+//   - ri 不应低于已提交基线 idx（合并逻辑出错/陈旧读会触发）；
+//   - 不可靠网下允许部分 -1，但转发路径必须在丢包下仍可用（ok 阈值 1/3）。
+void TestReadIndexFollowerConcurrent() {
+  const int servers = 5;
+  auto cfg = MakeConfig(servers, true);  // 开不可靠网
+  cfg->Begin(
+      "Test (Ext): ReadIndex 不可靠网下 leader+follower 混合并发转发（压合并/丢包）");
+
+  int leader = cfg->CheckOneLeader();
+  // 先写一批已提交命令建立基线（不可靠网下 One 内部重试到成功）
+  int idx = cfg->One("seed", servers, true);
+  for (int i = 0; i < 3; ++i) cfg->One("c" + std::to_string(i), servers, true);
+
+  std::atomic<int> ok{0}, neg{0}, bad{0};
+  const int nthr = 8, niter = 40;
+  std::vector<std::thread> ts;
+  for (int t = 0; t < nthr; ++t) {
+    ts.emplace_back([&, t]() {
+      for (int i = 0; i < niter; ++i) {
+        // 各线程轮询不同目标：leader / follower 混合压，走「RPC转发 + leader
+        // active_read_ 合并」
+        int target = (leader + t + i) % servers;
+        int ri = cfg->GetRaft(target)->ReadIndex();
+        if (ri < 0) {
+          neg++;
+          continue;  // -1=重定向/丢包，预期可接受
+        }
+        if (ri < idx) {
+          bad++;  // 读点不该低于已提交基线（合并/陈旧 bug 会触发）
+          continue;
+        }
+        ok++;
+      }
+    });
+  }
+  for (auto& th : ts) th.join();
+
+  // 不可靠网下允许大量 -1（重定向/重试信号，靠上层 Clerk 重试），但转发路径必须
+  // "活着"：至少有若干次成功读，且绝不出现非法读点（bad==0 才是真正确性约束）。
+  // 注：raft 层裸调 ReadIndex 没有 Clerk 重试层，单次成功率在不可靠网+高并发下本就低，
+  // 故不能用 1/3 这种激进阈值（会误杀）；只要偶有成功即证明路径可用。
+  // ⚠️ TSan 让线程调度非确定：实测同种子 ok 在 18~274 间剧烈抖动，liveness 计数
+  // 不可复现，卡绝对值会偶发误杀正确代码。故 TSan 下只做【观测】不 Fatal，
+  // 真正硬的安全约束始终是下面的 bad==0。
+  const int kMinOk = 5;
+#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
+  (void)kMinOk;
+  fprintf(stderr,
+          "[G2@TSan] soft liveness: ok=%d neg=%d（TSan 下不卡阈值，仅观测）\n",
+          ok.load(), neg.load());
+#else
+  if (ok.load() < kMinOk)
+    cfg->Fatal("不可靠网 leader+follower 混合并发转发几乎全失败: ok=" +
+               std::to_string(ok.load()) + " neg=" + std::to_string(neg.load()));
+#endif
+  if (bad.load() > 0)
+    cfg->Fatal("出现低于已提交基线的非法 read_index（疑似合并/陈旧）: bad=" +
+               std::to_string(bad.load()));
+  cfg->End();
+}
+
+// ===========================================================================
+// 覆盖缺口 G4：持续隔离的 follower 必须【稳定】返回 -1（不止"立刻一次"）。
+// 原 TestReadIndexPartitionImmediate 只验证"隔离后立刻读失败"，没压"长期分区
+// 下反复读仍稳定失败"。这里以 ~100ms 间隔反复读 ~2s，每次都必须 -1。
+void TestReadIndexIsolatedFollowerStable() {
+  const int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test (Ext): 持续隔离的 follower 必须【稳定】返回 -1（多次读都拒）");
+
+  int leader = cfg->CheckOneLeader();
+  cfg->One("v1", servers, true);
+
+  int follower = (leader + 1) % servers;
+  cfg->Disconnect(follower);
+
+  // 以 100ms 间隔反复读 ~2s，每次都必须 -1
+  bool all_neg = true;
+  for (int t = 0; t < 20; ++t) {
+    int ri = cfg->GetRaft(follower)->ReadIndex();
+    if (ri >= 0) {
+      all_neg = false;
+      break;
+    }
+    raftcpp::SleepMs(100);
+  }
+  if (!all_neg)
+    cfg->Fatal("持续隔离的 follower 竟然返回了非负 read_index（应稳定 -1）");
+
+  cfg->Connect(follower);
   cfg->End();
 }
 
@@ -1597,7 +1738,7 @@ void TestReadIndexMajorityToleratesMinorityFailure() {
 // ReadIndex × InstallSnapshot：落后 follower 的那一票只能靠快照回包送回来
 //
 // 覆盖点：ReplicateLoop 发现 follower 落后到快照点之前时改发 InstallSnapshot，
-// 并把 active_read_ctx_ 塞进 snap_args.read_ctx；follower 原样回显；leader 在
+// 并把 active_read_.ctx 塞进 snap_args.read_ctx；follower 原样回显；leader 在
 // 快照回包里调 RecordReadAckLocked —— 这是 AppendEntries 心跳之外的【第二条
 // 读确认通道】。
 //
@@ -2027,7 +2168,7 @@ void TestReadIndexSnapshotUnreliable() {
 // 背景（变异实证坐实的真实缺口）：把 ReadIndex 三处判据（raft.cpp 发送侧 /
 // 回包侧 / 计票侧）从 IsVoter 改成"非 kRemoved 即算"（learner 也算）后，原
 // 37 条用例（ReadIndex 全族 + 成员变更全族）全部绿灯、零捕获。根因是既有
-// TestLearnerReadIndexRejected 只验「learner 自己调 ReadIndex 被拒」，走的是
+// TestLearnerReadIndexForwards 只验「learner 自己调 ReadIndex 经转发成功」，走的是
 // state_ != kLeader 平凡分支，根本没走到多数派确认，区分不了"learner 的票算不算"。
 //
 // 本用例构造：5 节点 → 降 2 个为 learner（剩 3 voter）→ 断掉另外 2 个非 leader
@@ -4029,12 +4170,12 @@ void TestConfChangeFromMinorityLeader() {
 // 【变异实证有牙】去掉 ReadIndex 的 `state_ != kLeader` 守卫 → learner 也返回
 //   commit_index_(>=0) → 期望 -1 落空 → FAILED。
 // ===========================================================================
-void TestLearnerReadIndexRejected() {
+void TestLearnerReadIndexForwards() {
   const int servers = 5;
   auto cfg = MakeConfig(servers, false);
-  cfg->Begin("Test: a learner must NOT serve ReadIndex (must return -1)");
+  cfg->Begin("Test: a learner forwards ReadIndex to leader and succeeds (>= 0)");
   int leader = cfg->CheckOneLeader();
-  cfg->One("v1", servers, false);
+  int idx1 = cfg->One("v1", servers, false);
 
   // 把节点 3 降为 learner
   cfg->GetRaft(leader)->ProposeConfChangeTo(3, MemberRole::kLearner);
@@ -4046,20 +4187,38 @@ void TestLearnerReadIndexRejected() {
   }
   if (!ok) cfg->Fatal("降级失败：节点3 未切换为 kLearner");
 
-  // 关卡 1：对 learner 直接 ReadIndex 必须被拒
+  // 关卡 1（翻转）：learner 经转发应拿到合法读点（非 voter 非 leader 也能服务线性一致读）
   int ri = cfg->GetRaft(3)->ReadIndex();
-  if (ri >= 0) {
-    cfg->Fatal("learner 调 ReadIndex 返回 " + std::to_string(ri) +
-               " —— 非 leader 不应服务线性一致读（脏读风险）");
+  if (ri < 0) {
+    cfg->Fatal("learner 调 ReadIndex 应经转发成功（返回 >= 0），实际 " +
+               std::to_string(ri));
+  }
+  if (ri < idx1) {
+    cfg->Fatal("learner ReadIndex=" + std::to_string(ri) +
+               " 落后于已知已提交下标 " + std::to_string(idx1));
   }
 
-  // 关卡 2：写一条已提交命令后，learner 仍应被拒（不因‘本地有 commit 值’就放行）
-  cfg->One("v2", servers, false);
+  // 关卡 2（翻转）：再写一条已提交命令后，learner 仍应转发成功
+  // （不因“本地有 commit 值”走捷径、也不该被拒）
+  int idx2 = cfg->One("v2", servers, false);
   int ri2 = cfg->GetRaft(3)->ReadIndex();
-  if (ri2 >= 0) {
-    cfg->Fatal("learner 在已有提交后仍被允许 ReadIndex（返回 " +
-               std::to_string(ri2) + "）—— 不安全");
+  if (ri2 < 0) {
+    cfg->Fatal("learner 在已有提交后仍应转发成功 ReadIndex，实际 " +
+               std::to_string(ri2));
   }
+  if (ri2 < idx2) {
+    cfg->Fatal("learner ReadIndex=" + std::to_string(ri2) +
+               " 落后于已知已提交下标 " + std::to_string(idx2));
+  }
+
+  // 新增安全关：隔离 learner 后够不到 leader，必须返回 -1
+  // （不放大本地 commit 放读——转发失败即不放行）
+  cfg->Disconnect(3);
+  int ri_iso = cfg->GetRaft(3)->ReadIndex();
+  if (ri_iso >= 0) {
+    cfg->Fatal("被隔离的 learner 仍返回 ReadIndex>=0 —— 转发失败时应拒绝放读");
+  }
+  cfg->Connect(3);
 
   // 对称正例：voter leader 的 ReadIndex 仍正常（证明我们没把 ReadIndex 整坏）
   int leader2 = cfg->CheckOneLeader();
@@ -4416,6 +4575,8 @@ static const TestCase kTests[] = {
     {"TestReadIndex", TestReadIndex},
     {"TestReadIndexNoStale", TestReadIndexNoStale},
     {"TestReadIndexConcurrent", TestReadIndexConcurrent},
+    {"TestReadIndexFollowerConcurrent", TestReadIndexFollowerConcurrent},
+    {"TestReadIndexIsolatedFollowerStable", TestReadIndexIsolatedFollowerStable},
     {"TestReadIndexPartitionImmediate", TestReadIndexPartitionImmediate},
     {"TestReadIndexMajorityToleratesMinorityFailure", TestReadIndexMajorityToleratesMinorityFailure},
     // ReadIndex × InstallSnapshot：快照回包是 AppendEntries 之外的第二条读确认通道
@@ -4472,7 +4633,7 @@ static const TestCase kTests[] = {
     // ㉑ 少数派分区内 leader 发起的变更，愈合后必须不生效
     {"TestConfChangeFromMinorityLeader", TestConfChangeFromMinorityLeader},
     // ㉒ learner 必须被拒绝对 ReadIndex 服务（对称负向）
-    {"TestLearnerReadIndexRejected", TestLearnerReadIndexRejected},
+    {"TestLearnerReadIndexForwards", TestLearnerReadIndexForwards},
     {"TestVoteCountIgnoresRemovedVoters", TestVoteCountIgnoresRemovedVoters},
     {"TestRemovedFreezeCoversBothSources", TestRemovedFreezeCoversBothSources},
 
