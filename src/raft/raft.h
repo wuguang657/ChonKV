@@ -1,9 +1,5 @@
 // raft.h —— Raft 共识算法的 C++ 骨架（对应 Go 版 src/raft/raft.go）
 //
-// ===========================================================================
-// 给你的任务：只改 raft.cpp，不动 raft.h / config.* / test_raft.cpp / labrpc
-// ===========================================================================
-//
 // 分三个阶段，和 MIT 6.824 Lab 2 一一对应：
 //
 //   2A 领导者选举   StartElection(), RequestVote(), AppendEntries(),
@@ -178,15 +174,21 @@ inline bool IsRemovedFrozen(const std::vector<MemberRole>& is_member,
   return false;
 }
 
+enum class EntryType {
+  kNormal,     // 普通客户端命令
+  kConfChange, // 成员变更条目
+  kNoOp        // leader 当选时为建立读安全点补的空日志
+};
+
 struct LogEntry {
   int term = 0;
   int index = 0;
   Command command;
+  EntryType type = EntryType::kNormal;  // E7：统一 entry 类型，替代 is_conf 特判
   // ---- 成员变更配置条目 ----
-  // 普通命令 is_conf=false；成员变更条目 is_conf=true，并携带目标节点与加/删。
+  // 普通命令 type=kNormal；成员变更条目 type=kConfChange，并携带目标节点与加/删。
   // 节点必须【apply 到这条 entry 时】才切换本地 is_member_（不是收到就切），
   // 且同一时刻只允许一个 conf 变更在飞行（ProposeConfChange 里的 pending_conf_index_ 保证）。
-  bool is_conf = false;
   int conf_server = -1;  // 目标节点编号
   // 目标角色的整型值（MemberRole：0=kRemoved, 1=kLearner, 2=kVoter）。
   // 原来是 bool conf_add，只能表达"加 / 删"两态，塞不下 learner 这个第三态，
@@ -199,6 +201,9 @@ struct ApplyMsg {
   bool command_valid = false;
   Command command;
   int command_index = 0;
+  // E7-hardening：携带本 entry 的类型，让上层（KV）显式分流，
+  // 不必再用「空串=no-op / 反序列化失败=配置」这类隐式 content heuristic。
+  EntryType entry_type = EntryType::kNormal;
 
   // Lab 3（快照）才会用到，这里先留着
   bool snapshot_valid = false;

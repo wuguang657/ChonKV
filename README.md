@@ -324,30 +324,6 @@ RAFT_LOG=1 ./build/raft_test 2B # 3. 看不清状态机？开 trace
 - **exactly-once 去重**：`(client_id, seq_id)` 去重表
 - **porcupine 线性化校验**：测试级别已很强
 
----
-
-## 路线图 / Roadmap（已知差距）
-
-> 以下均为**尚未实现**的生产化项，按优先级大致排序。所有"缺失"结论来自实际读码，非推测。
-
-**🔴 高优先级**
-
-1. **真实持久化** — `Persister` 当前纯内存，无 WAL / `fsync` / CRC；需抽 `LogStore` 接口 → `SegmentLogStore` 落盘
-2. **真实传输层** — `labrpc` 是软件模拟，无消息大小上限 / 流控背压 / TLS
-
-**🟡 中优先级**
-
-3. **复制流水线** — 当前为停等（`inflight_log_` 是 bool），改为滑动窗口可显著提升跨机房吞吐
-4. **快照分块** — 当前整块塞进单条 RPC（`InstallSnapshotArgs::data`），大状态机需按 `offset` 流式分块
-5. **磁盘水位保护** — 日志只增不减，需设警戒线触发快照排水或拒绝写入，否则磁盘写满崩溃
-
-**🟢 进行中 / 待接入**
-
-6. **tinylsm 接入** — `src/tinylsm/` 目录已存在，但**尚未编入 CMake、未被 kvraft 引用**，是独立 WIP 模块
-7. **其余生产项** — Leader Transfer、优雅关闭、group commit、客户端 session TTL/LRU、metrics 可观测性、锁粒度细化
-
----
-
 ## 许可证 / License
 
 [MIT](./LICENSE) © 2026 吴崇廣 (wuguang657)

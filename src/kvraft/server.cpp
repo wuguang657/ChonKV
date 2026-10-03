@@ -1,38 +1,4 @@
 // server.cpp —— KV 服务器实现（对应 Go 版 src/kvraft/server.go）
-//
-// ===========================================================================
-// 【本文件最要紧的一处：快照 "raft 已装 / KV 未装" 窗口】
-// ===========================================================================
-//
-// Follower 收到 leader 的 InstallSnapshot 之后，要做两件【分属两把锁】的事：
-//
-//   ① raft 侧（raft 锁）：截断日志、推进 last_applied_ / snapshot_index_、
-//      把 blob 与 raft state 落盘
-//   ② KV 侧（KV 锁）：把快照字节反序列化，灌进 kv_store_ 状态机
-//
-// 如果崩在 ① 之后、② 之前：
-//   * raft 重启后认为自己"快照已装"（snapshot_index_ 已经是新的），
-//     再也不会重发这条 snapshot 消息
-//   * 但 kv_store_ 还是旧的 → 状态机永久缺数据
-//
-// 本文件用两层把这个窗口闭合：
-//
-//   【第 1 层 · 顺序与幂等】（ApplierLoop 的 snapshot_valid 分支）
-//     raft 侧已在 InstallSnapshot 内用 last_applied_ 守卫拦下陈旧快照，
-//     所以 KV 侧【无条件安装】，只用自身的 last_cmd_index_ 防回退；
-//     ApplySnapshotLocked 是幂等的（整体替换，重复装结果一样）。
-//
-//   【第 2 层 · 重启恢复】（构造函数）
-//     启动时经 rf_->GetSnapshotData() 把已提交的快照装回状态机。
-//     这是补刀：即便真的崩在 ① 和 ② 之间，重启时 KV 也能从磁盘恢复出来。
-//     ⚠️ 必须走 raft 的接口而不是直接读 persister —— 盘上存的是带
-//     index/term 头的磁盘格式，且可能是"阶段1 已落盘、阶段2 未提交"的 blob，
-//     只有 raft 剥头校验过才知道该不该采用。
-//     这一层对应 Go 版 StartKVServer 里的
-//     `if kv.persister.ReadSnapshot() != nil { kv.installSnapshot(...) }`。
-//
-// 两层叠加后，无论崩在哪一刻，重启后都是自洽的。
-// ===========================================================================
 
 #include "server.h"
 
@@ -413,30 +379,37 @@ void KVServer::ApplierLoop() {
       // 正好落在 no-op 的下标上，若这里直接跳过，Get 的"等 last_cmd_index_ >= ri"
       // 就会永远差 1 卡死（实测 lci=836 / ri=837，恰好差一个 no-op）。
       // 安全性：no-op 不写状态机，不存在"下标已推进但 kv_store_ 还没改"的窗口。
-      if (m.command.empty()) {
-        {
-          std::lock_guard<std::mutex> lk(mu_);
-          last_cmd_index_ = m.command_index;
-        }
-        apply_cv_.notify_all();
-        continue;
+      // E7-hardening：用 ApplyMsg.entry_type 显式分流，不再靠「空串=no-op」隐式判断。
+      switch (m.entry_type) {
+        case raft::EntryType::kNoOp:
+        case raft::EntryType::kConfChange:
+          // 这两类都不写 kv_store_，但【必须】推进 last_cmd_index_：
+          // ReadIndex 的线性化点 ri 可能恰好落在 no-op / conf 的下标上，
+          // 若跳过则 Get 永远差 1 卡死（no-op 支路实测 lci=836/ri=837 差 1）。
+          // 安全性：不写状态机，不存在"下标已推进但 kv_store_ 还没改"的窗口。
+          //   - no-op：leader 上任补的空日志，只为推进 commitIndex。
+          //   - conf：raft 编码成 "CONF:x:V" 这种【非 Op 二进制】的哨兵串，本就不进状态机；
+          //     卡死链：若跳过，conf 恰为最后一条已提交条目时 ri 落在其下标上 →
+          //     Get 的"等 last_cmd_index_ >= ri"（server.cpp:274）永不成立 → 死等 1s → kWrongLeader。
+          // 不唤醒 msg_replies_：conf 走 ProposeConfChangeTo，KV 层不为其注册 waiter。
+          {
+            std::lock_guard<std::mutex> lk(mu_);
+            last_cmd_index_ = m.command_index;
+          }
+          apply_cv_.notify_all();
+          continue;
+        case raft::EntryType::kNormal:
+        default:
+          break;  // 走下方真实命令路径
       }
 
       Op op;
-      // 真实命令：空命令已在上面处理。
-      //
-      // ⚠️⚠️ 反序列化失败【也必须照样推进 last_cmd_index_】——否则 Get 会永久挂起。
-      // 触发载荷：raft 派发的成员变更条目（raft.cpp 里编码成 "CONF:x:V" 这类字符串），
-      //   而 Op 是 length-prefixed 二进制（common.h），"CONF" 前 4 字节会被当成
-      //   长度 ≈ 11.8 亿 → Deserialize 必然返回 false。
-      // 卡死链：raft 的 last_applied_ 正常推进，但 KV 的 last_cmd_index_ 卡在 conf
-      //   下标之前 → 当 conf 恰为最后一条已提交条目时，ReadIndex 返回的 ri 就落在
-      //   conf 下标上 → Get 的 "等 last_cmd_index_ >= ri"（server.cpp:274）永不成立
-      //   → 每次死等 1s 超时 → 返回 kWrongLeader。成员变更 + 读并发必踩。
-      // 安全性：这类条目根本不写 kv_store_，所以不存在"下标已推进但状态机还没改"
-      //   的窗口 —— 与上面 no-op 分支（server.cpp:416-423）同理，反而【必须】推进。
-      // 不唤醒 msg_replies_：conf 条目走 ProposeConfChangeTo，KV 层不会为它注册 waiter。
+      // 走到这里只可能是 kNormal（no-op / conf 已在上面 switch 里 continue）。
       if (!op.Deserialize(m.command)) {
+        std::fprintf(stderr,
+            "[kvraft] WARN: command_index=%d 反序列化失败(应为 kNormal)，"
+            "按契约违例处理：推进 last_cmd_index_ 并跳过，可能丢失该条命令\n",
+            m.command_index);
         {
           std::lock_guard<std::mutex> lk(mu_);
           last_cmd_index_ = m.command_index;

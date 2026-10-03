@@ -104,27 +104,27 @@ case "$PART" in
     ) ;;
   3A)
     TESTS=(
-      # TestKVRedirectLeaderId
-      # TestKVBackpressureBusy
-      # TestKVSessionsEviction
-      # TestKVSessionsSnapshotRoundTrip
-      # TestKVSessionsDeterminismWithSnapshots
-      # TestKVSessionsFenceStopsReplay
-      # TestKVSessionsClientProtocol
-      # TestKVSessionsTombstoneValue
-      # TestKVSessionsTombstoneSnapshot
-      # TestKVSessionsFollowerRead
-      # TestConcurrentFollowerReadUnreliable
-      # TestFollowerReadAfterSnapshot
-      # TestBasic3A
-      # TestConcurrent3A
-      # TestUnreliable3A
-      # TestUnreliableOneKey3A
-      # TestOnePartition3A
-      # TestManyPartitionsOneClient3A
-      # TestManyPartitionsManyClients3A
-      # TestPersistOneClient3A
-      # TestPersistConcurrent3A
+      TestKVRedirectLeaderId
+      TestKVBackpressureBusy
+      TestKVSessionsEviction
+      TestKVSessionsSnapshotRoundTrip
+      TestKVSessionsDeterminismWithSnapshots
+      TestKVSessionsFenceStopsReplay
+      TestKVSessionsClientProtocol
+      TestKVSessionsTombstoneValue
+      TestKVSessionsTombstoneSnapshot
+      TestKVSessionsFollowerRead
+      TestConcurrentFollowerReadUnreliable
+      TestFollowerReadAfterSnapshot
+      TestBasic3A
+      TestConcurrent3A
+      TestUnreliable3A
+      TestUnreliableOneKey3A
+      TestOnePartition3A
+      TestManyPartitionsOneClient3A
+      TestManyPartitionsManyClients3A
+      TestPersistOneClient3A
+      TestPersistConcurrent3A
       TestPersistConcurrentUnreliable3A
       TestPersistPartition3A
       TestPersistPartitionUnreliable3A

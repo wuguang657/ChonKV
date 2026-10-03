@@ -85,7 +85,7 @@ std::string AppendEntriesArgs::Serialize() const {
   e.Int(static_cast<int>(entries.size()));
   for (const LogEntry& en : entries) {
     e.Int(en.term).Int(en.index).Bytes(en.command)
-    .Bool(en.is_conf).Int(en.conf_server).Int(en.conf_role);
+    .Int(static_cast<int>(en.type)).Int(en.conf_server).Int(en.conf_role);
   }
   return e.Take();
 }
@@ -101,9 +101,11 @@ bool AppendEntriesArgs::Deserialize(const std::string& s) {
   entries.reserve(static_cast<size_t>(n));
   for (int i = 0; i < n; i++) {
     LogEntry en;
+    int et = 0;
     if (!(d.Int(en.term) && d.Int(en.index) && d.Bytes(en.command) &&
-          d.Bool(en.is_conf) && d.Int(en.conf_server) && d.Int(en.conf_role)))
+          d.Int(et) && d.Int(en.conf_server) && d.Int(en.conf_role)))
       return false;
+    en.type = static_cast<EntryType>(et);
     entries.push_back(std::move(en));
   }
   return d.Ok();
@@ -745,7 +747,8 @@ void Raft::BecomeLeaderIfQuorumLocked() {
             LastLogIndexLocked() + 1, commit_index_);
       logs_.push_back(
           LogEntry{current_term_,
-                   LastLogIndexLocked() + 1, Command("")});
+                   LastLogIndexLocked() + 1, Command(""),
+                   EntryType::kNoOp});
       PersistLocked();
       // 读安全点 = 这条 no-op 自身的下标（push 之后 LastLogIndexLocked()
       // 就是它），不是它再 +1 —— 否则 no-op 提交后 commit_index_ 永远差 1，
@@ -781,7 +784,7 @@ void Raft::BecomeLeaderIfQuorumLocked() {
     for (int ci = commit_index_ + 1;
          ci <= LastLogIndexLocked(); ci++) {
       size_t cpos = static_cast<size_t>(ci - snapshot_index_);
-      if (cpos < logs_.size() && logs_[cpos].is_conf) {
+      if (cpos < logs_.size() && logs_[cpos].type == EntryType::kConfChange) {
         pending_conf_index_ = ci;
       }
     }
@@ -795,7 +798,7 @@ void Raft::BecomeLeaderIfQuorumLocked() {
     // 上任时扫一遍日志里的 conf 条目即可恢复正确冻结下标。
     removed_at_index_.assign(peers_.size(), -1);
     for (const LogEntry& ce : logs_) {
-      if (!ce.is_conf) continue;
+      if (ce.type != EntryType::kConfChange) continue;
       int sv = ce.conf_server;
       if (sv < 0 ||
           sv >= static_cast<int>(removed_at_index_.size()))
@@ -1485,7 +1488,7 @@ void Raft::ApplyLoop() {
           size_t pos = static_cast<size_t>(idx - snapshot_index_);
           if (pos < logs_.size()) {
             last_applied_ = idx;
-            if (logs_[pos].is_conf) {
+            if (logs_[pos].type == EntryType::kConfChange) {
               // ---- 成员变更条目：apply 时才切换本地配置（不是收到就切）----
               int sv = logs_[pos].conf_server;
               // 目标角色三态：kRemoved / kLearner / kVoter（原来是 bool，塞不下 learner）
@@ -1502,6 +1505,16 @@ void Raft::ApplyLoop() {
               // 本变更已 apply → 清除在途标记（允许下一个变更）
               if (logs_[pos].index == pending_conf_index_) {
                 pending_conf_index_ = 0;
+              }
+              if (pending_conf_index_ == 0) {
+                int voters = static_cast<int>(MemberCountLocked());
+                if (voters > 0 && voters % 2 == 0) {
+                  std::fprintf(stderr,
+                      "[raft] WARN: 当前集群 voter 数为偶数(%d)。偶数集群容错能力与奇数"
+                      "相同却多耗费一台节点，且存在精确 50/50 网络分区导致整体不可用的风险；"
+                      "建议保持奇数个 voter。\n",
+                      voters);
+                }
               }
               PersistLocked();  // 配置变更也要落盘，重启能恢复
               // 本节点已不是 voter（被移除、或降级成 learner）且是 leader → 主动退位。
@@ -1532,11 +1545,21 @@ void Raft::ApplyLoop() {
                              : target == MemberRole::kLearner ? "L"
                                                               : "R");
               msg.command_index = idx;
+              msg.entry_type = EntryType::kConfChange;
+              has_msg = true;
+            } else if (logs_[pos].type == EntryType::kNoOp) {
+              // no-op：leader 当选补的空日志，只为推进 commitIndex / 读安全点。
+              msg.command_valid = true;
+              msg.command = logs_[pos].command;  // 空串
+              msg.command_index = idx;
+              msg.entry_type = EntryType::kNoOp;
               has_msg = true;
             } else {
+              // kNormal：真实客户端命令
               msg.command_valid = true;
               msg.command = logs_[pos].command;
               msg.command_index = idx;
+              msg.entry_type = EntryType::kNormal;
               has_msg = true;
             }
           }
@@ -1968,7 +1991,7 @@ StartResult Raft::ProposeConfChangeTo(int server, MemberRole target) {
   LogEntry e;
   e.term = current_term_;
   e.index = LastLogIndexLocked() + 1;
-  e.is_conf = true;                        // 标记：这是"成员变更条目"
+  e.type = EntryType::kConfChange;              // 标记：这是"成员变更条目"
   e.conf_server = server;                  // 改谁（比如节点2）
   e.conf_role = static_cast<int>(target);  // 改成什么角色（三态）
   // Q2 隐私加固：在【提案此刻】就记下"server 被移除时的配置条目下标"作为复制冻结点。
@@ -1998,7 +2021,7 @@ void Raft::PersistLocked() {
   e.Int(static_cast<int>(logs_.size()));
   for (const LogEntry& en : logs_) {
     e.Int(en.term).Int(en.index).Bytes(en.command)
-    .Bool(en.is_conf).Int(en.conf_server).Int(en.conf_role);
+    .Int(static_cast<int>(en.type)).Int(en.conf_server).Int(en.conf_role);
   }
   // 持久化当前成员配置（与日志一起落盘，重启能恢复）。
   e.Int(static_cast<int>(is_member_.size()));
@@ -2026,9 +2049,11 @@ void Raft::ReadPersist(const std::string& data) {
   logs.reserve(static_cast<size_t>(n));
   for (int i = 0; i < n; i++) {
     LogEntry en;
+    int et = 0;
     if (!(d.Int(en.term) && d.Int(en.index) && d.Bytes(en.command) &&
-          d.Bool(en.is_conf) && d.Int(en.conf_server) && d.Int(en.conf_role)))
+          d.Int(et) && d.Int(en.conf_server) && d.Int(en.conf_role)))
       return;
+    en.type = static_cast<EntryType>(et);
     logs.push_back(std::move(en));
   }
 
