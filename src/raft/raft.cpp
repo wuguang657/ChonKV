@@ -1328,9 +1328,27 @@ void Raft::ReplicateLoop(int server) {
           // 既限制单包大小，也定义"一批"的粒度（窗口以条目计，等价于若干批在途）。
           if (last - next + 1 > kMaxEntriesPerRpc)
             last = next + kMaxEntriesPerRpc - 1;
+          // §5.2 双上限：条目数上限已在上面把 last 截到 kMaxEntriesPerRpc；
+          // 这里再加字节上限——累加每条 entry 的 command 字节，超过 kMaxBytesPerRpc
+          // 且已至少发出一条时截断（单条超大 value 仍至少发一条，避免永远发不出去卡死）。
+          size_t entry_bytes = 0;
           for (int i = next; i <= last; i++) {
-            args.entries.push_back(
-                logs_[static_cast<size_t>(i) - snapshot_index_]);
+            size_t pos = static_cast<size_t>(i) - snapshot_index_;
+            if (i > next && entry_bytes + logs_[pos].command.size() > kMaxBytesPerRpc) {
+              ae_byte_truncated_count_.fetch_add(1, std::memory_order_relaxed);
+              break;
+            }
+            args.entries.push_back(logs_[pos]);
+            entry_bytes += logs_[pos].command.size();
+          }
+          last = next + static_cast<int>(args.entries.size()) - 1; 
+          // §5.2 记录本批 payload 字节（观测用：断言单条 AE 不超 kMaxBytesPerRpc）。
+          // 各 follower 的发送循环并发跑在锁外，用 relaxed store 即可——
+          // 每个线程只写自己这批的 payload（必然 <= 上限），最终值不会超过上限。
+          {
+            long long b = static_cast<long long>(entry_bytes);
+            long long cur = max_ae_payload_bytes_.load(std::memory_order_relaxed);
+            if (b > cur) max_ae_payload_bytes_.store(b, std::memory_order_relaxed);
           }
           // 流水线核心：发送指针只在"真正发出新批"时前进，绝不因 ACK 回退。
           // 窗口占用由 (next_index_ - 1 - match_index_) 自动释放，无需显式清 bool。
@@ -2447,6 +2465,19 @@ int Raft::ReadIndex() {
     }
     return result;           // 调用方拿到 readIndex 后等 apply 到它再读
   }
+}
+
+}  // namespace raft
+
+
+namespace raft {
+
+// §5.2 单条 AE 字节上限观测接口实现
+long long Raft::AEByteTruncatedCount() const {
+  return ae_byte_truncated_count_.load(std::memory_order_relaxed);
+}
+long long Raft::MaxAppendEntriesBytes() const {
+  return max_ae_payload_bytes_.load(std::memory_order_relaxed);
 }
 
 }  // namespace raft

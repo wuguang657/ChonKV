@@ -207,6 +207,7 @@ case "$PART" in
       TestMaxUncommittedBackpressure
       TestRpcMaxMessageBytes
       TestRemovedNodeQuiesces
+      TestAppendEntriesMaxBytesPerRpc
     ) ;;
   *)
     echo "未知 part: ${PART}（只支持 2A/2B/2C/3A/3B/CheckQuorum/ReadIndex/Membership/MaxMessageSize）" >&2

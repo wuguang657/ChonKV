@@ -4412,6 +4412,55 @@ void TestMaxUncommittedBackpressure() {
 }
 
 // ===========================================================================
+// §5.2 单条 AppendEntries 字节上限 —— 双上限之二（条目数上限见 kMaxEntriesPerRpc）
+//
+// 为什么需要：kMaxEntriesPerRpc 只限制单 RPC 的【条目数】（1024 条），不限制
+// 【字节数】。follower 落后时若单条 command 很大（非 lab 短 value），单 RPC 仍
+// 可能偏大 → 序列化/网络压力；生产应补 kMaxBytesPerRpc（如 1MiB）做双上限。
+//
+// 验证：让一个 follower 落后，leader 持续提交大量大 value；重连后 leader 给该
+// follower 追平，单条 AE 必须被字节上限截断（AEByteTruncatedCount > 0），且历史
+// 单条 AE 最大 payload 字节 <= kMaxBytesPerRpc。
+//
+// 变异检验：
+//   · 删掉 for 循环里的字节上限判断 → AEByteTruncatedCount 恒为 0 → 本用例失败
+// ===========================================================================
+void TestAppendEntriesMaxBytesPerRpc() {
+  int servers = 3;
+  auto cfg = MakeConfig(servers, false);
+  cfg->Begin("Test: AppendEntries per-RPC byte cap (S5.2)");
+
+  int leader = cfg->CheckOneLeader();
+  // 选一个非 leader 的 follower 断开，让其落后；leader 仍可提交（剩 2/3 多数）。
+  int laggy = (leader + 1) % servers;
+  cfg->Disconnect(laggy);
+
+  // leader 持续提交大量大 value（每条 12KB，共 200 条 ≈ 2.4MB 总量）。
+  // 只要求多数派（2 台）同意，laggy 不参与，故 leader 能照常提交、日志增长。
+  const int n = 200;
+  const int val_size = 12000;
+  for (int i = 0; i < n; i++) {
+    cfg->One(raftcpp::RandString(val_size), 2, false);
+  }
+
+  // 重连 laggy，触发 leader 给它追平前面的 200 条大 entry。
+  cfg->Connect(laggy);
+  // 再提交一条要求全部 3 台同意的命令：这强制 laggy 先追平所有历史日志。
+  cfg->One("final-sync", servers, false);
+
+  long long trunc = cfg->GetRaft(leader)->AEByteTruncatedCount();
+  long long maxb = cfg->GetRaft(leader)->MaxAppendEntriesBytes();
+  if (trunc <= 0) {
+    cfg->Fatal("字节上限未生效：单条 AE 从未因字节截断（AEByteTruncatedCount=0）");
+  }
+  if (maxb > static_cast<long long>(kMaxBytesPerRpc)) {
+    cfg->Fatal("单条 AE 字节超限：MaxAppendEntriesBytes=" + std::to_string(maxb) +
+               " > kMaxBytesPerRpc=" + std::to_string(kMaxBytesPerRpc));
+  }
+  cfg->End();
+}
+
+// ===========================================================================
 // C3 单条消息字节上限 —— 超限的 RPC 必须被拒收（而不是把两端内存顶穿）
 //
 // 为什么需要：InstallSnapshot 的载荷是整个状态机快照。上层状态机一旦膨胀（或
@@ -4642,6 +4691,7 @@ static const TestCase kTests[] = {
     {"TestMaxUncommittedBackpressure", TestMaxUncommittedBackpressure},
     // C3 单条 RPC 消息字节上限（防超大 snapshot/畸形条目顶穿收发两端内存）
     {"TestRpcMaxMessageBytes", TestRpcMaxMessageBytes},
+    {"TestAppendEntriesMaxBytesPerRpc", TestAppendEntriesMaxBytesPerRpc},
     // C5 被移除节点主动退场（入口处静默 + 可观测，不再白跑 Pre-Vote 广播）
     {"TestRemovedNodeQuiesces", TestRemovedNodeQuiesces},
   };

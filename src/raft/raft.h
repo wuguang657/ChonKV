@@ -105,6 +105,11 @@ constexpr int kMaxEntriesPerRpc = 1024;
 // → 即"8 批在途"，跨 10ms RTT 时吞吐从 1/RTT 提升到 8/RTT。
 constexpr int kPipelineMaxInFlight = 8 * kMaxEntriesPerRpc;
 
+// §5.2 生产加固：单条 AppendEntries 字节上限（双上限之二，条目数上限见 kMaxEntriesPerRpc）
+// follower 落后时若单条 command 很大（非 lab 短 value），单 RPC 仍可能偏大 → 序列化/网络压力。
+// 与 kMaxEntriesPerRpc 共同构成"单条 AE 双上限"：任一先到即截断。
+constexpr size_t kMaxBytesPerRpc = 1 * 1024 * 1024;  // 1 MiB
+
 // ---------------------------------------------------------------------------
 // C1 生产加固：未提交 entry 上限（背压 / 防 OOM）
 // ---------------------------------------------------------------------------
@@ -444,6 +449,12 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // 调试/测试：本节点日志最新下标。
   // 用来验证"learner 虽不投票，但仍在持续接收并追加日志（追数据）"。
   int LastLogIndex() const;
+
+  // §5.2 生产加固：单条 AppendEntries 字节上限的观测接口（测试/调试用，不影响生产逻辑）。
+  // 因"单条 RPC 字节数超过 kMaxBytesPerRpc"而截断的批次数（已发至少一条仍超时不截断）。
+  long long AEByteTruncatedCount() const;
+  // 历史单条 AE 携带的 entry payload 字节数最大值（不含 RPC header），用于断言不超上限。
+  long long MaxAppendEntriesBytes() const;
 
   // 调试用：一行文字描述当前状态
   std::string LogStatus();
@@ -791,6 +802,10 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // 存在的意义：证明静默逻辑【真的生效了】，而不是"碰巧没触发选举"——
   // 没有它，删除 C5 的检查后测试依然全绿（假通过），mutation 检验抓不出来。
   std::atomic<int> election_suppressed_{0};
+
+  // §5.2 单条 AE 字节上限的观测计数器（SendAppendEntries 在锁外并发更新，故用 atomic）。
+  std::atomic<long long> ae_byte_truncated_count_{0};  // 因字节上限截断的批次数
+  std::atomic<long long> max_ae_payload_bytes_{0};     // 单条 AE 最大 payload 字节
   // 锁内版本：调用方必须已持有 mu_（Start()/ReadIndex() 内部用）。
   bool IsRemovedSelfLocked() const;
 

@@ -55,8 +55,9 @@ void KVServer::Start() {
 
 void KVServer::Kill() {
   dead_.store(true);
-
-  // 先关 channel：applier 会把队列里剩下的消息消费完，然后 Pop 返回 false 退出
+  // 先停止提交
+  if (rf_) rf_->Kill();
+  // 关 channel：applier 会把队列里剩下的消息消费完，然后 Pop 返回 false 退出
   apply_ch_->Close();
 
   // 唤醒所有卡在 WaitOp 里的 RPC handler，让它们尽快返回（否则客户端 RPC 挂死）
@@ -71,7 +72,6 @@ void KVServer::Kill() {
 
   // 只有既未 join 也未 detach 的线程才可 join，否则会抛异常。
   if (applier_.joinable()) applier_.join();
-  if (rf_) rf_->Kill();
 }
 
 // ---------------------------------------------------------------------------
