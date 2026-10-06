@@ -48,7 +48,7 @@
 - **现状**：`Start()` 一条命令一个 entry，一次 Persist 一次（将来一次 fsync）。
 - **生产需要**：
   - **写批处理**：多个客户端写合并成一个 AE 批次（已有打包雏形，加上限即可）
-  - **fsync 合并（group commit）**：多条 entry 攒一起 fsync 一次，而不是每条 fsync。这是持久化层吞吐的命门（见 §5）
+  - **fsync 合并（group commit）**：多条 entry 攒一起 fsync 一次，而不是每条 fsync。这是持久化层吞吐的命门（见 §4）
 
 ### 3.2 锁粒度（P2，改动大，最后做）
 
@@ -57,17 +57,9 @@
 
 ---
 
-# 四、客户端会话与资源回收
+# 四、持久化层：对接 tiny-lsm
 
-- [ ] **（P2）Raft 层提供 session 抽象**：现在 session 仍驻 KV 层。生产 Raft 通常把 session 管理下沉（etcd 的 `Lessor`/lease），便于快照时统一序列化——**尚未下沉**（#2 去重已实现，此条是"下沉"工程化，仍待做）。
-
-> 说明：`ReadIndexCtx` 我已经查过，`raft.cpp:1653` 有 `read_ctxs_.erase(ctx)`，**没有泄漏**，这条不用改。（避免你白找一遍）
-
----
-
-# 五、持久化层：对接 tiny-lsm
-
-## 5.0 ★ 先说一个关键设计决策：Raft log **不要**塞进 LSM 的 KV 接口
+## 4.0 ★ 先说一个关键设计决策：Raft log **不要**塞进 LSM 的 KV 接口
 
 这是最容易走错的一步，我必须先讲清楚。
 
@@ -92,7 +84,7 @@
 > 一句话：**tiny-lsm 用来装状态机 KV，不要用来装 Raft log。**  
 > Raft log 单独写一个 append-only segment（顺序 append + 稀疏索引 + 前缀/后缀截断 + fsync），语义简单，300 行内可控，而且能精确控制 fsync 时机（这是正确性关键，交给 LSM 反而控制不了）。
 
-## 5.1 tiny-lsm 现状（基于实际代码）
+## 4.1 tiny-lsm 现状（基于实际代码）
 
 **项目形态**：xmake 构建（`xmake.lua`），命名空间 `tiny_lsm`，C++20。核心源码 `src/`，头文件 `include/`。
 
@@ -110,7 +102,7 @@
 
 **编译/测试**：`xmake` / `xmake run test_lsm`；静态库目标 `lsm_shared`（`xmake.lua:109`）；依赖 gtest / toml11 / spdlog。
 
-## 5.2 tiny-lsm 的 4 个坑（接入前必须知道）
+## 4.2 tiny-lsm 的 4 个坑（接入前必须知道）
 
 1. **🔴 WAL 只在"事务路径"写 —— 非事务 `put` 会丢数据**
    - 铁证：WAL 写入点仅在 `TranContext::commit`（`transation.cpp:257` → `write_to_wal` → `wal->log(records, true)` 强制 fsync）。
@@ -128,7 +120,7 @@
 
 其他：无列族（ColumnFamily）、无 `scan(begin_key, end_key)` 半开区间 API、无快照序列化接口。
 
-## 5.3 三块持久化的分工与 fsync 策略
+## 4.3 三块持久化的分工与 fsync 策略
 
 | 数据                              | 特点                          | 用什么存                                  | fsync 策略                                                     |
 | ------------------------------- | --------------------------- | ------------------------------------- | ------------------------------------------------------------ |
@@ -137,19 +129,19 @@
 | **状态机 KV**                      | 随机读写、量大                     | **tiny-lsm** `LSMEngine`              | 走**事务 API**，由 LSM 的 WAL 保证                                   |
 | **快照 blob**                     | 大、偶发、整体替换                   | LSM `flush_all()` + 导出 / checkpoint   | 锁外写（你现在的两阶段 `SaveSnapshotBlob` 思路可直接平移）                      |
 
-## 5.4 接入步骤（按这个顺序来，每步可独立验证）
+## 4.4 接入步骤（按这个顺序来，每步可独立验证）
 
 - [ ] **Step 0**：在 macOS 上先跑通 tiny-lsm（`xmake` + `xmake run test_lsm`）。  
   ⚠️ 风险：README 标注 platform 为 Linux，macOS（Apple Silicon）**未明确保证**。这一步跑不通，后面方案要换。
 - [ ] **Step 1**：定义 `LogStore` 接口（`Append/Get(index)/Term(index)/LastIndex/TruncateSuffix/TruncatePrefix`），先用**内存 vector** 实现，把 `raft.cpp` 里对 `logs_` 的直接操作收敛到接口后面。**此时测试应全绿（纯重构）**。
 - [ ] **Step 2**：实现 `SegmentLogStore`（append-only 文件 + 稀疏索引 + fsync + 截断），替换 Step 1 的内存实现。加 CRC 防半截写。
 - [ ] **Step 3**：`StateStore`——term/votedFor 原子落盘（tmp + rename + fsync）。
-- [ ] **Step 4**：**先改造 tiny-lsm**：把 `full_compact` 挪到后台线程（见 §5.2 坑2）。不然后面怎么接都会卡。
+- [ ] **Step 4**：**先改造 tiny-lsm**：把 `full_compact` 挪到后台线程（见 §4.2 坑2）。不然后面怎么接都会卡。
 - [ ] **Step 5**：状态机换成 tiny-lsm。apply 用**事务 API**（`begin_tran`/`put`/`commit`）保证 WAL fsync。单线程 apply 正好契合 LSM 无并发写。
 - [ ] **Step 6**：快照——先 `flush_all()` + `Level_Iterator` 全量导出（**注意 MVCC**：要以最大 `tranc_id` 取每个 key 的最新非删除值）；恢复时清空 + `put_batch` 重放。更优方案是实现 **checkpoint**（硬链接 SST 目录，RocksDB 做法，秒级）。
 - [ ] **Step 7**：group commit——`Start()` 后的 fsync 攒批（这是吞吐的关键，也是面试亮点）。
 
-## 5.5 tiny-lsm 需要补的能力（你的下一个子项目）
+## 4.5 tiny-lsm 需要补的能力（你的下一个子项目）
 
 - [ ] **后台 compaction 线程**（P0，阻塞问题）
 - [ ] **Manifest**（替代目录扫描）
@@ -160,7 +152,7 @@
 
 ---
 
-# 六、网络层（留白，你还没定）
+# 五、网络层（留白，你还没定）
 
 现在是 labrpc 模拟网络（`src/labrpc/`）。将来换真实传输层时，需要抽象出这几个接口（先不展开，等你定方案）：
 
@@ -172,7 +164,7 @@
 
 ---
 
-# 七、实施路线图（建议顺序）
+# 六、实施路线图（建议顺序）
 
 **第一批（P0，安全性，不做就不能叫生产）**
 
@@ -198,7 +190,7 @@
 
 ## 附：本次实测铁证清单
 
-> 注：以下为 2026-09-14 首次实测基线。其中 §2.7 多数派过滤（原 `peers_.size()` **未过滤** `is_member_`）、§5.1 流水线（原停等）、§5.2 条目数上限已被后续实现推翻——当前真实状态以 §九.C 待做清单与 §九 工程经验为准，本节不再逐条修订。
+> 注：以下为 2026-09-14 首次实测基线。其中 §2.7 多数派过滤（原 `peers_.size()` **未过滤** `is_member_`）、§4.1 流水线（原停等）、§4.2 条目数上限已被后续实现推翻——当前真实状态以 §九.C 待做清单与 §九 工程经验为准，本节不再逐条修订。
 
 **Raft（cpp-6.824）**
 
@@ -233,7 +225,7 @@
 
 ## A. 仍有效的部分（保留原文，未过期）
 
-- **§5 tiny-lsm 分析**（5.0–5.5）：持久化层对接分析与 4 个坑仍有效（WAL 仅事务路径写、前台 compaction 阻塞、无 Manifest、`WAL::flush()` 空实现）。
+- **§4 tiny-lsm 分析**（4.0–4.5）：持久化层对接分析与 4 个坑仍有效（WAL 仅事务路径写、前台 compaction 阻塞、无 Manifest、`WAL::flush()` 空实现）。
 - 以下"确仍缺失/未做"的小节结论正确，已在 §九.C 清单中保留：§2.1 快照分块、§2.2 磁盘水位、§2.3 CRC、§3.2 锁粒度。
 
 ## B. 剔除「持久化 + 网络」后的剩余待做清单（2026-10-01）

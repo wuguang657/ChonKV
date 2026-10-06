@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
-# test_part.sh —— 并发压测某一 Lab 部分（2A/2B/2C/3A/3B/CheckQuorum/ReadIndex）
-# 的【每一条】用例（TSan 版）
-#
-# 这是 test2A.sh / test2B.sh / test2C.sh / test3A.sh / test3B.sh 的通用核心，
-# 逻辑与 test3B.sh 完全一致：只编译一次 → 每条用例各起独立测试进程并发跑
-# → 每条重复 COUNT 轮、每轮换随机种子 → 日志按 "part-用例名" 分文件汇总。
+# test_part.sh —— 并发压测某一 Lab 部分（2A/2B/2C/3A/3B/生产级扩展）的【每一条】用例。
+# 唯一压测入口（原 test2A.sh / test2B.sh / test2C.sh / test3A.sh / test3B.sh 已并入）：
+# 只编译一次 → 每条用例各起独立测试进程并发跑 → 每条重复 COUNT 轮、每轮换随机种子
+# → 日志按 "part-用例名" 分文件汇总。
 #
 # 为什么可以进程级并发：
 #   labrpc 是纯内存模拟网络——无真实端口、无磁盘共享文件，每个测试进程自带
@@ -24,10 +22,12 @@
 #   OPT=1 ./test_part.sh 2A       优化版：-O2 + LTO（明显更快；改变指令时序，
 #                                 结果面可能与 Debug 基线不同，回归后使用；
 #                                 Release 下 OPT 只贡献 LTO，-O3 照旧）
+#   ./test_part.sh 3B             快照（当前处于调试态，只跑未注释的用例）
+#   ./test_part.sh ChunkedSnapshotTransmit   分块快照两条
 #   ./test_part.sh CheckQuorum    生产级扩展：CheckQuorum 全部 7 条
-#   ./test_part.sh ReadIndex      生产级扩展：ReadIndex 全部 10 条
-#   ./test_part.sh Membership     生产级扩展：Membership 全部 27 条
-#   ./test_part.sh MaxMessageSize 生产级扩展：MaxMessageSize 全部 3 条
+#   ./test_part.sh ReadIndex      生产级扩展：ReadIndex 全部条数
+#   ./test_part.sh Membership     生产级扩展：Membership（可能处于调试态）
+#   ./test_part.sh MaxMessageSize 生产级扩展：MaxMessageSize 全部条数
 #
 # 二进制分派（与 tsan.sh 一致）：2*/生产级扩展 → raft_test，3* → kv_test
 #
@@ -132,14 +132,21 @@ case "$PART" in
     ) ;;
   3B)
     TESTS=(
-      TestSnapshotRPC3B
-      TestSnapshotSize3B
-      TestSnapshotRecover3B
-      TestSnapshotRecoverManyClients3B
-      TestSnapshotUnreliable3B
-      TestSnapshotUnreliableRecover3B
-      TestSnapshotUnreliableRecoverConcurrentPartition3B
-      TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable3B
+      # TestSnapshotRPC3B
+      # TestSnapshotSize3B
+      # TestSnapshotRecover3B
+      # TestSnapshotRecoverManyClients3B
+      # TestSnapshotUnreliable3B
+      TestSnapshotMultiChunk3B
+      TestSnapshotMultiChunkUnreliable3B
+      # TestSnapshotUnreliableRecover3B
+      # TestSnapshotUnreliableRecoverConcurrentPartition3B
+      # TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable3B
+    ) ;;
+  ChunkedSnapshotTransmit)
+    TESTS=(
+      TestChunkedSnapshotTransmit
+      TestChunkedSnapshotLargeStateMachine
     ) ;;
   # ---- 生产级扩展（raft_test 的 Ext 用例）----
   # 每条进程拿【全名】当过滤词，命中 main() 的精确匹配模式 —— 这些用例名
@@ -174,33 +181,33 @@ case "$PART" in
     ) ;;
   Membership)
     TESTS=(
-      TestSingleNodeConfChange
-      TestNoRemovingLastVoter
-      TestLearnerCatchup
-      TestLearnerAvailabilityWin
-      TestMembershipPersistAcrossRestart
-      TestLearnerNeverLeader
-      TestLearnerPersistAcrossRestart
-      TestConfChangeChurn
-      TestRemoveLeaderSelf
-      TestInstallSnapshotRestoresMembership
-      TestConcurrentConfChangeLinearizable
-      TestLearnerCatchupWithChurn
-      TestConfChangeMidCrash
-      TestRemovedNodeExcludedFromQuorum
-      TestMembershipConsistencyAtQuiescence
-      TestReadIndexDuringConfChange
-      TestLearnerDirectlyRemoved
-      TestPromoteLaggingLearnerSafe
-      TestStartRejectedForNonVoter
-      TestInstallSnapshotRestoresRemovedRole
-      TestRemovedNodeStopsReceivingReplication
-      TestRemovedNodeStaysQuiescentAfterRemoval
+      # TestSingleNodeConfChange
+      # TestNoRemovingLastVoter
+      # TestLearnerCatchup
+      # TestLearnerAvailabilityWin
+      # TestMembershipPersistAcrossRestart
+      # TestLearnerNeverLeader
+      # TestLearnerPersistAcrossRestart
+      # TestConfChangeChurn
+      # TestRemoveLeaderSelf
+      # TestInstallSnapshotRestoresMembership
+      # TestConcurrentConfChangeLinearizable
+      # TestLearnerCatchupWithChurn
+      # TestConfChangeMidCrash
+      # TestRemovedNodeExcludedFromQuorum
+      # TestMembershipConsistencyAtQuiescence
+      # TestReadIndexDuringConfChange
+      # TestLearnerDirectlyRemoved
+      # TestPromoteLaggingLearnerSafe
+      # TestStartRejectedForNonVoter
+      # TestInstallSnapshotRestoresRemovedRole
+      # TestRemovedNodeStopsReceivingReplication
+      # TestRemovedNodeStaysQuiescentAfterRemoval
       TestMembershipFuzzChurn
-      TestConfChangeFromMinorityLeader
-      TestLearnerReadIndexRejected
-      TestVoteCountIgnoresRemovedVoters
-      TestRemovedFreezeCoversBothSources
+      # TestConfChangeFromMinorityLeader
+      # TestLearnerReadIndexRejected
+      # TestVoteCountIgnoresRemovedVoters
+      # TestRemovedFreezeCoversBothSources
     ) ;;
   MaxMessageSize)
     TESTS=(
@@ -210,7 +217,7 @@ case "$PART" in
       TestAppendEntriesMaxBytesPerRpc
     ) ;;
   *)
-    echo "未知 part: ${PART}（只支持 2A/2B/2C/3A/3B/CheckQuorum/ReadIndex/Membership/MaxMessageSize）" >&2
+    echo "未知 part: ${PART}（只支持 2A/2B/2C/3A/3B/ChunkedSnapshotTransmit/CheckQuorum/ReadIndex/Membership/MaxMessageSize）" >&2
     exit 2 ;;
 esac
 

@@ -49,7 +49,7 @@
 #include "persister.h"
 
 namespace raft {
-
+int Crc32(const char* data, size_t n);
 // 日志里存的命令。Go 版是 interface{}，C++ 里我们用字符串，
 // 到了 Lab 3（KV 服务）你可以把它塞成任意序列化的字节。
 using Command = std::string;
@@ -109,6 +109,15 @@ constexpr int kPipelineMaxInFlight = 8 * kMaxEntriesPerRpc;
 // follower 落后时若单条 command 很大（非 lab 短 value），单 RPC 仍可能偏大 → 序列化/网络压力。
 // 与 kMaxEntriesPerRpc 共同构成"单条 AE 双上限"：任一先到即截断。
 constexpr size_t kMaxBytesPerRpc = 1 * 1024 * 1024;  // 1 MiB
+
+// 快照分块流式传输：单条 InstallSnapshot RPC 携带的快照字节上限。
+// 生产上状态机几十 GB 时，若整块塞一条 RPC → 内存爆 / 连接占死 / 超时重传整块。
+// 切成固定大小的 chunk，follower 按 offset 追加写、done 时校验 CRC 后安装。
+constexpr size_t kSnapshotChunkSize = 512 * 1024;  // 512 KiB / chunk
+// §2.1 重组缓冲硬上限（P0-3 生产加固，防 OOM DoS）：follower 接收分块快照时，
+// recv_snap_buf_ 按 offset 扩容。伪造 term 的 InstallSnapshot RPC（超大 offset / 超大数据）
+// 可令 resize 撑爆内存。合法快照状态机远小于此值，超过即视为恶意/异常、拒绝并复位在途缓冲。
+constexpr size_t kMaxRecvSnapBuf = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
 
 // ---------------------------------------------------------------------------
 // C1 生产加固：未提交 entry 上限（背压 / 防 OOM）
@@ -310,7 +319,15 @@ struct InstallSnapshotArgs {
   int leader_id = 0;              // 便于 follower 重定向客户端
   int last_included_index = 0;    // 快照覆盖的最后一条日志下标的逻辑 index
   int last_included_term = 0;     // 该下标的 term
-  std::string data;               // 快照内容（状态机 blob）
+  int offset = 0;                 // 本 chunk 在完整 blob 中的字节偏移
+  int chunk_size = 0;             // 本 chunk 字节数
+  bool done = false;              // 是否为最后一块
+  int crc = 0;                    // 完整 blob 的 CRC32（截断成 int，比较用）
+  int epoch = 0;                  // 本次分块传输的代号：每次 leader 起一帧新传输就 +1，
+                                  // 跟随同一帧的所有 chunk 共享同一 epoch。follower 只接受
+                                   // 当前期望 epoch 的片，旧 epoch 残片（乱序迟到）一律忽略，
+                                   // 避免「上一帧没装成的残片」冲掉「当前在途新快照」的重组缓冲。
+  std::string data;               // 本 chunk 的状态机 blob 切片
   // 成员配置随快照一起传：落后太多的 follower 装快照时本地 logs_ 可能已不含
   // 覆盖区间内的 conf 条目（被截断），必须按 leader 在快照点处的角色数组重建。
   std::vector<int> members;       // 各节点角色（MemberRole 的整型值）
@@ -321,7 +338,8 @@ struct InstallSnapshotArgs {
 
 struct InstallSnapshotReply {
   int term = 0;  // follower 当前 term，leader 据以退位
-
+  bool ok_install = false;  // 仅当「本 chunk 是 done 且 follower 真正安装成功」时为 true；
+                            // leader 据此推进 match_index_。中间 chunk / 校验失败均为 false。
   std::string Serialize() const;
   bool Deserialize(const std::string& s);
 };
@@ -461,10 +479,6 @@ class Raft : public std::enable_shared_from_this<Raft> {
   int me() const { return me_; }
 
   // ---- 快照测试 / 调试访问器（不影响生产逻辑）----
-  // ⚠️ TSan 修复：这四个调试访问器原本是无锁 inline 读，会被 main 线程的
-  // CheckConsistency() 并发读到（worker 线程在 mu_ 锁内写 last_applied_ 等），
-  // 触发 data race（raft.cpp:885 ApplyLoop 写 last_applied_）。改为在锁内读
-  // （mu_ 是 mutable，const 方法可锁，无重入死锁）。
   int LogSize() const {
     std::lock_guard<std::mutex> lk(mu_);
     return static_cast<int>(logs_.size());
@@ -478,7 +492,7 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // 后者拿到的是带 header 的磁盘格式，且可能是「尚未提交」的 blob。
   std::string GetSnapshotData() const {
     std::lock_guard<std::mutex> lk(mu_);
-    return snapshot_data_;
+    return *snapshot_data_;
   }
   int CommitIndex() const {
     std::lock_guard<std::mutex> lk(mu_);
@@ -656,7 +670,29 @@ class Raft : public std::enable_shared_from_this<Raft> {
   int snapshot_index_ = 0; // 快照覆盖到最后这条日志（逻辑 index）
   int snapshot_term_ = 0;  // 快照覆盖到最后这条日志（逻辑 term）
   // 裸的状态机 blob（不含磁盘头）。恢复时由 persister 读出、剥头校验后填入。
-  std::string snapshot_data_;
+  // P0-1/P0-2：用 shared_ptr 管理 blob，发送侧 O(1) 钉死这一波所用的 buffer，
+  // 切片时按需拷 chunk（不整拷贝），且 Raft::Snapshot 走「原子替换」而非原地改，
+  // 多帧发送间隙源被替换也不会让新旧混合（详见 ReplicateLoop 钉死逻辑）。
+  std::shared_ptr<std::string> snapshot_data_ = std::make_shared<std::string>();
+  // 当前 snapshot_data_ 的 CRC32（分块传输时随每条 chunk 带上，follower done 时校验）。
+  int snap_crc_ = 0;
+  // snap_crc_ 是相对哪个 snapshot_index_ 算出来的（-1 = 尚未计算）。
+  // 【惰性 CRC】只有 leader 真正要发分块快照时才算，算完按此键缓存，
+  // 一次快照最多算一次——避免每个节点每次生成快照都全量算一遍（见 raft.cpp 注释）。
+  int snap_crc_index_ = -1;
+  std::string recv_snap_buf_;   // 正在重组的完整 blob
+  int recv_snap_last_term_ = -1;  // 正在重组的快照的 last_included_term（用于检测「新快照到来」重置缓冲）
+  int recv_snap_index_ = -1;    // 正在重组的快照 last_included_index
+  int recv_snap_epoch_ = -1;    // 正在重组的传输代号（档2：旧残片靠它识别并丢弃）
+
+  // 分块快照：leader 侧 per-follower 当前分块传输代号（每次开新传输 +1）。
+  // 与 snap_in_flight_ 配合：snap_in_flight_ 挡「重复洪发」，epoch 让 follower 能区分
+  // 「同一快照的迟到残片（丢弃）」与「同一快照的新一轮重试（reset 重来）」。
+  // 仅由该 follower 对应的 ReplicateLoop 线程读写 [s]，无跨线程竞争。
+  std::vector<int> snap_epoch_;
+  // 分块快照：leader 侧「是否正在给某 follower 分块传输快照」标记（防重复洪发）。
+  // 仅由该 follower 对应的 ReplicateLoop 线程读写 [s]，无跨线程竞争。
+  std::vector<char> snap_in_flight_;
 
   // ---- snapshot blob 两阶段落盘：把大 blob 的 I/O 挪出 raft 主锁 ----
   //

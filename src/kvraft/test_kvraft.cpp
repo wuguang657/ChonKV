@@ -1420,6 +1420,100 @@ void TestSnapshotSize3B() {
   cfg.Cleanup();
 }
 
+// 多分块快照专项：强制把状态机撑过 kSnapshotChunkSize(512KB)，
+// 让 InstallSnapshot 必须走「分块发送 → 接收重组 → CRC → 两阶段落盘 → 重启读回」
+// 完整路径。
+//
+// 为什么需要它：现有所有快照用例的 blob 都远小于 512KB（单块即可传完），
+// 分块循环里 offset>0 重组 / 空洞 / CRC 跨块校验 / 重启恢复这些路径从未被任何
+// 用例跑到。修复 epoch 代际清闸、2GB 缓冲 cap、方案H 重置等改动都没有回归保护，
+// 且之前那次 state diverged 也极难复现（正是因为没有多块压力）。
+void TestSnapshotMultiChunk3B(bool unreliable = false) {
+  const int nservers = 3;
+  const int maxraftstate = 1000;
+  const int kChunkSize = 512 * 1024;  // 对齐 raft.h 的 kSnapshotChunkSize
+  const int bigKeys = 300;            // 300 × ~4KB ≈ 1.2MB 状态机 → 多块(3 chunk)
+
+  Config cfg(nservers, unreliable, maxraftstate);
+  auto ck = cfg.MakeClient(cfg.All());
+
+  cfg.Begin("Test: multi-chunk InstallSnapshot (3B)");
+
+  DoPut(&cfg, ck.get(), "ready", "R");
+  DoCheck(&cfg, ck.get(), "ready", "R");
+
+  // 隔离 2 号，让 {0,1} 把状态机撑过 512KB（期间反复生成快照、截断日志）
+  cfg.Partition({0, 1}, {2});
+  {
+    auto ck1 = cfg.MakeClient({0, 1});
+    for (int i = 0; i < bigKeys; i++) {
+      std::string val = "BIG" + std::to_string(i) + std::string(3980, 'x');
+      DoPut(&cfg, ck1.get(), std::to_string(i), val);
+    }
+  }
+
+  // 断言：快照确实超过了单块上限 —— 否则本用例根本没走到多块路径，等于没测
+  int ssz = cfg.SnapshotSize();
+  if (ssz <= kChunkSize) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "snapshot too small (%d <= %d): 未触发多块路径，用例无效", ssz,
+                  kChunkSize);
+    Fatal(buf);
+  }
+
+  // 全网恢复：落后的 2 号只能靠 InstallSnapshot（多块）追上
+  cfg.ConnectAll();
+  std::this_thread::sleep_for(std::chrono::milliseconds(kElectionTimeoutMs));
+
+  // 不可靠网下多 chunk 传输较慢：显式等待 2 号靠分块快照追平 leader，
+  // 避免后面的 DoCheck 单次读在 2 号尚未追平时误 Fatal（flaky 防护）。
+  {
+    auto ck2 = cfg.MakeClient({2});
+    std::string want0 = "BIG0" + std::string(3980, 'x');
+    bool caught = false;
+    for (int t = 0; t < 400; t++) {
+      if (ck2->Get("0") == want0) { caught = true; break; }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!caught)
+      Fatal("unreliable multi-chunk: follower 2 did not catch up via chunked InstallSnapshot");
+  }
+
+  // 抽样校验若干 key 的值（读 {0,1} 这组，它们本就持有全量）
+  {
+    auto ck1 = cfg.MakeClient({0, 1});
+    for (int i = 0; i < bigKeys; i += 37) {
+      std::string want = "BIG" + std::to_string(i) + std::string(3980, 'x');
+      DoCheck(&cfg, ck1.get(), std::to_string(i), want);
+    }
+  }
+  DoCheck(&cfg, ck.get(), "ready", "R");
+
+  // 崩溃重启 2 号：验证多块快照的「落盘 → 重启读回」路径。
+  // 重启后 2 号从持久化快照恢复（不再走 RPC），若重组/落盘有 bug 这里会暴露。
+  cfg.ShutdownServer(2);
+  std::this_thread::sleep_for(std::chrono::milliseconds(kElectionTimeoutMs));
+  cfg.StartServer(2);
+  cfg.ConnectAll();
+  std::this_thread::sleep_for(std::chrono::milliseconds(kElectionTimeoutMs));
+
+  // 只连 2 号读：强制从「重启后的 2 号」本地状态机取数据，
+  // 直接验证多块快照的持久化/恢复正确性（不依赖别的副本）。
+  {
+    auto ck2 = cfg.MakeClient({2});
+    for (int i = 0; i < bigKeys; i += 37) {
+      std::string want = "BIG" + std::to_string(i) + std::string(3980, 'x');
+      DoCheck(&cfg, ck2.get(), std::to_string(i), want);
+    }
+    DoCheck(&cfg, ck2.get(), "ready", "R");
+  }
+
+  // 终极一致性校验：所有副本状态机必须逐 key 一致（含重启后的 2 号）
+  cfg.End();
+  cfg.Cleanup();
+}
+
 // ===========================================================================
 // 生产化：会话 fencing（客户端协议兜底的【服务端挡刀】）
 // ===========================================================================
@@ -2159,6 +2253,8 @@ const TestEntry kTests[] = {
     // ---- 3B ----
     {"TestSnapshotRPC3B", TestSnapshotRPC3B},
     {"TestSnapshotSize3B", TestSnapshotSize3B},
+    {"TestSnapshotMultiChunk3B", [] { TestSnapshotMultiChunk3B(false); }},
+    {"TestSnapshotMultiChunkUnreliable3B", [] { TestSnapshotMultiChunk3B(true); }},
     {"TestSnapshotRecover3B",
      [] { GenericTest("3B", 1, false, true, false, 1000); }},
     {"TestSnapshotRecoverManyClients3B",

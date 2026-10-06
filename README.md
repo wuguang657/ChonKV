@@ -103,8 +103,7 @@ cpp-6.824/
 ├── patches/              # 已落地的加固补丁（raft/kv 各 fix，含 ReadIndex 相关）
 ├── CMakeLists.txt        # 构建定义（raft_test / kv_test / labrpc_selftest）
 ├── build.sh              # 一键编译 + 跑测试（支持全套构建变体）
-├── test_part.sh          # 并发压测 harness（通用核心，2A~3B/CheckQuorum/ReadIndex...）
-├── test2A.sh ~ test3B.sh # test_part.sh 的薄封装（只指定 part）
+├── test_part.sh          # 唯一压测入口（2A~3B/CheckQuorum/ReadIndex/Membership...）
 ├── tsan.sh               # ThreadSanitizer 一键体检
 ├── build*/  testdir/     # ⚠️ 本地编译产物（已 gitignore，clone 后不会出现）
 ├── LICENSE               # MIT
@@ -234,12 +233,12 @@ SEED=12345 ./build-tsan/raft_test TestReadIndex   # 固定种子复现某条
 ```
 
 支持的环境变量：`PART`（位置参数）、`COUNT`（默认 25）、`PARALLEL`（默认 4）、
-`SAN`（`tsan`/`asan`/`ubsan`/`asan,ubsan`/`none`，默认 `tsan`）、`TSAN`（旧开关，0/1）、
-`RELEASE`（0/1）、`OPT`（0/1）、`SEED`（固定随机种子）、`BIN`（显式指定二进制，
-sanitizer 配置按目录名反推）。
+`SAN`（`tsan`/`asan`/`ubsan`/`asan,ubsan`/`none`，默认 `none` 即 Debug 版，快 5~15 倍；
+`TSAN=1` 或 `SAN=tsan` 开 TSan）、`RELEASE`（0/1）、`OPT`（0/1）、`SEED`（固定随机种子）、
+`BIN`（显式指定二进制，sanitizer 配置按目录名反推）。
 
-`test2A.sh` ~ `test3B.sh` 是 `test_part.sh` 的薄封装，只指定 part，例如 `./test3B.sh`
-等价于 `./test_part.sh 3B`。
+`test_part.sh` 是唯一压测入口：`./test_part.sh 3B` 即压测 3B（原 test2A.sh ~
+test3B.sh 薄封装已并入，直接用 part 参数）。
 
 ### ThreadSanitizer 体检：`tsan.sh`
 

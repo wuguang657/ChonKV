@@ -24,6 +24,36 @@ static void Trace(const char* fmt, ...) {
   va_end(ap);
 }
 // ===========================================================================
+// §2.1 快照分块：CRC32（IEEE 802.3 多项式）工具 —— 用于分块传输完整性校验。
+// 完整快照 blob 在 leader 侧算一次 CRC32，随每条 chunk 带上；follower 收到 done
+// 重组出完整 blob 后重算并比对，不一致（半截写 / 分块丢失 / 损坏）则拒绝安装。
+// 截断成 int 仅用于「相等比较」，双射不丢区分度。
+// ===========================================================================
+static uint32_t Crc32Impl(const char* data, size_t n) {
+  // C++11 magic statics：lambda 内 static 表 + 外层 static 指针，
+  // 首次调用由运行时保证线程安全的单次初始化，消除 TSan data race。
+  // 不再用手写 if(!inited) 双检查锁（那正是竞态根源）。
+  static const uint32_t* table = []() {
+    static uint32_t t[256];
+    for (uint32_t i = 0; i < 256; ++i) {
+      uint32_t c = i;
+      for (int k = 0; k < 8; ++k)
+        c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+      t[i] = c;
+    }
+    return t;
+  }();
+  uint32_t crc = 0xFFFFFFFFu;
+  for (size_t i = 0; i < n; i++)
+    crc = table[(crc ^ static_cast<uint8_t>(data[i])) & 0xff] ^ (crc >> 8);
+  return crc ^ 0xFFFFFFFFu;
+}
+
+int Crc32(const char* data, size_t n) {
+  return static_cast<int>(Crc32Impl(data, n));
+}
+
+// ===========================================================================
 // 第一部分：序列化（已实现，不用改）
 // ===========================================================================
 //
@@ -125,6 +155,7 @@ bool AppendEntriesReply::Deserialize(const std::string& s) {
 std::string InstallSnapshotArgs::Serialize() const {
   labrpc::Encoder e;
   e.Int(term).Int(leader_id).Int(last_included_index).Int(last_included_term);
+  e.Int(offset).Int(chunk_size).Int(done ? 1 : 0).Int(crc).Int(epoch);
   e.Bytes(data);
   e.Int(static_cast<int>(members.size()));
   for (int m : members) e.Int(m);
@@ -133,9 +164,12 @@ std::string InstallSnapshotArgs::Serialize() const {
 
 bool InstallSnapshotArgs::Deserialize(const std::string& s) {
   labrpc::Decoder d(s);
+  int done_flag = 0;
   if (!(d.Int(term) && d.Int(leader_id) && d.Int(last_included_index) &&
-        d.Int(last_included_term) && d.Bytes(data)))
+        d.Int(last_included_term) && d.Int(offset) && d.Int(chunk_size) &&
+        d.Int(done_flag) && d.Int(crc) && d.Int(epoch) && d.Bytes(data)))
     return false;
+  done = (done_flag != 0);
   int nm = 0;
   if (!d.Int(nm) || nm < 0) return false;
   members.clear();
@@ -150,13 +184,16 @@ bool InstallSnapshotArgs::Deserialize(const std::string& s) {
 
 std::string InstallSnapshotReply::Serialize() const {
   labrpc::Encoder e;
-  e.Int(term);
+  e.Int(term).Int(ok_install ? 1 : 0);
   return e.Take();
 }
 
 bool InstallSnapshotReply::Deserialize(const std::string& s) {
   labrpc::Decoder d(s);
-  return d.Int(term) && d.Ok();
+  int ok = 0;
+  bool ok_parse = d.Int(term) && d.Int(ok) && d.Ok();
+  if (ok_parse) ok_install = (ok != 0);
+  return ok_parse;
 }
 
 std::string ReadIndexArgs::Serialize() const {
@@ -226,6 +263,8 @@ Raft::Raft(std::vector<std::shared_ptr<labrpc::ClientEnd>> peers, int me,
   // 而不是固定 1（Go 原版用 len(rf.log)，也是读盘后的值）。
   // 实战中当选时会再被 become-leader 回调重置一次，这里只是更稳健的初值。
   next_index_.assign(peers_.size(), LastLogIndexLocked() + 1);
+  snap_in_flight_.assign(peers_.size(), 0);  // §2.1：每 follower 分块快照在途标记
+  snap_epoch_.assign(peers_.size(), 0);       // §2.1：每 follower 当前传输代号（档2）
 
 }
 
@@ -1145,6 +1184,10 @@ void Raft::ReplicateLoop(int server) {
     InstallSnapshotArgs snap_args;
     bool send_now = false;
     bool send_snap = false;
+    // P0-1/P0-2：钉死这一波发送所用的快照 buffer（shared_ptr O(1) 拷贝，不整拷贝 blob）。
+    // 多帧发送期间若 Raft::Snapshot 原子替换 snapshot_data_，src_snap 仍指向旧 buffer，
+    // 切片不会拿到新旧混合数据。
+    std::shared_ptr<std::string> src_snap;
     {
       std::unique_lock<std::mutex> lk(mu_);
 
@@ -1156,11 +1199,6 @@ void Raft::ReplicateLoop(int server) {
       //         · 心跳计数变了                    → 发心跳
       //         · 有新日志、且当前没有带日志的 RPC 在途（或已在途超过
       //           kLogRetryMs，说明回信丢了，重发）→ 带上日志发
-      //
-      // ⚠️ 踩过的坑：条件千万别写成 "state_ == kLeader"。
-      // condition_variable::wait(lk, pred) 的语义是 while(!pred()) wait()，
-      // 谓词一进来就成立时它会【立即返回、一毫秒都不等】→ 空转，
-      // 一秒钟几万次 RPC，TestCount2B 直接挂。
       //
       // wait_until 的截止时间取"节流到期时刻"和"现在 +5ms"的较大值：
       // 保证不会忙等，又能在节流到期后尽快重试。
@@ -1232,7 +1270,7 @@ void Raft::ReplicateLoop(int server) {
       // cap < 0（如刚重启尚未重建）则日志/快照全部不发（removed 节点本就从日志
       // 重放拿到过移除条目，不依赖 leader 补发）。
       //
-      // ⚠️ 冻结判据必须【两源取或】，不能只用一个：
+      // 冻结判据必须【两源取或】，不能只用一个：
       //   (a) removed_at_index_[s] >= 0（冻结点）：覆盖【提案 → apply】这段窗口，
       //       此间 is_member_[s] 仍是 kVoter。只用 is_member_ 判 → cap 形同虚设，
       //       leader 会继续把 conf 之后的新条目（如 index 12/13）复制给待移除节点。
@@ -1284,22 +1322,35 @@ void Raft::ReplicateLoop(int server) {
       // 快照区间——否则条目循环 logs_[i - snapshot_index_] 又是负下标。
       if (removed && next <= snapshot_index_ && may_send_log) next = snapshot_index_ + 1;
 
-      // 该 follower 落后到快照点之前 → 改发 InstallSnapshot 而非 AppendEntries。
-      // 必须放在计算 prev_log_index/term 之前：否则 next-1 可能落在快照区间，
-      // logs_[next-1] 会越界（截断后 logs_ 里没有那些下标）。
-      // Q2：removed 节点绝不发快照（快照携带完整 KV 数据 → 隐私泄漏，且会越过冻结点），
-      // 即使落后也强制走 AppendEntries 分支（只发到冻结点为止）。
-      if (next <= snapshot_index_ && !removed) {
+      // next_index_ 推进到 snapshot_index_+1 之后，再正常发 AppendEntries。
+      bool lagging_for_snapshot = (next <= snapshot_index_ && !removed);
+      if (lagging_for_snapshot && !snap_in_flight_[s]) {
+        snap_in_flight_[s] = 1;  // 先占坑（持锁），回调在最后一块完成时才清零
+        snap_args.epoch = ++snap_epoch_[s];  // 每开一帧新分块传输代号 +1（档2：旧残片靠它识别）
         snap_args.term = current_term_;
         snap_args.leader_id = me_;
         snap_args.last_included_index = snapshot_index_;
         snap_args.last_included_term = snapshot_term_;
-        snap_args.data = snapshot_data_;
+        // P0-1：不再整 blob 深拷贝到 snap_args.data（原 L1330 锁内 O(blob) 拷贝）。
+        // 改为钉死 shared_ptr，锁外切片时按需取 chunk（见下方发送循环）。
+        src_snap = snapshot_data_;
+        // 【惰性 CRC】：只有真要发分块快照时才算，并按 snapshot_index_ 缓存，
+        // 一次快照最多算一次（详见 Raft::Snapshot 里作废缓存处的注释）。
+        if (snap_crc_index_ != snapshot_index_) {
+          snap_crc_ = Crc32(snapshot_data_->data(), snapshot_data_->size());
+          snap_crc_index_ = snapshot_index_;
+        }
+        snap_args.crc = snap_crc_;
         // 把当前成员配置随快照一起发给落后 follower（见 InstallSnapshot 处重建）。
         snap_args.members.clear();
         for (MemberRole r : is_member_) snap_args.members.push_back(static_cast<int>(r));
         send_snap = true;
       } else {
+        // 快照在途（lagging_for_snapshot 且 snap_in_flight_ 已置位）：本轮只发心跳，
+        // 不带头皮日志条目——理由见上方 lagging_for_snapshot 注释。may_send_log 置否后
+        // 下方 entries 构建被跳过，但 send_now 仍为 true（纯心跳仍发出，用于推进
+        // follower 的 commitIndex）。
+        if (lagging_for_snapshot) may_send_log = false;
         args.term = current_term_;
         args.leader_id = me_;
         args.leader_commit = commit_index_;
@@ -1333,6 +1384,12 @@ void Raft::ReplicateLoop(int server) {
           // 且已至少发出一条时截断（单条超大 value 仍至少发一条，避免永远发不出去卡死）。
           size_t entry_bytes = 0;
           for (int i = next; i <= last; i++) {
+            // §2.1 防御性钳制：next 一旦落在快照区间内（理论上不该发生——落后到
+            // 快照点之前应改走 InstallSnapshot；但 snap_in_flight_ 在途窗口等边界下
+            // ReplicateLoop 可能回退到 AE 分支），绝不能用 i-snapshot_index_ 去读
+            // logs_（会 size_t 下溢 → 越界读内存垃圾 → 发出乱码 entry 污染 follower）。
+            // 快照区间内这些条目 follower 本就该从快照里拿，直接跳过即可。
+            if (i <= static_cast<int>(snapshot_index_)) continue;
             size_t pos = static_cast<size_t>(i) - snapshot_index_;
             if (i > next && entry_bytes + logs_[pos].command.size() > kMaxBytesPerRpc) {
               ae_byte_truncated_count_.fetch_add(1, std::memory_order_relaxed);
@@ -1360,33 +1417,76 @@ void Raft::ReplicateLoop(int server) {
       }
     }
     if (send_snap) {
-      peers_[s]->CallAsyncTyped<InstallSnapshotArgs, InstallSnapshotReply>(
-          "Raft.InstallSnapshot", snap_args,
-          [self, server, snap_args](bool ok, const InstallSnapshotReply& reply) {
-            const size_t s = static_cast<size_t>(server);
-            std::lock_guard<std::mutex> lk(self->mu_);
-            if (self->killed_.load()) return;
-            // CheckQuorum liveness：回包 ok=true（哪怕迟到）→ 清零连续失败计数；
-            // ok=false（丢包 / 真断连）→ 累加。据此区分"回包延迟"与"真失联"。
-            if (ok) self->cq_consec_fail_[s] = 0;
-            else { if (self->cq_consec_fail_[s] < kCQMaxConsecFail) self->cq_consec_fail_[s]++; return; }  // 丢包 / 对方挂了，下一轮重发（封顶防无界增长）
-            if (reply.term > self->current_term_) {
-              self->ConvertToFollowerLocked(reply.term);
-              self->last_heartbeat_ = raftcpp::Now();
-              self->tick_cv_.notify_all();
-              self->replicator_cv_.notify_all();
-              return;
-            }
-            // 快照已装好：把该 follower 的复制进度推到快照点之后，
-            // 之后走普通 AppendEntries。
-            // 更新下CheckQuorum/Lease：follower 最近一次成功回包时刻
-            self->last_ack_time_[s] = raftcpp::Now();
-            self->match_index_[s] =
-                std::max(self->match_index_[s], snap_args.last_included_index);
-            self->next_index_[s] = snap_args.last_included_index + 1;
-            self->replicator_cv_.notify_all();
-          },
-          &cancel_rpcs_);
+      // §2.1 分块快照：把完整快照切片成 kSnapshotChunkSize 的 chunk，逐条 RPC 发出。
+      // 每条 chunk 携带 offset / done / crc；follower 按 offset 重组、done 时校验 CRC
+      // 后安装。可靠网络下一次性全发（in-order 投递，无空洞）；不可靠丢失时 follower
+      // 收不全 → ok_install=false → 下一轮心跳重发整块（正确，只是略慢）。
+      // P0-1：total 取钉死的 src_snap（不再依赖 snap_args.data 整拷贝）。
+      const size_t total = src_snap->size();
+      size_t off = 0;
+      int last_idx = snap_args.last_included_index;
+      int snap_term = snap_args.term;  // 发送时任期，用于回调二次确认（防旧 term 迟到回包）
+      do {
+        size_t remain = total - off;
+        size_t len = (remain < kSnapshotChunkSize) ? remain : kSnapshotChunkSize;
+        bool is_last = (off + len >= total);
+        InstallSnapshotArgs chunk_args;  // 不复用 snap_args（避免整体拷贝 1GB blob）
+        chunk_args.term = snap_args.term;
+        chunk_args.leader_id = snap_args.leader_id;
+        chunk_args.last_included_index = snap_args.last_included_index;
+        chunk_args.last_included_term = snap_args.last_included_term;
+        chunk_args.offset = static_cast<int>(off);
+        chunk_args.chunk_size = static_cast<int>(len);
+        chunk_args.done = is_last;
+        chunk_args.crc = snap_args.crc;
+        chunk_args.epoch = snap_args.epoch;
+        // P0-1：从钉死的 src_snap 切片（每次只拷一个 chunk 的 len 字节，非整 blob）。
+        chunk_args.data = src_snap->substr(off, len);
+        chunk_args.members = snap_args.members;
+        peers_[s]->CallAsyncTyped<InstallSnapshotArgs, InstallSnapshotReply>(
+            "Raft.InstallSnapshot", chunk_args,
+            [self, server, is_last, last_idx, snap_term, send_epoch = snap_args.epoch](bool ok, const InstallSnapshotReply& reply) {
+              const size_t s = static_cast<size_t>(server);
+              std::lock_guard<std::mutex> lk(self->mu_);
+              if (self->killed_.load()) return;
+              // CheckQuorum liveness：回包 ok=true（哪怕迟到）→ 清零连续失败计数；
+              // ok=false（丢包 / 真断连）→ 累加。据此区分"回包延迟"与"真失联"。
+              if (ok) self->cq_consec_fail_[s] = 0;
+              else { if (self->cq_consec_fail_[s] < kCQMaxConsecFail) self->cq_consec_fail_[s]++; }
+              // OK 为false时, reply.term默认为0
+              if (reply.term > self->current_term_) {
+                self->ConvertToFollowerLocked(reply.term);
+                self->last_heartbeat_ = raftcpp::Now();
+                self->tick_cv_.notify_all();
+                self->replicator_cv_.notify_all();
+                self->snap_in_flight_[s] = 0;
+                return;
+              }
+              // 二次确认：迟到的快照回包作废（与 AppendEntries 回调的对称守卫，
+              // 防旧 term / 退位后的迟到回包误推进 match_index_）。
+              if (snap_term != self->current_term_ || self->state_ != ServerState::kLeader) {
+                if (send_epoch == self->snap_epoch_[s]) self->snap_in_flight_[s] = 0;
+                return;
+              }
+              // 最后一块回包：仅当 RPC 送达(ok) 且 follower 真正安装成功(ok_install) 才推进
+              // 复制进度。follower 在「last_included <= last_applied（早就有这份快照）」时幂等
+              // 返回 ok_install=true（不落盘但视为已安装），故不会卡死（TestSnapshotRPC3B
+              // key=c 正常）；不可靠网下中间块丢失致 CRC 失败时 ok_install=false，leader 不
+              // 推进 → 下一轮心跳重发整块自愈，消除「虚报已追平 → follower 永久饿死」的活性边角。
+              if (is_last) {
+                if (ok && reply.ok_install) {
+                  self->match_index_[s] = std::max(self->match_index_[s], last_idx);
+                  self->next_index_[s] = last_idx + 1;
+                }
+                self->snap_in_flight_[s] = 0;
+                self->replicator_cv_.notify_all();
+              }
+            },
+            &cancel_rpcs_);
+        off += len;
+      } while (off < total);
+      // 注意：snap_in_flight_[s]=1 已在上面的持锁决策块里置位；
+      // 最后一块的回包回调（持锁）会把它清零。不要在这里再置 1，否则会与回调竞争。
       continue;
     }
     if (!send_now) continue;
@@ -1550,7 +1650,7 @@ void Raft::ApplyLoop() {
               }
               tick_cv_.notify_all();
               replicator_cv_.notify_all();
-              // ⚠️ 配置条目【也要】作为一条命令派发给状态机/harness。
+              // 配置条目【也要】作为一条命令派发给状态机/harness。
               // 原因：harness 的 apply 顺序检查要求每个 index 都被记录；
               // 若 has_msg=false 直接丢弃，conf 占据的 index 会留下空洞，
               // 下一条真实命令会被误报 "apply out of order"。
@@ -1737,7 +1837,17 @@ void Raft::Snapshot(int index, const std::string& snapshot) {
 
   snapshot_index_ = index;
   snapshot_term_ = snap_term;
-  snapshot_data_ = snapshot;
+  // P0-2：原子替换（shared_ptr 赋值），不原地改。正在发送的旧 buffer 由
+  // ReplicateLoop 持有的 shared_ptr 钉死，不会被这次替换影响。
+  snapshot_data_ = std::make_shared<std::string>(std::move(snapshot));
+  // 【惰性 CRC】这里【不】计算 CRC，只作废缓存。
+  // 本函数由 applier 高频调用（实测 20s 内每节点数千次快照）。若每次都对整个 blob
+  // （本测试后期 ~73KB）算一遍 CRC32，在 TSan 下（每次访存都插桩）会把 KV 的
+  // apply/快照循环整体拖慢，落后几十次快照才轮得上一次裁剪 → 日志来不及截 →
+  // "logs were not trimmed"（RELEASE+TSAN 50 轮实测 3/50，base 无此开销为 0/50）。
+  // CRC 只有 leader 真要发分块快照时才用得上，故推迟到 ReplicateLoop 那一刻计算。
+  snap_crc_ = 0;
+  snap_crc_index_ = -1;
   // 注意：blob 已在阶段 1 落盘，这里【只】持久化 raft state（PersistLocked
   // 不再碰 blob）。落盘顺序恒为「先 blob 后 state」，靠 blob 头里的 index
   // 做崩溃校验，见 DecodeSnapshotBlob / ReadPersist。
@@ -1749,9 +1859,11 @@ void Raft::Snapshot(int index, const std::string& snapshot) {
 
 void Raft::InstallSnapshot(const InstallSnapshotArgs& args,
                            InstallSnapshotReply& reply) {
-  // ========== 阶段 0：快判（持 mu_，只读 + O(1) 元数据更新，不做 I/O）==========
-  // 决定"这个快照值不值得落盘"。term 推进 / heartbeat 刷新也放在这里，
-  // 保证「收到更高 term 的（哪怕过期的）快照仍会退位」这一语义不丢失。
+  // §2.1 分块快照接收：先按 offset 重组完整 blob，done 且 CRC 校验通过后才安装。
+  // 中间 chunk 只落本地重组缓冲，不碰 raft state / 不落盘（幂等、可重传）。
+  std::string assembled;  // done+校验通过后承载完整 blob，供阶段 1/2 使用
+
+  // ========== 阶段 0：快判 + 分块重组（持 mu_）==========
   {
     std::lock_guard<std::mutex> lk(mu_);
     reply.term = current_term_;
@@ -1765,27 +1877,117 @@ void Raft::InstallSnapshot(const InstallSnapshotArgs& args,
     last_heartbeat_ = raftcpp::Now();
     tick_cv_.notify_all();
 
-    // 走到这里说明发来的是【合法（同任期或更新任期）的 leader】→ 记下编号，
-    // 供上层做 WrongLeader 重定向（kvraft 的 Get/PutAppend reply 回填 leader_id）。
-    // 与 AppendEntries(L938) 对齐：即便随后因任期更大而退位，这条消息的发送方
-    // 确是当前/更新任期的合法 leader，记它没错；下一任 leader 的快照/心跳会覆盖。
+    // 合法（同任期或更新任期）的 leader → 记下编号，供上层 WrongLeader 重定向。
     leader_id_ = args.leader_id;
 
-    // 已经包含这个快照（或更新的）→ 连盘都不用落。
-    if (args.last_included_index <= last_applied_) return;
+    // 已经包含这个快照（或更新的）→ 幂等视为已安装：不落盘、不动分块缓冲，
+    // 但回 ok_install=true，让 leader 据此推进 match_index_（避免「早就有却因
+    // ok_install=false 永不推进」的死循环，见 TestSnapshotRPC3B key=c）。
+    if (args.last_included_index <= last_applied_) {
+      reply.ok_install = true;
+      return;
+    }
+
+    // 分块重组（档2 epoch 加固）：
+    // - 不同身份的快照（last_included_term/index 变化）：比当前在途的【更新】才采纳并 reset；
+    //   更旧的迟到残片直接忽略（不 reset、不写），避免冲掉新快照在途缓冲。
+    // - 同一身份的快照：offset==0 表示 leader 开启新一轮传输，直接 reset 重组；
+    //   offset>0 的迟到残片才靠 epoch 去重（比当前更小 → 忽略）。这样 leader 重启后
+    //   首帧（epoch 从 1 起、offset==0）直接被采纳，不会卡在「旧残片忽略」的活性退化。
+    bool new_snapshot =
+        (recv_snap_index_ != args.last_included_index) || (recv_snap_last_term_ != args.last_included_term);
+    if (new_snapshot) {
+      bool newer = (recv_snap_index_ < 0) ||  // 尚无在途缓冲
+                   (args.last_included_index > recv_snap_index_) ||
+                   (args.last_included_index == recv_snap_index_ &&
+                    args.last_included_term > recv_snap_last_term_);
+      if (!newer) {
+        // 更旧快照的迟到残片 → 忽略（不 reset、不写，避免冲掉新快照在途缓冲）。
+        reply.ok_install = false;
+        return;
+      }
+      recv_snap_buf_.clear();
+      recv_snap_index_ = args.last_included_index;
+      recv_snap_last_term_ = args.last_included_term;
+      recv_snap_epoch_ = args.epoch;
+    } else {
+      // 同一快照：offset==0 表示 leader 开启了新一轮传输（每次发送/重发都从 0 起），
+      // 直接清空缓冲重组；offset>0 的迟到残片才用 epoch 去重（比当前更小则忽略）。
+      // 这样 leader 重启后首帧（epoch 从 1 起、offset==0）直接被采纳，不会因 epoch
+      // 比 follower 残留值小而卡在「旧残片忽略」（自愈但慢）的活性退化里。
+      if (args.offset == 0) {
+        recv_snap_buf_.clear();
+        recv_snap_epoch_ = args.epoch;
+      } else if (args.epoch != recv_snap_epoch_) {
+        if (args.epoch > recv_snap_epoch_) {
+          recv_snap_buf_.clear();
+          recv_snap_epoch_ = args.epoch;
+        } else {
+          reply.ok_install = false;
+          return;
+        }
+      }
+    }
+    // 把本 chunk 写入缓冲的 offset 处（按需扩容，未到的区域填 0）。
+    size_t off = static_cast<size_t>(args.offset);
+    // §2.1 防御（生产加固，P0-3）：防伪造 RPC 撑爆内存（OOM DoS）。
+    // 正常分块每块 data ≤ kSnapshotChunkSize；offset 非法（<0）或
+    // offset+data 之和超过 kMaxRecvSnapBuf 即视为恶意/异常，拒绝并复位在途缓冲，
+    // 等 leader 下一轮合法传输重发（与 done 时 CRC 失败走同一复位路径）。
+    if (args.offset < 0 ||                                 // offset 非法
+        args.data.size() > kSnapshotChunkSize ||           // 单块过大
+        off + args.data.size() > kMaxRecvSnapBuf) {        // 总缓冲超限
+      recv_snap_buf_.clear();
+      recv_snap_index_ = -1;
+      recv_snap_last_term_ = -1;
+      recv_snap_epoch_ = -1;
+      reply.ok_install = false;
+      return;
+    }
+    if (off + args.data.size() > recv_snap_buf_.size())
+      recv_snap_buf_.resize(off + args.data.size());
+    if (!args.data.empty())
+      recv_snap_buf_.replace(off, args.data.size(), args.data);
+
+    if (!args.done) {
+      // 中间 chunk：仅重组，回包（ok_install=false 表示尚未安装）。
+      reply.ok_install = false;
+      return;
+    }
+
+    // done chunk：先判定完整性 + CRC 校验。
+    size_t expect_total = off + args.data.size();
+    bool complete = (recv_snap_buf_.size() == expect_total);
+    bool crc_ok = complete &&
+                  (Crc32(recv_snap_buf_.data(), recv_snap_buf_.size()) == args.crc);
+    // 不完整（分块丢失 / 乱序）或 CRC 不符（半截写 / 损坏）→ 拒绝安装，清缓冲，
+    // 等 leader 下一轮心跳重发整块（正确，只是略慢）。
+    if (!crc_ok) {
+      recv_snap_buf_.clear();
+      recv_snap_index_ = -1;
+      recv_snap_last_term_ = -1;
+      recv_snap_epoch_ = -1;
+      reply.ok_install = false;
+      return;
+    }
+    // 校验通过：把完整 blob 挪出（锁外 I/O 用），并复位接收状态。
+    assembled = std::move(recv_snap_buf_);
+    recv_snap_index_ = -1;
+    recv_snap_last_term_ = -1;
+    recv_snap_epoch_ = -1;
   }
 
   // ========== 阶段 1：blob 落盘（★ 慢 I/O，在 raft 主锁 mu_ 之外）==========
   // 这里是 follower 侧真正的重活：几百 MB 的快照要 write + fsync。
   // 旧实现在 mu_ 内做，会堵死本节点的 AppendEntries / 选举定时器；
   // 若多数派 follower 同时装快照，leader 收不到 ack → 被 CheckQuorum 误退位。
-  SaveSnapshotBlob(args.last_included_index, args.last_included_term, args.data);
+  SaveSnapshotBlob(args.last_included_index, args.last_included_term, assembled);
 
   // ========== 阶段 2：持锁完成 raft state 变更（快）==========
   // msg 在【锁外】构造：锁内不再做大 blob 的拷贝。
   ApplyMsg msg;
   msg.snapshot_valid = true;
-  msg.snapshot = args.data;
+  msg.snapshot = assembled;
   msg.snapshot_index = args.last_included_index;
   msg.snapshot_term = args.last_included_term;
   {
@@ -1798,17 +2000,15 @@ void Raft::InstallSnapshot(const InstallSnapshotArgs& args,
     // 已经包含这个快照（或更新的），无需重复安装（idempotent）。
     // ⚠️ 改用 last_applied_ 判旧（对齐 Go 版 raft.go:904）：
     // 基准必须是「状态机已应用位置」，而不是 snapshot_index_（日志截断点）。
-    // 二者恒有 last_applied_ >= snapshot_index_；若只比 snapshot_index_，存在窗口
-    // snapshot_index_ < args.index <= last_applied_：follower 已应用到 100、本地
-    // 快照截断到 90，leader 迟到发快照 95 会被误接受 → 日志截断 + lastIncludedIndex
-    // 推进到 95，若 lastApplied 再被回退，96~100 的 Put/Append 会被重放 → 重复 append
-    // + 丢新日志（回归 bug：get wrong value / got []）。
     if (args.last_included_index <= last_applied_) return;
 
     int old_snap_index = snapshot_index_;
     snapshot_index_ = args.last_included_index;
     snapshot_term_ = args.last_included_term;
-    snapshot_data_ = args.data;
+    snapshot_data_ = std::make_shared<std::string>(std::move(assembled));
+    // 惰性 CRC：blob 变了就作废缓存，等本节点真要发快照时再算（见 Raft::Snapshot）。
+    snap_crc_ = 0;
+    snap_crc_index_ = -1;
     // 成员配置随快照一起恢复：落后 follower 装快照时本地 logs_ 可能已不含覆盖
     // 区间内的 conf 条目（被截断），必须用 leader 在快照点处的角色数组重建，
     // 否则 is_member_ 与 leader 不一致 → 多数派判定错位 → 安全性崩塌。
@@ -1822,14 +2022,10 @@ void Raft::InstallSnapshot(const InstallSnapshotArgs& args,
         ConvertToFollowerLocked(current_term_);
       }
     }
-    // 注意：blob 已在阶段 1 于锁外落盘，PersistLocked() 只写 raft state。
 
     // 截断 logs_：哨兵重建（index 对齐到快照点）；args.last_included_index+1 之后
     // 的旧条目保留，等 leader 重发覆盖即可（即使保留也可能错位，AppendEntries 的
     // 一致性检查会基于 prev_log_index 砍掉冲突段）。
-    //
-    // 注意：logs_[0] 必须同步改写——老哨兵的 index/term 已不再对应新 snap_index_，
-    // 否则 AppendEntries 的 pos = e.index - snapshot_index_ 会算错。
     size_t pos = static_cast<size_t>(args.last_included_index - old_snap_index);
     if (pos < logs_.size()) {
       std::vector<LogEntry> new_logs;
@@ -1856,11 +2052,9 @@ void Raft::InstallSnapshot(const InstallSnapshotArgs& args,
     apply_cv_.notify_all();
 
     // 落盘 raft state（含截断后的 logs_、新 snapshot 元数据）。
-    // ⚠️ blob 【不在这里写】—— 已在阶段 1 于锁外落盘。
     PersistLocked();
 
     // 挂到 pending_snapshot_，由 ApplyLoop 统一派发。
-    // 若已有待投递快照，只保留更新的那个（旧的已被新的完全覆盖，投它没有意义）。
     if (!pending_snapshot_.has_value() ||
         pending_snapshot_->snapshot_index < msg.snapshot_index) {
       Trace("S%d InstallSnapshot单相挂pending idx=%d term=%d (已挂=%s)", me_,
@@ -1869,6 +2063,7 @@ void Raft::InstallSnapshot(const InstallSnapshotArgs& args,
       pending_snapshot_ = std::move(msg);
       apply_cv_.notify_all();  // 唤醒 ApplyLoop
     }
+    reply.ok_install = true;  // 仅当真正安装成功时置 true（leader 据此推进 match）
     return;
   }
 }
@@ -2130,7 +2325,9 @@ void Raft::ReadPersist(const std::string& data) {
         if (last_applied_ < b_idx) last_applied_ = b_idx;
       }
       if (b_idx == snapshot_index_) {
-        snapshot_data_ = std::move(b_raw);  // 裸状态机数据
+        snap_crc_ = Crc32(b_raw.data(), b_raw.size());
+        snap_crc_index_ = snapshot_index_;  // 已算好，记为对该 index 的缓存
+        snapshot_data_ = std::make_shared<std::string>(std::move(b_raw));  // 裸状态机数据
       }
       // 盘上 blob 的 index 恒 >= 已提交边界，之后只允许写更新的。
       saved_blob_index_ = snapshot_index_;

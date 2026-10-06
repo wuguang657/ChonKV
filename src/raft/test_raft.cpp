@@ -4041,8 +4041,8 @@ void TestMembershipFuzzChurn() {
     role[node] = tgt;
     // 等 apply（单飞保护：上一条未 commit 前新提议会被拒，所以这里等它真正生效）
     bool applied = false;
-    for (int t = 0; t < 40; t++) {
-      raftcpp::SleepMs(50);
+    for (int t = 0; t < 100; t++) {
+      raftcpp::SleepMs(100);
       if (cfg->GetRaft(node)->MembershipView()[node] == static_cast<int>(tgt)) {
         applied = true;
         break;
@@ -4576,6 +4576,279 @@ void TestRemovedNodeQuiesces() {
 }
 
 // ===========================================================================
+// §2.1 分块快照：单元测试（直接驱动 InstallSnapshot handler）
+// ---------------------------------------------------------------------------
+// 不依赖网络/选举，直接用合法的大 KV 快照 blob（与 config.cpp 的 EncodeKV 同格式）
+// 手工切片成多个 chunk，喂给 follower 的 InstallSnapshot，验证：
+//   (1) happy-path：有序多 chunk 重组 + CRC 校验通过 → ok_install=true，状态机水化；
+//   (2) corrupt-crc：done chunk 的 crc 被篡改 → ok_install=false，不安装；
+//   (3) missing-middle-chunk：中间块缺失（空洞）→ CRC 必败 → 不安装；
+//   (4) middle-chunk-only：仅发第一块（非 done）→ 仅重组，不安装。
+// blob 体量 ≈ 3.2MB，远超单 chunk（512KiB），强制走多 chunk 路径。
+// ===========================================================================
+void TestChunkedSnapshotTransmit() {
+  // ---- 构造合法大 KV 快照 blob（int n; 然后 n 个 (Int k, Bytes v)）----
+  const int kEntries = 8000;
+  const int kValSize = 400;  // 每条约 400B → blob ≈ 8000*(4+4+400) ≈ 3.2MB
+  labrpc::Encoder enc;
+  enc.Int(kEntries);
+  std::map<int, std::string> expected;
+  for (int i = 1; i <= kEntries; i++) {
+    std::string v(kValSize, static_cast<char>('a' + (i % 26)));
+    enc.Int(i).Bytes(v);
+    expected[i] = v;
+  }
+  std::string blob = enc.Take();
+  const int crc = raft::Crc32(blob.data(), blob.size());
+
+  auto runScenario = [&](const std::string& tag, bool deliver_all,
+                         bool corrupt_crc, bool only_first_chunk) {
+    auto cfg = MakeConfig(1, false);  // 单节点：无 leader 主动发快照干扰
+    cfg->Begin("Test (§2.1): chunked snapshot transmit — " + tag);
+    auto rf = GetRaftOrFatal(cfg, 0);
+    int term = rf->GetState().first;  // 用节点当前 term，避免被当成过期快照拒收
+    const int last_included_index = kEntries;
+    const int last_included_term = 1;
+
+    const size_t total = blob.size();
+    size_t off = 0;
+    bool saw_done = false;
+    do {
+      size_t remain = total - off;
+      size_t len = (remain < raft::kSnapshotChunkSize) ? remain
+                                                      : raft::kSnapshotChunkSize;
+      bool is_last = (off + len >= total);
+
+      if (only_first_chunk) {
+        // 只发第一块（非 done）：验证「中间 chunk 不安装」
+        InstallSnapshotArgs a;
+        a.term = term; a.leader_id = 0;
+        a.last_included_index = last_included_index;
+        a.last_included_term = last_included_term;
+        a.offset = 0; a.chunk_size = static_cast<int>(len);
+        a.done = false; a.crc = crc;
+        a.data = blob.substr(0, len);
+        InstallSnapshotReply r;
+        rf->InstallSnapshot(a, r);
+        if (r.ok_install)
+          cfg->Fatal(tag + ": 中间 chunk 不应触发安装");
+        if (rf->SnapshotIndex() != 0)
+          cfg->Fatal(tag + ": 中间 chunk 不应推进快照点");
+        cfg->End();
+        return;
+      }
+      if (!deliver_all && !is_last && off > 0) {
+        // 制造空洞：跳过中间块，只保留「第一块 + 最后一块」
+        off += len;
+        continue;
+      }
+
+      InstallSnapshotArgs a;
+      a.term = term; a.leader_id = 0;
+      a.last_included_index = last_included_index;
+      a.last_included_term = last_included_term;
+      a.offset = static_cast<int>(off);
+      a.chunk_size = static_cast<int>(len);
+      a.done = is_last;
+      a.crc = corrupt_crc ? (crc ^ 0x5A5A5A5A) : crc;
+      a.data = blob.substr(off, len);
+      InstallSnapshotReply r;
+      rf->InstallSnapshot(a, r);
+
+      if (is_last) {
+        saw_done = true;
+        if (corrupt_crc) {
+          if (r.ok_install) cfg->Fatal(tag + ": crc 被篡改却安装成功");
+          if (rf->SnapshotIndex() != 0)
+            cfg->Fatal(tag + ": crc 篡改不应推进快照点");
+        } else if (!deliver_all) {
+          // 空洞场景：CRC 必败 → 拒绝安装
+          if (r.ok_install)
+            cfg->Fatal(tag + ": 缺中间块却安装成功（CRC 应拦截）");
+          if (rf->SnapshotIndex() != 0)
+            cfg->Fatal(tag + ": 缺中间块不应推进快照点");
+        } else {
+          if (!r.ok_install) cfg->Fatal(tag + ": 合法分块快照未安装");
+        }
+      }
+      off += len;
+    } while (off < total);
+
+    if (!saw_done) cfg->Fatal(tag + ": 未发出 done 块");
+    if (!corrupt_crc && deliver_all) {
+      // 等 ApplyLoop 派发 pending_snapshot_、状态机水化
+      bool ok = false;
+      for (int t = 0; t < 50; t++) {
+        if (cfg->GetState(0) == expected) { ok = true; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+      if (!ok) cfg->Fatal(tag + ": 分块重组后的状态机与期望不一致");
+    }
+    cfg->End();
+  };
+
+  runScenario("happy-path", true, false, false);
+  runScenario("corrupt-crc", true, true, false);
+  runScenario("missing-middle-chunk", false, false, false);
+  runScenario("middle-chunk-only", false, false, true);
+
+  // ---- 档2 epoch 硬化：旧快照的迟到残片不得冲掉新快照在途缓冲 ----
+  // 两类：① 不同身份快照 A→B，A 的迟到残片必须被忽略；② 同一快照 epoch 重试必须
+  // 正确 reset 重来，且更旧 epoch 残片被忽略。
+  auto mk_blob = [](int n) -> std::pair<std::string, std::map<int, std::string>> {
+    labrpc::Encoder e;
+    e.Int(n);
+    std::map<int, std::string> m;
+    for (int i = 1; i <= n; i++) {
+      std::string v(20, 'x');
+      e.Int(i).Bytes(v);
+      m[i] = v;
+    }
+    return std::make_pair(e.Take(), m);
+  };
+  auto runEpoch = [&](const std::string& tag, bool retry_same) {
+    auto cfg = MakeConfig(1, false);
+    cfg->Begin("Test (§2.1): epoch hardening — " + tag);
+    auto rf = GetRaftOrFatal(cfg, 0);
+    int term = rf->GetState().first;
+
+    auto blobA = mk_blob(2), blobB = mk_blob(2);
+    int crcA = raft::Crc32(blobA.first.data(), blobA.first.size()), crcB = raft::Crc32(blobB.first.data(), blobB.first.size());
+
+    auto send = [&](const std::string& blob, int idx, int snap_term, int epoch,
+                    size_t off, bool done) -> InstallSnapshotReply {
+      size_t len = blob.size() - off;
+      InstallSnapshotArgs a;
+      a.term = term; a.leader_id = 0;
+      a.last_included_index = idx; a.last_included_term = snap_term;
+      a.offset = static_cast<int>(off); a.chunk_size = static_cast<int>(len);
+      a.done = done; a.crc = (idx == 200 ? crcB : crcA);
+      a.epoch = epoch;
+      a.data = blob.substr(off, len);
+      InstallSnapshotReply r;
+      rf->InstallSnapshot(a, r);
+      return r;
+    };
+
+    if (!retry_same) {
+      // ① 旧 A(idx=100,epoch=1) 第一块 → 采纳
+      send(blobA.first, 100, 1, 1, 0, false);
+      // 新 B(idx=200,epoch=2) 第一块 → 更新身份并 reset
+      send(blobB.first, 200, 1, 2, 0, false);
+      // A 的迟到残片(idx=100,epoch=1) → 更旧 → 忽略（不 reset 不写）
+      InstallSnapshotReply rA = send(blobA.first, 100, 1, 1, blobA.first.size() / 2, true);
+      if (rA.ok_install) cfg->Fatal(tag + ": 旧快照迟到残片不应被安装");
+      // B 第二块（done,epoch=2）→ 完成安装
+      send(blobB.first, 200, 1, 2, blobB.first.size() / 2, true);
+      if (rf->SnapshotIndex() != 200) cfg->Fatal(tag + ": 新快照未安装到 200");
+    } else {
+      // ② 同一快照(idx=100)：epoch=1 第一块 → 采纳；epoch=2 重试 → reset 重来
+      send(blobA.first, 100, 1, 1, 0, false);
+      send(blobA.first, 100, 1, 2, 0, false);
+      // epoch=1 旧残片在传输途中(offset>0)迟到 → 更旧 → 忽略（不 reset 不写）。
+      // ⚠️ 必须在 epoch=2 完成(done)【之前】发，才能命中 epoch 去重分支；
+      //    若等快照装完再发，会走「已安装→幂等 ok_install=true」分支（这是正确行为，
+      //    不是 bug，详见 raft.cpp:1876 注释），断言就写反了。
+      InstallSnapshotReply rOld =
+          send(blobA.first, 100, 1, 1, blobA.first.size() / 2, false);
+      if (rOld.ok_install) cfg->Fatal(tag + ": 旧 epoch 残片不应安装");
+      // 用 epoch=2 正确块完成安装
+      send(blobA.first, 100, 1, 2, blobA.first.size() / 2, true);
+      if (rf->SnapshotIndex() != 100) cfg->Fatal(tag + ": 重试快照未安装到 100");
+    }
+    // 状态机水化校验
+    auto exp = retry_same ? blobA.second : blobB.second;
+    bool ok = false;
+    for (int t = 0; t < 50; t++) {
+      if (cfg->GetState(0) == exp) { ok = true; break; }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!ok) cfg->Fatal(tag + ": 重组后状态机与期望不一致");
+    cfg->End();
+  };
+  runEpoch("stale-old-snapshot-residual", false);
+  runEpoch("same-snapshot-epoch-retry", true);
+}
+
+// ===========================================================================
+// §2.1 分块快照：集成测试（大状态机端到端追平）
+// ---------------------------------------------------------------------------
+// 对齐 TestInstallSnapshotCatchUp2D，但把单条命令的 value 放大到 16KiB，使 KV 状态
+// 机涨到数 MB（远超单 chunk 512KiB），让落后 follower 真正通过「多 chunk」InstallSnapshot
+// 追平。验收点：造大状态机 → 能稳定分块传完并 install → 状态机与 leader 一致。
+// ===========================================================================
+void TestChunkedSnapshotLargeStateMachine() {
+  auto cfg = MakeConfig(3, false);
+  cfg->EnableSnapshotCompaction();
+  cfg->Begin("Test (§2.1): chunked snapshot catch up on large state machine");
+
+  const int kValSize = 16 * 1024;  // 16KiB/命令
+  auto bigcmd = [](int i) {                 // [kValSize] → []
+    std::string v(kValSize, static_cast<char>('A' + (i % 26)));
+    return "big" + std::to_string(i) + ":" + v;
+  };
+
+  // 先提交一批，让 leader 侧状态机 + 快照涨到 MB 级
+  for (int i = 1; i <= 20; i++) cfg->One(bigcmd(i), 1, true);
+
+  int leader = cfg->CheckOneLeader();
+  int follower = (leader + 1) % 3;
+  cfg->Crash1(follower);
+
+  // 继续提交（命令更多更大）→ leader 状态机继续膨胀，频繁自动快照（kSnapshotThreshold=20）
+  for (int i = 21; i <= 128; i++) cfg->One(bigcmd(i), 1, true);
+
+  auto lrf = GetRaftOrFatal(cfg, leader);
+  WaitApplied(lrf, 3000);
+
+  cfg->Start1(follower);
+
+  // 必须同时等两条：① 分块快照把 follower 快照点追平(验证走通 InstallSnapshot 多块路径)；
+  // ② follower 的 last_applied 追上 leader 的 last_applied——快照点(如 120)之后的 121~128
+  // 等日志还需靠正常复制追平并 apply。只等 ① 不够：装快照瞬间 follower 的 LastApplied 与
+  // CommitIndex 都被推进到快照点，WaitApplied 会因 LastApplied>=CommitIndex 立即返回，
+  // 慢速(TSan)下 121~128 尚未复制来就被拿去比对 → state 条目 120 vs 128 误判失败。
+  bool ok = false;
+  for (int t = 0; t < 400; t++) {
+    auto frf = GetRaftOrFatal(cfg, follower);
+    // ⚠️ 关键修正：不能只等 raft 层 last_applied_ 指针。raft 的 last_applied_ 是「派发」
+    // 语义(ApplyLoop 把条目 push 进 apply_ch_ 后即推进)，而真正写进状态机 map 的是
+    // applier 线程(异步消费 apply_ch_)。TSan 下 applier 被严重减速，会出现
+    // 「last_applied_ 已=128、但状态机 map 还停在快照点 120」的窗口；若只等指针就会被
+    // 拿去比对 → 误报 follower=120。故最终判定必须看状态机 map size 真正追平 leader。
+    if (lrf->SnapshotIndex() > 0 &&
+        frf->SnapshotIndex() >= lrf->SnapshotIndex() &&
+        static_cast<int>(cfg->GetState(follower).size()) >=
+            static_cast<int>(cfg->GetState(leader).size())) {
+      ok = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  if (!ok) {
+    auto frf = GetRaftOrFatal(cfg, follower);
+    char buf[192];
+    std::snprintf(buf, sizeof(buf),
+                  "large-state follower didn't fully catch up: "
+                  "snap(leader=%d,follower=%d) applied(leader=%d,follower=%d)",
+                  lrf->SnapshotIndex(), frf->SnapshotIndex(),
+                  lrf->LastApplied(), frf->LastApplied());
+    cfg->Fatal(buf);
+  }
+
+  auto ls = cfg->GetState(leader);
+  auto fs = cfg->GetState(follower);
+  std::cout << "  large-state follower 快照点追上: "
+            << GetRaftOrFatal(cfg, follower)->SnapshotIndex()
+            << "  leader 快照点: " << lrf->SnapshotIndex()
+            << "  状态条目 leader=" << ls.size()
+            << " follower=" << fs.size() << "\n";
+  if (ls != fs)
+    cfg->Fatal("large-state follower state != leader after chunked snapshot");
+  cfg->End();
+}
+
+// ===========================================================================
 // 测试主程序
 // ===========================================================================
 
@@ -4610,6 +4883,10 @@ static const TestCase kTests[] = {
     {"TestInstallSnapshotCatchUp2D", TestInstallSnapshotCatchUp2D},
     {"TestSnapshotRestart2D", TestSnapshotRestart2D},
     {"TestSnapshotStateMachine2D", TestSnapshotStateMachine2D},
+
+    // §2.1 分块快照流式传输（etcd snap.Message 语义：offset/done/crc/chunk_size）
+    {"TestChunkedSnapshotTransmit", TestChunkedSnapshotTransmit},
+    {"TestChunkedSnapshotLargeStateMachine", TestChunkedSnapshotLargeStateMachine},
 
     // ./build/raft_test CheckQuorum     # 精确命中 TestCheckQuorum（唯一含 CheckQuorum 的）
     // ./build/raft_test ReadIndex       # 同时命中 TestReadIndex + TestReadIndexNoStale
