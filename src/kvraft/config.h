@@ -14,7 +14,7 @@
 #include <vector>
 
 #include "../labrpc/labrpc.h"
-#include "../raft/persister.h"
+#include "../labgob/persister.h"
 #include "client.h"
 #include "server.h"
 

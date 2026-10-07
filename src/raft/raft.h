@@ -46,14 +46,14 @@
 #include "../common/thread_tracker.h"
 #include "../common/util.h"
 #include "../labrpc/labrpc.h"
-#include "persister.h"
+#include "../labgob/persister.h"
 
 namespace raft {
 int Crc32(const char* data, size_t n);
 // 日志里存的命令。Go 版是 interface{}，C++ 里我们用字符串，
 // 到了 Lab 3（KV 服务）你可以把它塞成任意序列化的字节。
 using Command = std::string;
-
+using Persister = labgob::Persister;
 // ---------------------------------------------------------------------------
 // 常量：选举超时 / 心跳间隔
 // ---------------------------------------------------------------------------
@@ -363,6 +363,11 @@ struct StartResult {
   // 与 is_leader=false 区分开 —— 后者可能是"我不是 leader"，本标记专指"我是
   // leader 但被限流了"，调用方可据此选择"稍后重试"而不是"换 leader 重试"。
   bool backpressure = false;
+  // #2.2 磁盘水位保护：本节点【是 leader】，但 raft state 落盘体积已超阈值，
+  // 拒绝本次新写入，逼上层去调 Snapshot() 压缩。与 backpressure 同构但语义不同：
+  // backpressure=未提交过多（内存/复制压力）；disk_full=raft state 太大（磁盘水位）。
+  // 调用方看到 disk_full 应触发快照后重试，而非换节点。
+  bool disk_full = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -421,6 +426,13 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // 上层服务（比如 KV 服务器）提交一条命令。
   // 不是 leader 就返回 is_leader=false。
   StartResult Start(const Command& command);
+
+  // #2.2 磁盘水位保护：设置 raft state（term/votedFor/log）序列化后允许的最大字节数。
+  // 设为 0（默认）= 不限制，保持与现有行为完全一致。超过则 Start() 返回 disk_full=true，
+  // 调用方应触发 Snapshot() 压缩后再重试。
+  void SetMaxRaftStateBytes(size_t n) { max_raft_state_bytes_ = n; }
+  // 当前 raft state 序列化字节数（与 persister 写入的 RaftState 大小一致，不含快照 blob）。
+  size_t RaftStateSize() const;
   int ReadIndex();
   // 生产级扩展 ③：提议一次【单节点】成员变更（一次只加/减一个）。
   // add=true  → 把 server 设为 kVoter；add=false → 设为 kRemoved。
@@ -826,6 +838,18 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // 由 SetMaxUncommittedEntries() 修改；默认 kMaxUncommittedEntriesDefault。
   // 受 mu_ 保护（只在 Start() 内读、由 SetMaxUncommittedEntries() 写）。
   int max_uncommitted_entries_ = kMaxUncommittedEntriesDefault;
+
+  // ---- #2.2 磁盘水位保护：raft state 字节数上限 ----
+  // 由 SetMaxRaftStateBytes() 修改；默认 0=不限制。受 mu_ 保护（只在 Start() 内读、由 SetMaxRaftStateBytes() 写）。
+  size_t max_raft_state_bytes_ = 0;
+
+  // #2.2 辅助：编码 raft state 为字节串（PersistLocked / RaftStateSize 共用），调用方须持 mu_。
+  std::string EncodeRaftStateLocked() const;
+  // 缓存「上一次 PersistLocked 编码出的字节数」，使 RaftStateSizeLocked() 从 O(日志条数) 降为 O(1)。
+  // 由 PersistLocked() 编码后写入；ReadPersist() 末尾用一次 EncodeRaftStateLocked() 初始化（构造期仅一次）。
+  // 读取方须持 mu_（Start() / RaftStateSize() / ProposeConfChangeTo 均持锁）。
+  size_t raft_state_bytes_ = 0;
+  size_t RaftStateSizeLocked() const { return raft_state_bytes_; }
 
   // ---- 重定向用：本节点认知的 leader 编号 ----
   // 收到合法 AppendEntries（含心跳）时记为 args.leader_id；自己当选时记为 me_。

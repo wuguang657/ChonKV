@@ -41,7 +41,7 @@
 
 #include "../common/chan.h"
 #include "../labrpc/labrpc.h"
-#include "../raft/persister.h"
+#include "../labgob/persister.h"
 #include "../raft/raft.h"
 #include "common.h"
 
@@ -216,6 +216,13 @@ class KVServer {
   // 测试里只在"没有客户端在跑"的时候调。
   std::map<std::string, std::string> SnapshotStore() const;
 
+  // 测试专用：返回 ForceSnapshotOnDiskFull 真正落盘（CAS 抢到快照资格）的次数。
+  // 用于并发突发护栏用例断言"节流生效、没形成 fsync 风暴"——该计数应被钉死在
+  // ≤ 测试耗时/50ms，而非正比于 disk_full 突发事件数。
+  int64_t ForcedSnapCountForTest() const {
+    return forced_snap_count_.load(std::memory_order_relaxed);
+  }
+
   // ---- 会话表淘汰 / fencing 调试用（白盒）----
   // ⚠️ 这几个都加锁：ApplierLoop 会在另一个线程里并发改 sessions_ / fenced_，
   //    测试线程无锁直读是 data race（TSan 会报），必须走这里的访问器。
@@ -299,12 +306,25 @@ class KVServer {
   void ApplySnapshotLocked(const std::string& blob);
   // 判断是否需要生成快照，需要就把数据准备好（在锁内编码）
   bool PrepareSnapshotLocked(int index, int* snap_index, std::string* blob);
+  // #2.2 磁盘水位：disk_full 时主动压缩一次（锁内编码 + 锁外 Snapshot）。
+  void ForceSnapshotOnDiskFull();
 
   mutable std::mutex mu_;
   std::condition_variable apply_cv_;  // applier 完成某个 index 后通知等待者
 
   int me_ = 0;
   int maxraftstate_ = 0;  // -1 表示不生成快照
+
+  // #2.2 磁盘水位节流：上次强制快照的 steady_clock 纳秒戳（原子，无锁）。
+  // 并发 disk_full 突发下用 CAS 限流——每 kForceSnapMinInterval 窗口仅一个线程真落盘，
+  // 其余直接跳过（状态已被抢到资格的线程的快照压缩过，再压一次是纯浪费 I/O、反令磁盘更满）。
+  // 见 server.cpp ForceSnapshotOnDiskFull 的限流实现。
+  std::atomic<int64_t> last_forced_snap_ns_{0};
+
+  // 测试专用计数器：ForceSnapshotOnDiskFull 真正落盘（CAS 抢到资格）的累计次数。
+  // 仅在 CAS 成功路径递增，跳过（被节流）的路径不计数。
+  std::atomic<int64_t> forced_snap_count_{0};
+
   std::shared_ptr<raft::Raft> rf_;
   std::shared_ptr<raft::Persister> persister_;
   std::shared_ptr<raftcpp::Chan<raft::ApplyMsg>> apply_ch_;

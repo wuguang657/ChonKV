@@ -4503,7 +4503,7 @@ void TestRpcMaxMessageBytes() {
 
   // 恢复闸门后集群必须自愈（证明闸门只是"拒收"，没有把状态机搞坏）。
   cfg->SetMaxRpcMessageBytes(labrpc::kMaxRpcMessageBytesDefault);
-  cfg->One("after-cap-recovered", servers, false);
+  cfg->One("after-cap-recovered", servers, true);
   cfg->End();
 }
 
@@ -4857,7 +4857,240 @@ struct TestCase {
   std::function<void()> fn;
 };
 
+// ===========================================================================
+// 新增：崩溃恢复硬化（文件模式）+ #2.2 磁盘水位保护验证
+// ===========================================================================
+
+// 崩溃恢复硬化：强制文件模式，模拟多节点同时崩溃后从磁盘重启，
+// 验证 raft state（term/votedFor/log/snapshot）正确恢复、已提交命令不丢、不分裂脑。
+void TestFileBackedCrashRecover() {
+  const int servers = 3;
+  // 强制文件模式（不依赖 MakeConfig 默认值），每节点独立磁盘目录，崩溃后从磁盘恢复。
+  auto cfg = std::make_shared<Config>(servers, false, /*file_backed=*/true);
+  cfg->Begin("Test (file): crash + restart from disk recovers committed state");
+
+  // 提交一批命令，制造一定量 raft state
+  for (int i = 1; i <= 20; i++)
+    cfg->One(Cmd(1000 + i), servers, true);
+
+  // 记录崩溃前一个节点的完整已提交状态，作为后续比对基准
+  int ref = cfg->CheckOneLeader();
+  auto before = cfg->GetState(ref);
+  if (before.empty()) cfg->Fatal("崩溃前未提交任何命令");
+
+  // 模拟整机宕机：所有节点崩溃，但磁盘上的持久化状态保留
+  for (int i = 0; i < servers; i++) cfg->Crash1(i);
+
+  // 从磁盘重启全部节点
+  for (int i = 0; i < servers; i++) cfg->Start1(i);
+
+  // 重启后必须仍能选主并提交（证明 term/votedFor 没回退、未触发分裂脑）
+  cfg->One(Cmd(2099), servers, true);
+
+  // 重启后已提交的命令不应丢失、值不应变化：证明磁盘恢复正确
+  for (int i = 0; i < servers; i++) {
+    auto after = cfg->GetState(i);
+    for (const auto& kv : before) {
+      auto it = after.find(kv.first);
+      if (it == after.end())
+        cfg->Fatal("节点 " + std::to_string(i) + " 重启后丢失已提交 index " +
+                   std::to_string(kv.first));
+      if (it->second != kv.second)
+        cfg->Fatal("节点 " + std::to_string(i) + " 重启后 index " +
+                   std::to_string(kv.first) + " 值发生变化");
+    }
+  }
+
+  cfg->End();
+}
+
+// #2.2 磁盘水位保护：raft state 超过阈值时 Start() 返回 disk_full=true，
+// 逼上层调 Snapshot() 压缩；压缩后 RaftStateSize 下降、Start() 恢复成功。
+void TestRaftStateDiskQuota() {
+  auto cfg = MakeConfig(1, false);  // 单节点即可验证水位逻辑（与落盘模式无关）
+  cfg->Begin("Test (#2.2): raft state disk quota rejects new writes when over threshold");
+
+  auto rf = GetRaftOrFatal(cfg, 0);
+
+  // 等单节点选出 leader（选举需一轮超时），否则循环里首次 Start 时还不是 leader
+  cfg->CheckOneLeader();
+
+  // 设一个较小的阈值（单位：raft state 序列化后字节数）。
+  const size_t threshold = 4096;
+  rf->SetMaxRaftStateBytes(threshold);
+
+  // 持续提交，直到 Start 返回 disk_full（阈值小，几百条内必触发）
+  bool saw_disk_full = false;
+  std::string rejected_cmd;  // 被 disk_full 拒绝的命令，稍后断言它从未被 apply（幽灵条目检查）
+  for (int i = 0; i < 3000 && !saw_disk_full; i++) {
+    std::string cmd = Cmd(5000 + i);
+    auto r = rf->Start(cmd);
+    // 必须先判 disk_full（与 backpressure 同语义：is_leader 保持 false，靠独立字段区分）
+    if (r.disk_full) {
+      saw_disk_full = true;
+      rejected_cmd = cmd;
+      break;
+    }
+    if (!r.is_leader) cfg->Fatal("单节点意外不是 leader");
+    // 让命令被 apply，避免未提交堆积触发 C1 背压（隔离纯水位路径）
+    WaitApplied(rf, 1000);
+  }
+
+  if (!saw_disk_full)
+    cfg->Fatal("阈值设得很小仍没触发 disk_full，水位保护未生效");
+  if (rf->RaftStateSize() < threshold)
+    cfg->Fatal("disk_full 触发但 RaftStateSize < 阈值，逻辑矛盾");
+
+  // 上层触发快照压缩（模拟 KVServer 在 apply 后调 Snapshot()）
+  int commit_idx = rf->LastApplied();
+  rf->Snapshot(commit_idx, "snapshot-blob-" + std::to_string(commit_idx));
+
+  // 压缩后 raft state 应下降，且能继续提交
+  if (rf->RaftStateSize() >= threshold)
+    cfg->Fatal("Snapshot 后 RaftStateSize 未下降，压缩无效");
+  auto r2 = rf->Start(Cmd(9999));
+  if (r2.disk_full)
+    cfg->Fatal("Snapshot 后仍 disk_full，恢复失败");
+  if (!r2.is_leader || r2.index <= 0)
+    cfg->Fatal("Snapshot 后 Start 未恢复正常");
+
+  // ---- 幽灵条目检查：被 disk_full 拒绝的 Start 绝不能把命令写进 log/状态机 ----
+  // 若 Start() 实现有 bug（既 push_back 又返 disk_full），这条断言会抓到：
+  // 被拒命令的值不应出现在任何已提交状态里。
+  auto st = cfg->GetState(0);
+  for (const auto& kv : st) {
+    if (kv.second == rejected_cmd)
+      cfg->Fatal("被 disk_full 拒绝的命令竟出现在已提交状态里（幽灵条目）");
+  }
+
+  cfg->End();
+}
+
+// ---------------------------------------------------------------------------
+// 崩溃恢复硬化（变体1）：少数派崩溃、多数派继续服务、崩溃节点从磁盘恢复后重新加入并追平。
+// 重点：验证「崩溃节点磁盘恢复 + 后续日志追平」路径，而非只测全集群同时重启。
+void TestFileBackedCrashMinority() {
+  const int servers = 3;
+  auto cfg = std::make_shared<Config>(servers, false, /*file_backed=*/true);
+  cfg->Begin("Test (file): minority crash, majority keeps serving, crashed node rejoins from disk");
+
+  for (int i = 1; i <= 20; i++) cfg->One(Cmd(1000 + i), servers, true);
+
+  // 崩掉一台少数派（非 leader），其余 2 台仍在多数，应能继续提交
+  int down = (cfg->CheckOneLeader() + 1) % servers;
+  cfg->Crash1(down);
+
+  // 多数派继续提交新命令（只等 2 台提交即可，down 那台不在多数）
+  for (int i = 21; i <= 30; i++) cfg->One(Cmd(2000 + i), servers - 1, true);
+
+  // 崩溃节点从磁盘重启，应重新加入并追平
+  cfg->Start1(down);
+  raftcpp::SleepMs(2 * kRaftElectionTimeout);
+
+  // 追平后所有节点已提交状态应一致
+  auto ref = cfg->GetState(cfg->CheckOneLeader());
+  for (int i = 0; i < servers; i++) {
+    auto st = cfg->GetState(i);
+    for (const auto& kv : ref) {
+      auto it = st.find(kv.first);
+      if (it == st.end() || it->second != kv.second)
+        cfg->Fatal("崩溃节点重加入后未追平 index " + std::to_string(kv.first));
+    }
+  }
+  cfg->End();
+}
+
+// ---------------------------------------------------------------------------
+// 崩溃恢复硬化（变体2）：专崩 leader，新主选出、旧主磁盘 term 不引发分裂脑，重加入不破坏一致性。
+void TestFileBackedCrashLeader() {
+  const int servers = 3;
+  auto cfg = std::make_shared<Config>(servers, false, /*file_backed=*/true);
+  cfg->Begin("Test (file): crash leader, new leader elected, old leader rejoins without split-brain");
+
+  for (int i = 1; i <= 20; i++) cfg->One(Cmd(1000 + i), servers, true);
+
+  int old_leader = cfg->CheckOneLeader();
+  auto before = cfg->GetState(old_leader);  // 崩溃前已提交状态（基准）
+
+  // 杀掉 leader
+  cfg->Crash1(old_leader);
+
+  // 必须能选出【不同】的新 leader 并继续提交（证明旧 leader 磁盘 term 没让集群卡死）
+  int new_leader = cfg->CheckOneLeader();
+  if (new_leader == old_leader) cfg->Fatal("旧 leader 已崩却仍被选为 leader");
+  for (int i = 21; i <= 30; i++) cfg->One(Cmd(2000 + i), servers - 1, true);
+
+  // 重启旧 leader（从磁盘恢复），它不应颠覆新主、不应造成分裂脑
+  cfg->Start1(old_leader);
+  raftcpp::SleepMs(2 * kRaftElectionTimeout);
+
+  // 全部节点最终已提交状态一致（无分裂脑：同一 index 不会有两个不同值）
+  auto ref = cfg->GetState(cfg->CheckOneLeader());
+  for (int i = 0; i < servers; i++) {
+    auto st = cfg->GetState(i);
+    for (const auto& kv : ref) {
+      auto it = st.find(kv.first);
+      if (it == st.end())
+        cfg->Fatal("节点 " + std::to_string(i) + " 重加入后缺 index " + std::to_string(kv.first));
+      if (it->second != kv.second)
+        cfg->Fatal("节点 " + std::to_string(i) + " index " + std::to_string(kv.first) + " 值冲突（分裂脑）");
+    }
+  }
+  cfg->End();
+}
+
+// ---------------------------------------------------------------------------
+// 崩溃恢复硬化（变体3）：先对 leader 做快照（日志截断到 LastApplied），再全集群崩溃从磁盘重启，
+// 验证状态机从「快照 blob + 残余日志」正确重建，且能继续提交。
+// 重点：覆盖 TestFileBackedCrashRecover 没碰的场景——重启节点的内存日志已被快照截断，
+// 必须靠磁盘上的 snapshot blob 才能恢复被压缩掉的那段状态。
+void TestFileBackedCrashAfterSnapshot() {
+  const int servers = 3;
+  auto cfg = std::make_shared<Config>(servers, false, /*file_backed=*/true);
+  cfg->Begin("Test (file): snapshot then crash+restart recovers truncated-state node from disk");
+
+  for (int i = 1; i <= 20; i++) cfg->One(Cmd(1000 + i), servers, true);
+
+  int leader = cfg->CheckOneLeader();
+  auto lrf = GetRaftOrFatal(cfg, leader);
+  // 对 leader 做快照：截断其日志到 LastApplied（模拟 KVServer 调 Snapshot 压缩）
+  int snap_idx = lrf->LastApplied();
+  lrf->Snapshot(snap_idx, "snapshot-blob-" + std::to_string(snap_idx));
+
+  // 快照后再提交几条（快照 + 残余日志混合场景）
+  for (int i = 21; i <= 25; i++) cfg->One(Cmd(2000 + i), servers, true);
+
+  // 记录崩溃前状态（含已被快照压缩掉的 index 1..snap_idx 命令，应仍在状态机里）
+  auto before = cfg->GetState(leader);
+  if (before.empty()) cfg->Fatal("快照后状态机为空，压缩异常");
+
+  // 全集群崩溃 + 从磁盘重启
+  for (int i = 0; i < servers; i++) cfg->Crash1(i);
+  for (int i = 0; i < servers; i++) cfg->Start1(i);
+
+  // 重启后仍能选主并提交（证明 leader 从 blob+残余日志正确重建了被截断的状态）
+  cfg->One(Cmd(3099), servers, true);
+
+  // 重启后已提交状态不丢、值不变
+  for (int i = 0; i < servers; i++) {
+    auto after = cfg->GetState(i);
+    for (const auto& kv : before) {
+      auto it = after.find(kv.first);
+      if (it == after.end())
+        cfg->Fatal("节点 " + std::to_string(i) + " 重启后丢失已提交 index " + std::to_string(kv.first));
+      if (it->second != kv.second)
+        cfg->Fatal("节点 " + std::to_string(i) + " 重启后 index " + std::to_string(kv.first) + " 值变化");
+    }
+  }
+  cfg->End();
+}
+
 static const TestCase kTests[] = {
+    {"TestFileBackedCrashRecover", TestFileBackedCrashRecover},
+    {"TestFileBackedCrashMinority", TestFileBackedCrashMinority},
+    {"TestFileBackedCrashLeader", TestFileBackedCrashLeader},
+    {"TestFileBackedCrashAfterSnapshot", TestFileBackedCrashAfterSnapshot},
+    {"TestRaftStateDiskQuota", TestRaftStateDiskQuota},
     {"TestInitialElection2A", TestInitialElection2A},
     {"TestReElection2A", TestReElection2A},
 

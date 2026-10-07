@@ -101,9 +101,15 @@ case "$PART" in
       TestFigure8Unreliable2C
       TestReliableChurn2C
       TestUnreliableChurn2C
+
+      TestFileBackedCrashRecover
+      TestFileBackedCrashMinority
+      TestFileBackedCrashLeader
+      TestFileBackedCrashAfterSnapshot
     ) ;;
   3A)
     TESTS=(
+      TestKVDiskFullBurstThrottle
       TestKVRedirectLeaderId
       TestKVBackpressureBusy
       TestKVSessionsEviction
@@ -132,16 +138,16 @@ case "$PART" in
     ) ;;
   3B)
     TESTS=(
-      # TestSnapshotRPC3B
-      # TestSnapshotSize3B
-      # TestSnapshotRecover3B
-      # TestSnapshotRecoverManyClients3B
-      # TestSnapshotUnreliable3B
+      TestSnapshotRPC3B
+      TestSnapshotSize3B
+      TestSnapshotRecover3B
+      TestSnapshotRecoverManyClients3B
+      TestSnapshotUnreliable3B
       TestSnapshotMultiChunk3B
       TestSnapshotMultiChunkUnreliable3B
-      # TestSnapshotUnreliableRecover3B
-      # TestSnapshotUnreliableRecoverConcurrentPartition3B
-      # TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable3B
+      TestSnapshotUnreliableRecover3B
+      TestSnapshotUnreliableRecoverConcurrentPartition3B
+      TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable3B
     ) ;;
   ChunkedSnapshotTransmit)
     TESTS=(
@@ -181,33 +187,33 @@ case "$PART" in
     ) ;;
   Membership)
     TESTS=(
-      # TestSingleNodeConfChange
-      # TestNoRemovingLastVoter
-      # TestLearnerCatchup
-      # TestLearnerAvailabilityWin
-      # TestMembershipPersistAcrossRestart
-      # TestLearnerNeverLeader
-      # TestLearnerPersistAcrossRestart
-      # TestConfChangeChurn
-      # TestRemoveLeaderSelf
-      # TestInstallSnapshotRestoresMembership
-      # TestConcurrentConfChangeLinearizable
-      # TestLearnerCatchupWithChurn
-      # TestConfChangeMidCrash
-      # TestRemovedNodeExcludedFromQuorum
-      # TestMembershipConsistencyAtQuiescence
-      # TestReadIndexDuringConfChange
-      # TestLearnerDirectlyRemoved
-      # TestPromoteLaggingLearnerSafe
-      # TestStartRejectedForNonVoter
-      # TestInstallSnapshotRestoresRemovedRole
-      # TestRemovedNodeStopsReceivingReplication
-      # TestRemovedNodeStaysQuiescentAfterRemoval
+      TestSingleNodeConfChange
+      TestNoRemovingLastVoter
+      TestLearnerCatchup
+      TestLearnerAvailabilityWin
+      TestMembershipPersistAcrossRestart
+      TestLearnerNeverLeader
+      TestLearnerPersistAcrossRestart
+      TestConfChangeChurn
+      TestRemoveLeaderSelf
+      TestInstallSnapshotRestoresMembership
+      TestConcurrentConfChangeLinearizable
+      TestLearnerCatchupWithChurn
+      TestConfChangeMidCrash
+      TestRemovedNodeExcludedFromQuorum
+      TestMembershipConsistencyAtQuiescence
+      TestReadIndexDuringConfChange
+      TestLearnerDirectlyRemoved
+      TestPromoteLaggingLearnerSafe
+      TestStartRejectedForNonVoter
+      TestInstallSnapshotRestoresRemovedRole
+      TestRemovedNodeStopsReceivingReplication
+      TestRemovedNodeStaysQuiescentAfterRemoval
       TestMembershipFuzzChurn
-      # TestConfChangeFromMinorityLeader
-      # TestLearnerReadIndexRejected
-      # TestVoteCountIgnoresRemovedVoters
-      # TestRemovedFreezeCoversBothSources
+      TestConfChangeFromMinorityLeader
+      TestLearnerReadIndexRejected
+      TestVoteCountIgnoresRemovedVoters
+      TestRemovedFreezeCoversBothSources
     ) ;;
   MaxMessageSize)
     TESTS=(
@@ -215,6 +221,7 @@ case "$PART" in
       TestRpcMaxMessageBytes
       TestRemovedNodeQuiesces
       TestAppendEntriesMaxBytesPerRpc
+      TestRaftStateDiskQuota
     ) ;;
   *)
     echo "未知 part: ${PART}（只支持 2A/2B/2C/3A/3B/ChunkedSnapshotTransmit/CheckQuorum/ReadIndex/Membership/MaxMessageSize）" >&2

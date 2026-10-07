@@ -125,7 +125,7 @@ void Config::StartServer(int i) {
     if (saved_[i]) {
       saved_[i] = saved_[i]->Copy();
     } else {
-      saved_[i] = raft::MakePersister();
+      saved_[i] = labgob::MakePersister();
     }
     persister = saved_[i];
   }  // ---- 释放锁再建 KVServer（StartKVServer 会起线程）----

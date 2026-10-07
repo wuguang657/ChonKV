@@ -4,9 +4,40 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <dirent.h>
 
 namespace raft {
+using namespace labgob;
 
+static std::atomic<int> g_cfg_seq{0};
+static void RemoveTree(const std::string& path) {
+  DIR* d = ::opendir(path.c_str());
+  if (!d) return;  // 目录不存在就当没东西可删
+  struct dirent* e;
+  while ((e = ::readdir(d)) != nullptr) {
+    std::string name = e->d_name;
+    if (name == "." || name == "..") continue;
+    std::string full = path + "/" + name;
+    struct stat st;
+    if (::stat(full.c_str(), &st) != 0) {
+      // stat 抓瞎（极罕见）：先 unlink 再 rmdir，只有一个会成功，覆盖文件/目录两种情况，不漏删
+      ::unlink(full.c_str());
+      ::rmdir(full.c_str());
+      continue;
+    }
+    if (S_ISDIR(st.st_mode)) {
+      RemoveTree(full);
+    } else if (::unlink(full.c_str()) != 0 && errno != ENOENT) {
+      std::fprintf(stderr, "RemoveTree: unlink %s failed (%s)\n", full.c_str(),
+                  std::strerror(errno));
+    }
+  }
+  ::closedir(d);
+  if (::rmdir(path.c_str()) != 0 && errno != ENOENT) {
+    std::fprintf(stderr, "RemoveTree: rmdir %s failed (%s)\n", path.c_str(),
+                std::strerror(errno));
+  }
+}
 // TSan 插桩令 raft 事件处理慢 5~15×。One() 内层等待（原始 2s）在成员变更 / 不可靠网
 // 场景下会被拖超，把“TSan 慢调度”误判成“日志达不成一致”——属于测试侧假阳性，
 // 而非 raft 逻辑 bug（TSan 本身也没报 data race，只报了 agreement 超时）。
@@ -31,8 +62,16 @@ constexpr double kOneOuterWaitSec = 10.0;
 // 构造 / 析构
 // ===========================================================================
 
-Config::Config(int n, bool unreliable) : n_(n) {
+Config::Config(int n, bool unreliable, bool file_backed) : n_(n), file_backed_(file_backed) {
   net_ = labrpc::MakeNetwork(); // 造一个全新的网络
+
+  // file-backed persister：仅文件模式需要；本场景建独立临时目录根（pid+seq 保证不重名）
+  if (file_backed_) {
+    raft_dir_base_ =
+        "/tmp/cpp6raft_" + std::to_string(::getpid()) + "_" + std::to_string(++g_cfg_seq);
+    labgob::MkdirAll(raft_dir_base_);
+  }
+
   apply_err_.assign(n, "");   // 按节点数n初始化为空字符串
   connected_.assign(n, false);
   saved_.assign(n, nullptr); // n块模拟硬盘
@@ -106,15 +145,6 @@ void Config::Crash1(int i) {
     if (rf) graves_.push_back(rf);  // 延后析构，等它自己的线程收工
   }
   if (rf) rf->Kill();
-  // 多此一举
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    if (saved_[i]) {
-      std::string raftlog = saved_[i]->ReadRaftState();
-      saved_[i] = std::make_shared<Persister>();
-      saved_[i]->SaveRaftState(raftlog);
-    }
-  }
 }
 
 // ===========================================================================
@@ -179,7 +209,12 @@ void Config::Start1(int i) {
     if (saved_[i]) {
       saved_[i] = saved_[i]->Copy();
     } else {
-      saved_[i] = MakePersister();
+      // 首次启动：按 harness 选定的模式造 persister
+      //   file_backed_  → 文件模式（每节点独立目录，落盘）
+      //   !file_backed_ → 内存模式（原行为，无磁盘 IO）
+      saved_[i] = file_backed_
+          ? MakePersister(raft_dir_base_ + "/node_" + std::to_string(i))
+          : MakePersister();
     }
     persister = saved_[i];
   }
@@ -610,6 +645,8 @@ void Config::Cleanup() {
     graves_.clear();
   }
   CheckTimeout();
+
+  if (!raft_dir_base_.empty()) RemoveTree(raft_dir_base_);
 }
 
 }  // namespace raft

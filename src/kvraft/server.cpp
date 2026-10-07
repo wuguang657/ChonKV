@@ -17,6 +17,13 @@ KVServer::KVServer(std::vector<std::shared_ptr<labrpc::ClientEnd>> peers, int me
   apply_ch_ = std::make_shared<raftcpp::Chan<raft::ApplyMsg>>();
   rf_ = std::make_shared<raft::Raft>(peers, me, persister, apply_ch_);
 
+  // ===== #2.2 磁盘水位：把 KVServer 的 maxraftstate_ 阈值同步给 raft =====
+  // 让 Start() 在水位超限时返回 disk_full（与老机制 PrepareSnapshotLocked 共用同一阈值）。
+  // maxraftstate_ <= 0 表示关闭快照，则 raft 不设上限（默认 0 = 不限制）。
+  if (maxraftstate_ > 0) {
+    rf_->SetMaxRaftStateBytes(static_cast<size_t>(maxraftstate_));
+  }
+
   // ======== T2/T3 修复 · 第 2 层：重启恢复 ========
   // 详见文件头注释。没有这一行，崩在"raft 已落盘 / KV 未安装"之间就会永久丢数据。
   // 【顺序必须早于 rf_->Start()】这是 3B 偶发丢数据的根因：Start() 一起后台线程，
@@ -195,6 +202,54 @@ bool KVServer::PrepareSnapshotLocked(int index, int* snap_index,
   return true;
 }
 
+// #2.2 磁盘水位节流/退避相关常量（文件作用域，仅本编译单元可见）。
+// 两次强制快照的最小间隔：强制快照要 encode 整个状态机 + blob 落盘 + 两次 fsync，极重。
+// disk_full 并发突发时若每个 WaitOp 都抢着快照会形成 fsync 风暴，反令磁盘更满、压缩更慢。
+// 50ms 上限 ≈ 每节点每秒至多 20 次快照，足够覆盖正常压缩，同时杜绝风暴。
+static constexpr auto kForceSnapMinInterval = std::chrono::milliseconds(50);
+// 单次 WaitOp 内 disk_full 重试上限（含初次）：退避后仍超限就交客户端（客户端自身会 20ms 退避重试）。
+static constexpr int kDiskFullMaxRetries = 4;
+// 重试间退避：指数增长、封顶，避免 tight loop；同时给 applier 机会把挂起 op 推进、缩短日志。
+static constexpr auto kDiskFullBackoffBase = std::chrono::milliseconds(2);
+static constexpr auto kDiskFullBackoffMax = std::chrono::milliseconds(50);
+
+// #2.2 磁盘水位：disk_full 时由 WaitOp 调用，强制压缩一次。
+// 不在里面再判 persister 阈值——disk_full 由「内存态 RaftStateSize」触发，可能与
+// 已落盘字节有短暂滞后；只要触发了就无条件压缩到 last_cmd_index_，保证重试时水位必降。
+// 锁内编码当前状态机（避免「撕裂」快照），锁外调 rf_->Snapshot（避免「持 KV 锁跨进 raft 锁」，
+// 同 applier 里的写法）。
+// ★ 节流：用 last_forced_snap_ns_ 的 CAS 限流，距上次快照不足 kForceSnapMinInterval 时直接跳过
+//   （状态已被别的线程的快照压缩过，再压一次只是纯浪费 I/O）。这样即便 N 个 WaitOp 同时 disk_full，
+//   整节点每 50ms 也至多落盘一次快照。
+void KVServer::ForceSnapshotOnDiskFull() {
+  const auto now = std::chrono::steady_clock::now();
+  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      now.time_since_epoch()).count();
+  const int64_t min_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      kForceSnapMinInterval).count();
+  int64_t prev = last_forced_snap_ns_.load(std::memory_order_relaxed);
+  // CAS 限流：仅当「距上次 ≥ 最小间隔」才抢到本次快照资格并更新时间戳；
+  // 否则（被并发线程抢先/刚刷新）循环重判，直到不满足间隔条件则退出、跳过本次快照。
+  while (now_ns - prev >= min_ns) {
+    // 当prev还等于last_forced_snap_ns_时，将now_ns写入last_forced_snap_ns_
+    if (last_forced_snap_ns_.compare_exchange_weak(prev, now_ns,
+            std::memory_order_relaxed)) {
+      int snap_index;
+      std::string blob;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        snap_index = last_cmd_index_;  // 边界：last_cmd_index_==0 时 rf_->Snapshot 被 index<=snapshot_index_ 守卫 no-op，不降水位，最终由 applier 自愈
+        blob = EncodeSnapshotLocked();
+      }
+      rf_->Snapshot(snap_index, blob);
+      forced_snap_count_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    // prev 被别的线程刷新，循环重判（可能已 < min_ns → 退出跳过）
+  }
+  // 未抢到资格：跳过本次快照（状态已由别的线程的快照压缩过）
+}
+
 std::map<std::string, std::string> KVServer::SnapshotStore() const {
   std::lock_guard<std::mutex> lk(mu_);
   return kv_store_;
@@ -301,6 +356,26 @@ Err KVServer::WaitOp(const Op& op, int* out_leader_id) {
   if (out_leader_id) *out_leader_id = -1;  // 默认"不知道 leader"
 
   raft::StartResult r = rf_->Start(op.Serialize());
+  // ---- #2.2 磁盘水位：提交时若水位超限，压缩后带节流+退避重试 ----
+  // 与老机制 PrepareSnapshotLocked 共用 maxraftstate_ 阈值：老机制在 apply 后被动触发，
+  // 这里在 Start() 主动拒绝、立刻走同一套「编码+锁外 Snapshot」压缩。
+  // - 压缩受 kForceSnapMinInterval 节流（ForceSnapshotOnDiskFull 内部 CAS 限流，杜绝 fsync 风暴）；
+  // - 仍超限则指数退避重试若干次，给 applier 把挂起 op 推进、缩短日志的机会，
+  //   避免一上来就 kBusy 把压力甩回客户端。退避后仍超限才交客户端（客户端自身会 20ms 退避重试）。
+  if (r.disk_full) {
+    for (int attempt = 0; attempt <= kDiskFullMaxRetries; ++attempt) {
+      ForceSnapshotOnDiskFull();  // 内部节流：不足间隔自动跳过，不会每次都真落盘
+      r = rf_->Start(op.Serialize());
+      if (!r.disk_full) break;    // 压缩生效，跳出重试
+      if (dead_.load()) return Err::kWrongLeader;  // 服务器被 Kill，别再耗着
+      if (attempt < kDiskFullMaxRetries) {
+        const auto backoff = std::min(kDiskFullBackoffBase * (1 << attempt),
+                                      kDiskFullBackoffMax);
+        std::this_thread::sleep_for(backoff);
+      }
+    }
+    if (r.disk_full) return Err::kBusy;  // 退避后仍超限（极端单条/并发堆积）→ 交客户端稍后重试
+  }
   // ---- C1 背压：我是 leader 但被限流 → 返回 kBusy ----
   // 关键点：之前这里只判 !r.is_leader，会把"背压限流"也当成 kWrongLeader，
   // 客户端于是换台重试 —— 但背压恰恰发生在 leader 身上，换台毫无意义，

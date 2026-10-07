@@ -25,14 +25,7 @@
 - **实现要点**：`InstallSnapshotArgs` 加 `offset` / `data` / `done` / `chunk_size`；follower 侧按 offset 追加写临时文件，收到 `done` 校验 CRC 后原子 rename。参考 etcd 的 `snap.Message`（带 `index/term/offset/data/done`）。
 - **验收**：造 1GB 状态机，能稳定传完并 install。
 
-### 2.2 日志无界增长 / 磁盘水位保护
-
-- **现状**：快照触发完全靠上层 KVServer 调 `Snapshot()`（按 `RaftStateSize()` 阈值），**Raft 层自身没有任何保护**。上层没调/调不动，日志就无限涨。
-- **生产后果**：磁盘写满 → 整个节点崩溃，且无法自愈（重启要 replay 巨量日志）。
-- **实现要点**：Raft 层加磁盘水位检查（日志大小 > 阈值时**拒绝新写入 / 返回 ErrDiskFull** 而不是继续吞）、快照频率节流（两次快照最小间隔）、快照失败重试退避。
-- **验收**：写满磁盘时集群降级为"只读"而不是崩溃。
-
-### 2.3 RPC 消息完整性校验（CRC）
+### 2.2 RPC 消息完整性校验（CRC）
 
 - **现状**：各 Args/Reply 的 `Serialize/Deserialize`（`raft.cpp:46-155`）**没有任何校验和**。网络层（`labrpc`）也不校验。
 - **生产后果**：真实网络上 bit flip / 截断包会被当成合法数据解析 → 状态机静默损坏，且极难排查。
@@ -166,11 +159,7 @@
 
 # 六、实施路线图（建议顺序）
 
-**第一批（P0，安全性，不做就不能叫生产）**
-
-- [ ] 日志/磁盘水位保护（#2.2，未做，且属持久化范畴）
-
-**第二批（P0，持久化）**  
+**第一批（P0，持久化）**  
 6\. [ ] macOS 跑通 tiny-lsm  
 7\. [ ] `LogStore` 接口重构（纯重构，测试全绿）  
 8\. [ ] `SegmentLogStore` 落盘 + CRC + group commit  
@@ -178,10 +167,10 @@
 10\. [ ] 状态机接 tiny-lsm（走事务 API）  
 11\. [ ] 快照：flush_all + 导出 → checkpoint
 
-**第三批（P1，可用性与性能）**  
+**第二批（P1，可用性与性能）**  
 12\. [ ] 快照分块流式传输（#8，未做）  
 
-**第四批（P2，工程成熟度）**  
+**第三批（P2，工程成熟度）**  
 13\. [ ] 可观测性：metrics（term / commit / apply lag / log size / snapshot 大小 / RPC 延迟）+ 结构化日志  
 14\. [ ] 混沌测试 / 故障注入（在现有 tester 基础上加）  
 15\. [ ] 锁粒度优化
@@ -226,7 +215,7 @@
 ## A. 仍有效的部分（保留原文，未过期）
 
 - **§4 tiny-lsm 分析**（4.0–4.5）：持久化层对接分析与 4 个坑仍有效（WAL 仅事务路径写、前台 compaction 阻塞、无 Manifest、`WAL::flush()` 空实现）。
-- 以下"确仍缺失/未做"的小节结论正确，已在 §九.C 清单中保留：§2.1 快照分块、§2.2 磁盘水位、§2.3 CRC、§3.2 锁粒度。
+- 以下"确仍缺失/未做"的小节结论正确，已在 §九.C 清单中保留：§2.1 快照分块、§2.2 CRC、§3.2 锁粒度。
 
 ## B. 剔除「持久化 + 网络」后的剩余待做清单（2026-10-01）
 
@@ -295,3 +284,15 @@
 ---
 
 *—— 本节由 WorkBuddy 于 2026-10-02 基于代码实核查补，非推测。*
+
+---
+
+## E. 变更记录
+
+- **2026-10-07**：「日志无界增长 / 磁盘水位保护」（原 §2.2、原第一批 P0）**已落地并验证通过**，从待办清单移除（文档已删条目并顺延编号）。落地清单（桌面实核）：
+  - Raft 层水位检查：`Start()` / `ProposeConfChangeTo()` 在提交前判 `RaftStateSize ≥ max_raft_state_bytes_` 即返回 `disk_full`（`raft.cpp:1160` / `:2227`，均在 `push_back` 之前，重试不重复 append）；
+  - KVServer 接线：`server.cpp:24` 设配额、`WaitOp` 收到 `disk_full` 调 `ForceSnapshotOnDiskFull()`（`:367`），压缩后仍满返 `kBusy`（`:377`）；
+  - 快照频率节流：CAS 限流 `kForceSnapMinInterval = 50ms`（`server.cpp:209` / `:235`），任意 50ms 窗口至多一次真落盘，杜绝 fsync 风暴；
+  - 失败重试退避：有界 `for(≤5 轮)` + 指数退避 2/4/8/16ms 封顶 50ms（`server.cpp:366-374`）；
+  - 护栏用例：`TestKVDiskFullBurstThrottle`（`test_kvraft.cpp:470`，注册 `:2311`），负向对照证明是真护栏。
+  - 编号顺延：原 §2.3 CRC → §2.2；路线图「第二批/第三批/第四批」→「第一批/第二批/第三批」。

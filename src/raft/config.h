@@ -28,7 +28,7 @@
 #include "../common/chan.h"
 #include "../common/util.h"
 #include "../labrpc/labrpc.h"
-#include "persister.h"
+#include "../labgob/persister.h"
 #include "raft.h"
 
 namespace raft {
@@ -54,7 +54,8 @@ struct TestFailure : std::exception {
 
 class Config {
  public:
-  Config(int n, bool unreliable);
+  // file_backed: true=文件模式(落盘, 每节点独立目录); false=内存模式(原行为, 无磁盘IO)
+  Config(int n, bool unreliable, bool file_backed = true);
   ~Config();
 
   Config(const Config&) = delete;
@@ -118,7 +119,9 @@ class Config {
   mutable std::mutex mu_;
   int n_ = 0;
   std::shared_ptr<labrpc::Network> net_;
-
+  std::string raft_dir_base_;
+  bool file_backed_ = false;  // 由构造函数参数设定；false=内存模式, true=文件模式
+  
   std::vector<std::shared_ptr<Raft>> rafts_;
   // 被 crash 掉的实例：它的后台线程可能还在跑，不能立刻析构，
   // 先放这儿，等 Cleanup() 里等线程收工再一起释放。

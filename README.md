@@ -12,13 +12,16 @@ KV-Raft application layer. It started from the MIT 6.824 (2020) course scaffoldi
 been extended well beyond the original labs. It passes the full Lab 2 suite
 (election / log replication / persistence / snapshots) and Lab 3 suite (linearizable KV
 service with snapshots), and adds **Pre-Vote**, **CheckQuorum leader step-down**,
-**ReadIndex + Lease read**, and **dynamic cluster membership change** (learner role, Q2
-removal freeze). The test suite ships **73 Raft tests + 34 KV tests (107 total)**, including a
+**ReadIndex + Lease read**, **dynamic cluster membership change** (learner role, Q2
+removal freeze), **chunked snapshot streaming**, and **log/disk watermark protection**.
+The test suite ships **81 Raft tests + 37 KV tests (118 total)**, including a
 `porcupine`-style linearizability checker, a ThreadSanitizer/ASan/UBSan build matrix, and a
 parallel stress harness (`test_part.sh`).
 
-> Persistence and transport layers are still in-memory / simulated — see
-> [Roadmap](#roadmap--known-gaps) for the productionization gaps.
+> **Persistence**: the Raft layer supports **two modes** — **file-backed (default**,
+> crash-safe on-disk via `tmp → fsync → rename → fsync(dir)`) and **in-memory**. See
+> [持久化模式开关](#持久化模式开关) for the exact switch location.
+> **Transport** is still simulated by `labrpc` (no real network).
 
 ### Build & test in 30 seconds
 
@@ -38,11 +41,15 @@ MIT 6.824（2020）的课程框架，但实现已经显著超出原 lab 范围�
 - 共识核完整覆盖 **Lab 2A~2D**（领导者选举、日志复制、崩溃恢复持久化、快照压缩）；
 - KV 层覆盖 **Lab 3A/3B**（线性一致 KV 服务 + 快照）；
 - 额外自研了多项**生产向**特性（见下）；
-- 配套 **107 条测试**（Raft 73 + KV 34），含 porcupine 线性化校验、TSan/ASan/UBSan
+- 配套 **118 条测试**（Raft 81 + KV 37），含 porcupine 线性化校验、TSan/ASan/UBSan
   构建矩阵，以及进程级并发压测脚本（`test_part.sh`）。
 
-> ⚠️ 当前**持久化层（Persister）仍是纯内存**、**传输层（labrpc）仍是软件模拟**，
-> 真实落盘 / 真实网络尚未接入——详见下方路线图。
+> ✅ **持久化层**：Raft 层已支持**双模式** —— **文件模式（默认**，崩溃安全落盘
+> `tmp → fsync → rename → fsync(dir)`）与**内存模式**，开关位置见
+> [持久化模式开关](#持久化模式开关)。
+>
+> ⚠️ **传输层（labrpc）仍是软件模拟**，真实网络尚未接入；KV 测试脚手架的 Persister
+> 目前固定为内存模式（详见开关一节）——详见下方路线图。
 
 ---
 
@@ -72,6 +79,10 @@ MIT 6.824（2020）的课程框架，但实现已经显著超出原 lab 范围�
 | **动态成员变更** | 单飞闸（single-flight）+ 最后 voter 阀门，保证变更期间不丢 Majority |
 | **Learner 三态成员** | `kVoter / kLearner / kRemoved`，Learner 不计票、可追平后提拔 |
 | **Q2 移除冻结** | 被移除节点日志硬冻结在移除配置条目下标，不泄漏后续条目（机密隔离） |
+| **文件持久化（双模式）** | `Persister` 支持内存 / 文件两态；文件模式走崩溃安全写 `tmp → fsync → rename → fsync(dir)`，落盘 `raft_state.bin` + `snapshot.bin`，**默认开启** |
+| **日志 / 磁盘水位保护** | `Start()` 提交前判 `RaftStateSize ≥ maxraftstate` → 返回 `disk_full`，上层强制压缩后重试；与老快照机制共用同一阈值 |
+| **快照节流 + 指数退避** | 强制快照走 CAS 限流（任意 50ms 窗口至多一次真落盘，防并发突发下的 fsync 风暴）+ `WaitOp` 指数退避（2/4/8/16ms，封顶 50ms） |
+| **分块快照流式传输** | `InstallSnapshot` 按 `kSnapshotChunkSize` 分块（offset / done / crc / chunk_size），避免大 blob 一次性顶穿收发两端内存 |
 
 **工程质量**
 
@@ -81,6 +92,86 @@ MIT 6.824（2020）的课程框架，但实现已经显著超出原 lab 范围�
 - `std::chrono::steady_clock` 单调时钟（租约不受墙钟 NTP 回跳影响）
 - **多档构建矩阵**：Debug / Release / LTO，加 TSan / ASan / UBSan 任意组合
 - **并发压测 harness**：每条用例独立进程、换种子多轮、日志分文件、可并发
+
+---
+
+## 持久化模式开关（内存 / 文件）
+
+Raft 的持久化层 `Persister`（`src/labgob/persister.h`）有两种模式，**开关只有一个参数**：
+
+| 模式 | 含义 | 是否落盘 | 怎么开 |
+|---|---|---|---|
+| **文件模式**（**默认**） | 每个节点一个独立目录，持久化真写盘 | ✅ `raft_state.bin` + `snapshot.bin` | `file_backed = true` |
+| **内存模式** | 原 lab 行为，纯内存，零磁盘 I/O | ❌ 不落盘 | `file_backed = false` |
+
+### ① 全局开关：改一行默认值（raft 测试脚手架）
+
+```cpp
+// src/raft/config.h:58
+Config(int n, bool unreliable, bool file_backed = true);
+//                                              ^^^^ 默认值：true = 文件模式
+```
+
+把 `true` 改成 `false`，整个 `raft_test` 全部用例就切回内存模式；改回 `true` 即恢复文件模式。
+**这是最省事的切换方式：一行改完全局。**
+
+### ② 单条用例覆盖：构造 Config 时显式传参
+
+```cpp
+auto cfg = std::make_shared<Config>(servers, /*unreliable=*/false, /*file_backed=*/false);
+```
+
+第三个参数显式给值即可覆盖默认值（个别用例想单独走内存模式时用）。
+
+### ③ 更底层：直接选 Persister 工厂
+
+```cpp
+// src/labgob/persister.h:293 / :298
+auto p_mem  = labgob::MakePersister();                    // 内存模式（无参数版本）
+auto p_file = labgob::MakePersister("/tmp/xxx/node_0");   // 文件模式（传目录）
+```
+
+### 文件模式把数据写到哪？
+
+根目录由测试脚手架按 `pid + 序号` 生成，**每节点一个子目录**：
+
+```
+/tmp/cpp6raft_<pid>_<seq>/          ← 根目录，src/raft/config.cpp:70-71
+    ├── node_0/
+    │   ├── raft_state.bin          ← term / votedFor / log
+    │   └── snapshot.bin            ← 快照 blob
+    ├── node_1/
+    └── copy_<seq>/                 ← 崩溃重启时 Copy() 出的目录副本
+```
+
+- `Cleanup()` 时整棵树由 `RemoveTree()` 递归删掉，不会在 `/tmp` 留垃圾。
+- 崩溃重启用例（`Crash1` + `Start1`）会 `Copy()` 出一份**目录副本**，保证旧实例的
+  残留线程改不到新实例的数据。副本名是扁平的 `copy_<seq>`（刻意不沿用源目录名，
+  否则反复重启会逐层嵌套、撑爆 `NAME_MAX=255`）。
+
+### 落盘失败会怎样？
+
+**直接 `std::abort()`（fail-stop），绝不"假装写成了"**。这是 Raft 铁律：持久化成功前
+不可提交，写不下去还继续跑会基于幽灵写入推进 `commitIndex` —— 那种情况下崩溃才是
+正确行为（宁崩不撒谎）。见 `persister.h` 的 `SaveRaftState` / `SaveStateAndSnapshot` /
+`SaveSnapshotOnly`。
+
+> 说明：测试 harness 模拟的是**进程崩溃重启**（`Crash1` + `Start1`），不是真实断电；
+> 但写路径本身（`tmp → fsync → rename → fsync(目录)`）是掉电安全的。
+
+### ⚠️ KV 测试目前固定为内存模式（开关尚未接线）
+
+`kvraft::Config` **没有** `file_backed` 参数（`src/kvraft/config.h:27`），`StartServer()`
+里固定调用无参工厂：
+
+```cpp
+// src/kvraft/config.cpp:128
+saved_[i] = labgob::MakePersister();   // ← 内存模式
+```
+
+所以 **KV 侧（3A / 3B）跑的是内存持久化**。若想让 KV 也走文件模式，需自行给
+`kvraft::Config` 加一个 `file_backed` 参数并透传到 `StartServer()`（约 3 处改动：
+`config.h` 构造函数签名、`config.cpp` 构造函数、`StartServer` 里的工厂调用）。
 
 ---
 
@@ -98,8 +189,8 @@ cpp-6.824/
 │   │   └── test_kvraft.cpp
 │   └── tinylsm/          # ⚠️ WIP：LSM 存储引擎，尚未接入构建（见路线图）
 ├── doc/                  # 设计 / 差距分析文档（深度，建议阅读）
-│   ├── 1-生产级差距与路线图.md
-│   └── 2-Raft生产化差距清单-含偶数节点与LSM持久化.md
+│   ├── 1-Raft生产化差距清单-含偶数节点与LSM持久化.md
+│   └── 2-快照分块生产化改造清单.md
 ├── patches/              # 已落地的加固补丁（raft/kv 各 fix，含 ReadIndex 相关）
 ├── CMakeLists.txt        # 构建定义（raft_test / kv_test / labrpc_selftest）
 ├── build.sh              # 一键编译 + 跑测试（支持全套构建变体）
@@ -162,32 +253,34 @@ cmake --build build -j
 
 ## 测试 / Testing
 
-### 测试套件构成（实测 107 条）
+### 测试套件构成（实测 118 条）
 
-**Raft（`raft_test`，73 条）**
+**Raft（`raft_test`，81 条）**
 
 | 分组 | 数量 | 内容 |
 |---|---:|---|
+| Ext · 文件持久化 / 磁盘水位 | 5 | FileBackedCrashRecover / CrashMinority / CrashLeader / CrashAfterSnapshot / RaftStateDiskQuota |
 | 2A 选举 | 2 | InitialElection / ReElection |
 | 2B 日志复制 | 8 | BasicAgree / RPCBytes / FailAgree / FailNoAgree / ConcurrentStarts / Rejoin / Backup / Count |
 | 2C 持久化 | 8 | Persist1/2/3 / Figure8 / UnreliableAgree / Figure8Unreliable / ReliableChurn / UnreliableChurn |
 | 2D 快照 | 4 | SnapshotTruncatesLog / InstallSnapshotCatchUp / SnapshotRestart / SnapshotStateMachine |
+| Ext · 分块快照 | 2 | ChunkedSnapshotTransmit / ChunkedSnapshotLargeStateMachine |
 | Ext · CheckQuorum | 7 | 生产向：leader 隔离主动退位、不误杀、分区稳定 |
 | Ext · ReadIndex | 14 | 线性一致读 / 防脏读 / 并发合并 / 快照追赶 / 不可靠网 |
 | Ext · Membership | 27 | 单飞闸 / Learner 提拔 / Q2 冻结 / 并发变更 fuzz / 移除节点隔离 |
-| Ext · MaxMessageSize | 3 | 未提交背压 / 最大消息字节 / 移除节点静默 |
-| **合计** | **73** | |
+| Ext · C1 / C3 / C5 | 4 | 未提交背压 / 最大消息字节 / 单条 AE 字节上限 / 移除节点静默 |
+| **合计** | **81** | |
 
-**KV（`kv_test`，34 条，含 1 个平时跳过的调试入口）**
+**KV（`kv_test`，37 条，含 1 个平时跳过的调试入口）**
 
 | 分组 | 数量 | 内容 |
 |---|---:|---|
-| 3A 基础/分区/并发 | 9 | Basic / Concurrent / Unreliable / OneKey / OnePartition / ManyPartitions×1 / ManyPartitions×Many / KVRedirectLeaderId / KVBackpressureBusy |
+| 3A 基础/重定向/背压 | 10 | Basic / Concurrent / Unreliable / OneKey / OnePartition / ManyPartitions×2 / KVRedirectLeaderId / KVBackpressureBusy / KVDiskFullBurstThrottle |
 | 3A Sessions/FollowerRead | 10 | KVSessions(Eviction/SnapshotRoundTrip/Determinism/Fence/ClientProtocol/Tombstone×2/FollowerRead) / ConcurrentFollowerReadUnreliable / FollowerReadAfterSnapshot |
 | 3A 持久化专项 | 6 | PersistOneClient / PersistConcurrent / PersistConcurrentUnreliable / PersistPartition / PersistPartitionUnreliable / PersistPartitionUnreliableLinearizable |
-| 3B 快照 | 8 | SnapshotRPC / SnapshotSize / Recover / RecoverManyClients / Unreliable / UnreliableRecover / UnreliableRecoverConcurrentPartition / UnreliableRecoverConcurrentPartitionLinearizable |
+| 3B 快照 | 10 | SnapshotRPC / SnapshotSize / MultiChunk×2 / Recover / RecoverManyClients / Unreliable / UnreliableRecover / UnreliableRecoverConcurrentPartition / Linearizable |
 | 调试入口 | 1 | kv_mini_lin_dup（设 `KV_MINI_LIN=1` 才跑，平时 skip） |
-| **合计** | **34** | |
+| **合计** | **37** | |
 
 > 注：大量 KV 用例以 lambda 包 `GenericTest(...)` 注册进 `kTests[]`（如
 > `TestSnapshotUnreliable3B` = `GenericTest("3B", 5, true, false, false, 1000)`），
@@ -212,6 +305,8 @@ cmake --build build -j
 ./build.sh 3A               # 跑 KV 3A 全部分组
 ./build.sh CheckQuorum      # 只跑 Ext: CheckQuorum 7 条
 ./build.sh Membership       # 只跑 Ext: Membership 27 条
+./build.sh FileBacked       # 只跑文件持久化崩溃恢复 4 条（需文件模式，默认即是）
+./build.sh DiskQuota        # 只跑磁盘水位保护用例 TestRaftStateDiskQuota
 ```
 
 ### 并发压测：`test_part.sh`
@@ -312,8 +407,8 @@ RAFT_LOG=1 ./build/raft_test 2B # 3. 看不清状态机？开 trace
 
 更深入的设计与差距分析见 [`doc/`](./doc)：
 
-- [`doc/1-生产级差距与路线图.md`](./doc/1-生产级差距与路线图.md) — 当前实现 vs etcd/TiKV 的结构性差距与落地路线
-- [`doc/2-Raft生产化差距清单-含偶数节点与LSM持久化.md`](./doc/2-Raft生产化差距清单-含偶数节点与LSM持久化.md) — 偶数节点 majority、LSM 持久化、快照分块、流水线、磁盘水位等专项清单
+- [`doc/1-Raft生产化差距清单-含偶数节点与LSM持久化.md`](./doc/1-Raft生产化差距清单-含偶数节点与LSM持久化.md) — 当前实现 vs etcd/TiKV 的结构性差距与落地路线（偶数节点 majority、LSM 持久化、磁盘水位等专项清单）
+- [`doc/2-快照分块生产化改造清单.md`](./doc/2-快照分块生产化改造清单.md) — 分块快照（`kSnapshotChunkSize`）从 lab 形态到生产态的改造清单
 
 几处比原版 lab 更生产化的实现（已在代码中落实）：
 

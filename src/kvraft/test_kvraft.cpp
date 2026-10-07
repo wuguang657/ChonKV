@@ -455,6 +455,106 @@ void TestKVBackpressureBusy() {
 }
 
 // ===========================================================================
+// 生产化：disk_full 并发突发护栏 —— 验证快照节流（防 fsync 风暴）
+// ===========================================================================
+// 背景：disk_full 突发时若每个 WaitOp 都抢着快照，会形成 fsync 风暴，反令磁盘更满、
+// 压缩更慢。ForceSnapshotOnDiskFull 用 CAS 限流（每 50ms 至多一次真落盘）来防。
+//
+// 本用例在「小 maxraftstate + 16 客户端并发高频 Put」下把 leader 持续顶在 disk_full
+// 状态，然后断言两件事：
+//   1) 不超时：整体在 HARD_TIMEOUT 内完成（WaitOp 自带 1s 硬超时，单个 op 不会永久阻塞，
+//      故客户端线程必然退出；此断言拦住"风暴导致整体卡死/极慢"的退化）。
+//   2) 节流生效（核心、确定性断言）：真正落盘的快照次数被钉死在
+//      ≤ 耗时/50ms + 余量。若无节流，每个 disk_full 的 WaitOp 各做一次快照，次数将
+//      正比于 disk_full 突发事件数（远超此上限）—— 这正是"fsync 风暴 / 写爆"的特征。
+void TestKVDiskFullBurstThrottle() {
+  const int nservers = 3;
+  const int nclients = 16;
+  const int ops_per_client = 120;  // 共 1920 次 Put，足以把 leader 持续顶在 disk_full
+  const int maxraftstate = 1000;   // 小阈值 → 频繁触发 disk_full 路径
+  const int64_t kHardTimeoutMs = 180000;  // 整体硬上限（仅拦住极端退化）
+
+  Config cfg(nservers, /*unreliable=*/false, maxraftstate);
+  cfg.Begin("Test: disk_full burst is throttled (no fsync storm)");
+
+  int leader = -1;
+  if (!WaitForLeader(cfg, &leader)) {
+    cfg.Cleanup();
+    Fatal("no leader elected");
+  }
+
+  // 并发突发：16 个客户端各自高频 Put 到不同 key（最大化并发与总 op 数）。
+  // 每个 Put 经 Clerk，遇 kBusy/kWrongLeader 会自行重试，最终 exactly-once。
+  std::vector<std::thread> threads;
+  for (int cli = 0; cli < nclients; cli++) {
+    threads.emplace_back([&, cli] {
+      auto ck = cfg.MakeClient(cfg.All());
+      for (int n = 0; n < ops_per_client; n++) {
+        std::string key = "k_" + std::to_string(cli) + "_" + std::to_string(n);
+        std::string val = "v" + std::to_string(cli) + "_" + std::to_string(n);
+        DoPut(&cfg, ck.get(), key, val);
+      }
+    });
+  }
+
+  const auto t0 = std::chrono::steady_clock::now();
+  for (auto& t : threads) t.join();
+  const auto t1 = std::chrono::steady_clock::now();
+  const int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      t1 - t0).count();
+
+  // 断言 1：不超时（防整体卡死/极慢）
+  if (elapsed_ms > kHardTimeoutMs) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "disk_full burst took %lldms > hard timeout %lldms — "
+                  "possible fsync storm / livelock",
+                  static_cast<long long>(elapsed_ms),
+                  static_cast<long long>(kHardTimeoutMs));
+    Fatal(buf);
+  }
+
+  // 统计所有副本真正落盘的快照次数（正常网络下 leader 稳定，但求和更稳健）
+  int64_t snap_count = 0;
+  for (int i = 0; i < nservers; i++)
+    snap_count += cfg.kvserver(i)->ForcedSnapCountForTest();
+
+  // 断言 2a：disk_full 路径确实被走到（否则本测试毫无意义）
+  if (snap_count <= 0) {
+    Fatal("ForcedSnapCountForTest==0: disk_full snapshot path was never taken "
+          "(test would be vacuous)");
+  }
+
+  // 断言 2b（核心）：实际物理快照次数被钉死在 ≤ 时间窗/50ms + 余量。
+  // 节流器保证任意 50ms 窗口至多一次真落盘，故上限仅取决于耗时；
+  // 若节流被破坏，次数将正比于并发 disk_full 事件数（远超此上限）。
+  const int64_t ceiling = elapsed_ms / 50 + 10;
+  if (snap_count > ceiling) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "throttle broken: forced_snap_count=%lld exceeds ceiling "
+                  "%lld (elapsed=%lldms). fsync storm / disk blow-up suspected.",
+                  static_cast<long long>(snap_count),
+                  static_cast<long long>(ceiling),
+                  static_cast<long long>(elapsed_ms));
+    Fatal(buf);
+  }
+
+  // 断言 3：一致性 —— 每个 key 的终值正确（Clerk 自行重试，应 exactly-once）
+  auto ck = cfg.MakeClient(cfg.All());
+  for (int cli = 0; cli < nclients; cli++) {
+    for (int n = 0; n < ops_per_client; n++) {
+      std::string key = "k_" + std::to_string(cli) + "_" + std::to_string(n);
+      std::string want = "v" + std::to_string(cli) + "_" + std::to_string(n);
+      DoCheck(&cfg, ck.get(), key, want);
+    }
+  }
+
+  cfg.End();
+  cfg.Cleanup();
+}
+
+// ===========================================================================
 // 生产化：会话表淘汰（防 last_seq_ 无限增长）
 // ===========================================================================
 // 【为什么淘汰必须用逻辑时钟】会话表是状态机的一部分（编进快照、每个副本 apply
@@ -2208,6 +2308,7 @@ const TestEntry kTests[] = {
     // ---- 生产化：重定向 + 背压（User 要求新增）----
     {"TestKVRedirectLeaderId", TestKVRedirectLeaderId},
     {"TestKVBackpressureBusy", TestKVBackpressureBusy},
+    {"TestKVDiskFullBurstThrottle", TestKVDiskFullBurstThrottle},
     {"TestKVSessionsEviction", TestKVSessionsEviction},
     {"TestKVSessionsSnapshotRoundTrip", TestKVSessionsSnapshotRoundTrip},
     {"TestKVSessionsDeterminismWithSnapshots",

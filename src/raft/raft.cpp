@@ -1152,6 +1152,17 @@ StartResult Raft::Start(const Command& command) {
     return result;
   }
 
+  // ---- #2.2 磁盘水位保护：raft state 过大 → 拒绝新写入，逼上层快照 ----
+  // 必须在 push_back【之前】判定（同 C1 背压）。默认 max_raft_state_bytes_==0 不限制，
+  // 与现有行为完全一致。语义上本节点仍是 leader（is_leader 保持 false，让上层当
+  // WrongLeader 重试），但本次提案被拒；上层应调 Snapshot() 压缩、待 raft state
+  // 缩小后再重试。这样即使上层忘了触发快照，Raft 层也不会无限涨盘拖垮节点。
+  if (max_raft_state_bytes_ > 0 &&
+      RaftStateSizeLocked() >= max_raft_state_bytes_) {
+    result.disk_full = true;
+    return result;
+  }
+
   int index = LastLogIndexLocked() + 1;
   logs_.push_back(LogEntry{current_term_, index, command});
   PersistLocked();
@@ -2207,6 +2218,18 @@ StartResult Raft::ProposeConfChangeTo(int server, MemberRole target) {
   e.type = EntryType::kConfChange;              // 标记：这是"成员变更条目"
   e.conf_server = server;                  // 改谁（比如节点2）
   e.conf_role = static_cast<int>(target);  // 改成什么角色（三态）
+  // #2.2 磁盘水位保护：与 Start() 对称，配置变更也会 append 一条日志，同样受配额约束。
+  // 必须在【任何副作用（含下方 removed_at_index_ 冻结点设置）之前】判定，否则 disk_full
+  // 早退会留下"被污染的下标却没有对应日志条目"的错位状态。默认 max_raft_state_bytes_==0
+  // 不限制，与现有行为完全一致。语义上本节点仍是 leader，但本次提案被拒；与 Start() 对齐，
+  // 下方 disk_full 早退处显式将 is_leader 置 false，调用方应以 disk_full 字段判定（而非
+  // is_leader）、稍后调 Snapshot() 压缩再重试。
+  if (max_raft_state_bytes_ > 0 &&
+      RaftStateSizeLocked() >= max_raft_state_bytes_) {
+    res.disk_full = true;
+    res.is_leader = false;  // 对齐 Start()：disk_full 时 is_leader 显式 false，避免上层误判"被接受"
+    return res;
+  }
   // Q2 隐私加固：在【提案此刻】就记下"server 被移除时的配置条目下标"作为复制冻结点。
   // 必须早于 conf 提交/apply：否则 ReplicateLoop 可能在 cap 设置前就把 conf 之后的
   // 新客户端条目（index > e.index）拷进发送缓冲并发给 server，造成"removed 节点多收
@@ -2227,7 +2250,10 @@ StartResult Raft::ProposeConfChangeTo(int server, MemberRole target) {
 // 第六部分：持久化
 // ===========================================================================
 
-void Raft::PersistLocked() {
+// #2.2 辅助：把当前 raft state 编码为字节串（term/votedFor/snapshot 元数据/log/成员配置），
+// 不含快照 blob（blob 单独由 SaveSnapshotBlob 落盘）。PersistLocked 与 RaftStateSize 共用，
+// 保证「写入磁盘的字节数」与「对外暴露的 RaftStateSize」严格一致。调用方须持 mu_。
+std::string Raft::EncodeRaftStateLocked() const {
   labrpc::Encoder e;
   e.Int(current_term_).Int(voted_for_);
   e.Int(snapshot_index_).Int(snapshot_term_);  // 快照元数据也要随状态恢复
@@ -2240,12 +2266,25 @@ void Raft::PersistLocked() {
   e.Int(static_cast<int>(is_member_.size()));
   for (MemberRole r : is_member_) e.Int(static_cast<int>(r));
   e.Int(pending_conf_index_);
+  return e.Take();
+}
 
+void Raft::PersistLocked() {
   // ⚠️ 这里【只写 raft state】，不再写 snapshot blob。
   // blob 已由 SaveSnapshotBlob() 在锁外单独落盘（阶段 1）。
   // 落盘顺序恒为「先 blob（带 index 头）→ 后 state」，崩溃一致性靠
   // DecodeSnapshotBlob() 比对 blob.index 与 snapshot_index_ 来保证。
-  persister_->SaveRaftState(e.Take());
+  // #2.2 优化：编码一次，既用于落盘、又缓存字节数供 RaftStateSizeLocked() O(1) 读取，
+  // 避免 Start()/ProposeConfChangeTo 每次提案都重编一遍（启用配额时从 O(N) 降到 O(1)）。
+  // 调用方均已持 mu_，写入 raft_state_bytes_ 安全。
+  std::string blob = EncodeRaftStateLocked();
+  raft_state_bytes_ = blob.size();
+  persister_->SaveRaftState(std::move(blob));
+}
+
+size_t Raft::RaftStateSize() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return RaftStateSizeLocked();
 }
 
 void Raft::ReadPersist(const std::string& data) {
@@ -2361,6 +2400,9 @@ void Raft::ReadPersist(const std::string& data) {
   // 现在才是真正的"消费完整字节流"边界
   // 注：原代码在上方赋值后又用 snapshot_index_ 重复赋了一次 commit_index_/last_applied_，
   // 二者等价（snapshot_index_ == snap_idx），属冗余，已删除。
+  // #2.2 初始化缓存的持久化字节数（构造期单线程、ctor 调 ReadPersist 时无并发；
+  // 直接重编一次即可，代价仅一次）。之后 RaftStateSizeLocked() 全程 O(1)。
+  raft_state_bytes_ = EncodeRaftStateLocked().size();
   if (!d.Ok()) return;
 }
 
