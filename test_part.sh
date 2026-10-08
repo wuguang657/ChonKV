@@ -138,6 +138,7 @@ case "$PART" in
     ) ;;
   3B)
     TESTS=(
+      TestSnapshotBlobCrc
       TestSnapshotRPC3B
       TestSnapshotSize3B
       TestSnapshotRecover3B

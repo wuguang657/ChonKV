@@ -286,13 +286,3 @@
 *—— 本节由 WorkBuddy 于 2026-10-02 基于代码实核查补，非推测。*
 
 ---
-
-## E. 变更记录
-
-- **2026-10-07**：「日志无界增长 / 磁盘水位保护」（原 §2.2、原第一批 P0）**已落地并验证通过**，从待办清单移除（文档已删条目并顺延编号）。落地清单（桌面实核）：
-  - Raft 层水位检查：`Start()` / `ProposeConfChangeTo()` 在提交前判 `RaftStateSize ≥ max_raft_state_bytes_` 即返回 `disk_full`（`raft.cpp:1160` / `:2227`，均在 `push_back` 之前，重试不重复 append）；
-  - KVServer 接线：`server.cpp:24` 设配额、`WaitOp` 收到 `disk_full` 调 `ForceSnapshotOnDiskFull()`（`:367`），压缩后仍满返 `kBusy`（`:377`）；
-  - 快照频率节流：CAS 限流 `kForceSnapMinInterval = 50ms`（`server.cpp:209` / `:235`），任意 50ms 窗口至多一次真落盘，杜绝 fsync 风暴；
-  - 失败重试退避：有界 `for(≤5 轮)` + 指数退避 2/4/8/16ms 封顶 50ms（`server.cpp:366-374`）；
-  - 护栏用例：`TestKVDiskFullBurstThrottle`（`test_kvraft.cpp:470`，注册 `:2311`），负向对照证明是真护栏。
-  - 编号顺延：原 §2.3 CRC → §2.2；路线图「第二批/第三批/第四批」→「第一批/第二批/第三批」。

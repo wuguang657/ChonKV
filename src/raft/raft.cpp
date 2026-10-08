@@ -2,6 +2,7 @@
 
 #include "raft.h"
 #include <cstdio>
+#include <cstdlib>  // std::abort（P1-1：坏 snapshot blob 的 fail-stop）
 
 namespace raft {
 
@@ -29,7 +30,20 @@ static void Trace(const char* fmt, ...) {
 // 重组出完整 blob 后重算并比对，不一致（半截写 / 分块丢失 / 损坏）则拒绝安装。
 // 截断成 int 仅用于「相等比较」，双射不丢区分度。
 // ===========================================================================
-static uint32_t Crc32Impl(const char* data, size_t n) {
+// ⚠️ TSan 性能护栏：Crc32 是纯函数（只读入参、不碰任何共享状态），本来就不该被
+// TSan 逐访存插桩。实测记载（见 Raft::Snapshot 处注释）：每次快照都算一遍 CRC32
+// 会把 KV 的 apply/快照循环整体拖慢 → 日志来不及截断 → "logs were not trimmed"
+// （RELEASE+TSAN 50 轮 3/50）。P1-1 要求每次落盘都算 CRC，若不关插桩等于把这笔
+// 开销原样加回来。故这里显式关闭本函数的 TSan 插桩。
+#if defined(__clang__)
+#define RAFT_NO_SANITIZE_THREAD __attribute__((no_sanitize("thread")))
+#else
+#define RAFT_NO_SANITIZE_THREAD
+#endif
+
+// 原始循环（不做「末态取反」），供增量续算复用。
+RAFT_NO_SANITIZE_THREAD
+static uint32_t Crc32Raw(uint32_t crc, const char* data, size_t n) {
   // C++11 magic statics：lambda 内 static 表 + 外层 static 指针，
   // 首次调用由运行时保证线程安全的单次初始化，消除 TSan data race。
   // 不再用手写 if(!inited) 双检查锁（那正是竞态根源）。
@@ -43,14 +57,20 @@ static uint32_t Crc32Impl(const char* data, size_t n) {
     }
     return t;
   }();
-  uint32_t crc = 0xFFFFFFFFu;
   for (size_t i = 0; i < n; i++)
     crc = table[(crc ^ static_cast<uint8_t>(data[i])) & 0xff] ^ (crc >> 8);
-  return crc ^ 0xFFFFFFFFu;
+  return crc;
+}
+
+uint32_t Crc32Update(uint32_t crc, const char* data, size_t n) {
+  // 入参 crc 是「已取反的终值」：先还原成运行值再续算，末尾再取反。
+  // 这样 Crc32Update(a‖b) == Crc32Update(Crc32Update(0, a), b)，可分段流式计算。
+  return Crc32Raw(crc ^ 0xFFFFFFFFu, data, n) ^ 0xFFFFFFFFu;
 }
 
 int Crc32(const char* data, size_t n) {
-  return static_cast<int>(Crc32Impl(data, n));
+  // 空串的 CRC32 == 0，故以 0 起算即为标准 CRC32。
+  return static_cast<int>(Crc32Update(0, data, n));
 }
 
 // ===========================================================================
@@ -1707,7 +1727,9 @@ void Raft::ApplyLoop() {
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// 磁盘上 snapshot blob 的格式：[magic(8B)][index(4B)][term(4B)][len(4B)][raw...]
+// 磁盘上 snapshot blob 的格式：
+//   V1（老）[magic(8B)][index(4B)][term(4B)][len(4B)][raw...]
+//   V2（现）[magic(8B)][index(4B)][term(4B)][len(4B)][crc(4B)][raw...]
 //
 // 为什么 blob 需要「自描述」的头？
 //   blob 与 raft state 现在是【两次独立落盘】（阶段1 落 blob / 阶段2 提交
@@ -1716,11 +1738,17 @@ void Raft::ApplyLoop() {
 //     · 恢复时 blob.index != state.snapshot_index_  → 崩在两阶段之间，
 //       blob 属于"写了一半"的未提交快照 → 丢弃，从完整的日志重放。
 //   没有这个头就无法区分，只能靠"猜测"，那正是丢数据的来源。
+//
+// 为什么 V2 再加一个 crc？（P1-1）
+//   头里写了 len，读出来长度对得上，但【内容烂没烂完全不知道】：磁盘 bit rot
+//   （放着不动翻了个比特）、写一半掉电，都会让 payload 烂掉而头看起来正常。
+//   而日志早已被截断到 index=X —— 0..X 的状态【只存在这一份 blob 里】，读坏了
+//   就永远重放不出来（state diverged）。所以必须能自校验，且损坏要被【发现】。
 // ---------------------------------------------------------------------------
 namespace {
 
-constexpr char kSnapMagic[] = "RAFTSNP1";
-constexpr size_t kSnapHeaderSize = 8 + 4 + 4 + 4;  // magic + index + term + len
+constexpr char kSnapMagicV1[] = "RAFTSNP1";  // V1：无 CRC，只能兼容读（向前兼容）
+constexpr char kSnapMagic[] = "RAFTSNP2";    // V2：头里带 CRC，当前写入格式
 
 void PutInt32(std::string& s, int32_t v) {
   uint32_t u = static_cast<uint32_t>(v);
@@ -1737,6 +1765,11 @@ int32_t GetInt32(const std::string& s, size_t off) {
   return static_cast<int32_t>(u);
 }
 
+}  // namespace
+
+// P1-1：落盘 blob 的自校验编码。CRC 覆盖【头的前 20 字节 + payload】——
+// 不只保护数据区，index/term/len 被翻改也能发现（否则攻击者/位翻转改一下 len
+// 就能让上层拿到一份"长度自洽但内容错位"的状态）。
 std::string EncodeSnapshotBlob(int index, int term, const std::string& raw) {
   std::string out;
   out.reserve(kSnapHeaderSize + raw.size());
@@ -1744,27 +1777,59 @@ std::string EncodeSnapshotBlob(int index, int term, const std::string& raw) {
   PutInt32(out, index);
   PutInt32(out, term);
   PutInt32(out, static_cast<int32_t>(raw.size()));
+  // 两段流式计算：先头 20B，再续算 payload —— 零额外拷贝（不拼临时串）。
+  uint32_t crc = Crc32Update(0, out.data(), kSnapHeaderSizeV1);
+  crc = Crc32Update(crc, raw.data(), raw.size());
+  PutInt32(out, static_cast<int32_t>(crc));
   out.append(raw);
   return out;
 }
 
-// 返回 false：不是本格式（空 / 老格式 / 损坏）。
+// P1-1：落盘 blob 的自校验解码。
+// 三态返回（配合 corrupt 出参）是核心设计：
+//   ① 解码成功                       → return true
+//   ② 空 / 非本格式（含老数据/垃圾）  → return false, corrupt=false（= 无快照，首次启动）
+//   ③ 本格式但 CRC 或长度对不上       → return false, corrupt=true（= 真损坏，须 fail-stop）
+// ②③ 必须分开：把 ③ 当成 ② 会让节点"丢掉唯一的状态副本还继续跑"（见 ReadPersist）。
 bool DecodeSnapshotBlob(const std::string& blob, int* index, int* term,
-                        std::string* raw) {
-  if (blob.size() < kSnapHeaderSize) return false;
-  if (blob.compare(0, 8, kSnapMagic, 8) != 0) return false;
-  int32_t idx = GetInt32(blob, 8);
-  int32_t t = GetInt32(blob, 12);
-  int32_t len = GetInt32(blob, 16);
-  if (len < 0) return false;
-  if (blob.size() != kSnapHeaderSize + static_cast<size_t>(len)) return false;
+                        std::string* raw, bool* corrupt) {
+  if (corrupt) *corrupt = false;
+  if (blob.size() < kSnapHeaderSizeV1) return false;  // 空/过短 → 无快照
+  const bool v2 = (blob.compare(0, 8, kSnapMagic, 8) == 0);
+  const bool v1 = !v2 && (blob.compare(0, 8, kSnapMagicV1, 8) == 0);
+  if (!v1 && !v2) return false;  // 非本格式 → 无快照（不是"损坏"）
+  const size_t hdr = v2 ? kSnapHeaderSize : kSnapHeaderSizeV1;
+  // 走到这里说明 magic 是本格式的：后面任何对不上都只能是【真损坏】（半截写/位翻转）。
+  if (blob.size() < hdr) {
+    if (corrupt) *corrupt = true;
+    return false;
+  }
+  const int32_t idx = GetInt32(blob, 8);
+  const int32_t t = GetInt32(blob, 12);
+  const int32_t len = GetInt32(blob, 16);
+  if (len < 0) {
+    if (corrupt) *corrupt = true;
+    return false;
+  }
+  if (blob.size() != hdr + static_cast<size_t>(len)) {
+    if (corrupt) *corrupt = true;  // 长度自相矛盾 = 被截断或被追加
+    return false;
+  }
+  if (v2) {
+    const uint32_t want = static_cast<uint32_t>(GetInt32(blob, kSnapHeaderSizeV1));
+    uint32_t got = Crc32Update(0, blob.data(), kSnapHeaderSizeV1);
+    got = Crc32Update(got, blob.data() + hdr, static_cast<size_t>(len));
+    if (got != want) {
+      if (corrupt) *corrupt = true;  // bit rot / 半截写
+      return false;
+    }
+  }
+  // V1 老格式无 CRC 可校验：长度自洽即认为可信（向前兼容，老盘能读）。
   if (index) *index = idx;
   if (term) *term = t;
-  if (raw) raw->assign(blob, kSnapHeaderSize, static_cast<size_t>(len));
+  if (raw) raw->assign(blob, hdr, static_cast<size_t>(len));
   return true;
 }
-
-}  // namespace
 
 // Raft::SaveSnapshotBlob —— 见 raft.h 声明处的完整说明。
 //
@@ -2339,7 +2404,8 @@ void Raft::ReadPersist(const std::string& data) {
     std::string disk_blob = persister_->ReadSnapshot();
     int b_idx = 0, b_term = 0;
     std::string b_raw;
-    if (DecodeSnapshotBlob(disk_blob, &b_idx, &b_term, &b_raw)) {
+    bool corrupt = false;
+    if (DecodeSnapshotBlob(disk_blob, &b_idx, &b_term, &b_raw, &corrupt)) {
       if (b_idx > snapshot_index_) {
         Trace("S%d 追认未提交的 snapshot blob：blob.index=%d > snapshot_index_=%d",
               me_, b_idx, snapshot_index_);
@@ -2370,8 +2436,21 @@ void Raft::ReadPersist(const std::string& data) {
       }
       // 盘上 blob 的 index 恒 >= 已提交边界，之后只允许写更新的。
       saved_blob_index_ = snapshot_index_;
+    } else if (corrupt) {
+      // ★ P1-1：blob 是本格式（magic 对得上）但 CRC / 长度对不上 = 真损坏。
+      // 这里【绝不能】像下面那样"视为无快照"继续跑：日志早已被截断到
+      // snapshot_index_=X，0..X 的状态只活在这一个 blob 里，一旦悄悄跳过，
+      // 状态机就永久缺一大块 → replicas did not converge / state diverged，
+      // 且不可自愈（重启还是同一个坏文件）。
+      // 所以 fail-stop：宁可当街崩，也不带着一份错状态继续对外服务 ——
+      // 与 persister 落盘失败即 abort 是同一条铁律（持久化不可信就不许继续）。
+      std::fprintf(stderr,
+                   "S%d FATAL: 磁盘 snapshot blob 校验失败（CRC/长度不符），"
+                   "疑似 bit rot 或半截写：blob_size=%zu snapshot_index_=%d\n",
+                   me_, disk_blob.size(), snapshot_index_);
+      std::abort();
     } else {
-      // 空 / 老格式 / 损坏：视为无快照（首次启动就是这种情况）。
+      // 空 / 老格式 / 非本格式：视为无快照（首次启动就是这种情况）。
       saved_blob_index_ = snapshot_index_;
     }
   }

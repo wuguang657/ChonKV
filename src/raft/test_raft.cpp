@@ -4858,6 +4858,99 @@ struct TestCase {
 };
 
 // ===========================================================================
+// P1-1：落盘 snapshot blob 自校验（CRC）—— 纯单测，不启集群
+// ===========================================================================
+//
+// 为什么必须有这一组断言：日志被截断到 index=X 之后，0..X 的状态【只存在】磁盘上
+// 这一份 blob 里。坏 blob 若被静默当成"没有快照"跳过，状态机会永久缺一大块 →
+// state diverged，且重启也修不好（还是同一个坏文件）。所以必须两头都卡死：
+//   · 坏 blob 必须【被检出】（corrupt=true）—— 由 ReadPersist 走 fail-stop abort；
+//   · 空盘 / 非本格式必须【不被误判】（corrupt=false）—— 那是全新节点的合法情形，
+//     误判会让首次启动一上来就 abort。
+void TestSnapshotBlobCrc() {
+  // 断言：解码必须失败，且 corrupt 必须等于期望值。
+  auto expect_reject = [](const std::string& what, const std::string& blob,
+                          bool want_corrupt) {
+    int idx = -1, term = -1;
+    std::string raw;
+    bool corrupt = false;
+    const bool ok = DecodeSnapshotBlob(blob, &idx, &term, &raw, &corrupt);
+    if (ok) throw TestFailure(what + "：坏 blob 竟被解码成功（没检出损坏）");
+    if (corrupt != want_corrupt) {
+      throw TestFailure(what + "：corrupt 期望 " +
+                        std::to_string(want_corrupt) + "，实际 " +
+                        std::to_string(corrupt));
+    }
+  };
+
+  const std::string payload(4096, 'x');
+
+  // ① 正常 round-trip：头 24 字节，index/term/payload 原样还原，且不报 corrupt。
+  const std::string blob = EncodeSnapshotBlob(120, 7, payload);
+  if (blob.size() != kSnapHeaderSize + payload.size()) {
+    throw TestFailure("头长度应为 24，实际 " +
+                      std::to_string(blob.size() - payload.size()));
+  }
+  {
+    int idx = 0, term = 0;
+    std::string raw;
+    bool corrupt = true;
+    if (!DecodeSnapshotBlob(blob, &idx, &term, &raw, &corrupt))
+      throw TestFailure("正常 blob 解码失败");
+    if (idx != 120 || term != 7 || raw != payload)
+      throw TestFailure("正常 blob 解码内容不符");
+    if (corrupt) throw TestFailure("正常 blob 被误判为 corrupt");
+  }
+
+  // ② 翻转 payload 中间 1 个 bit（模拟 bit rot）→ 必须判损坏。
+  {
+    std::string bad = blob;
+    const size_t p = kSnapHeaderSize + 100;
+    bad[p] = static_cast<char>(bad[p] ^ 0x01);
+    expect_reject("payload 翻转 1 bit", bad, true);
+  }
+
+  // ③ 翻转头里的 index 字段 → 必须判损坏（CRC 覆盖头，不只保护数据区）。
+  {
+    std::string bad = blob;
+    bad[9] = static_cast<char>(bad[9] ^ 0x01);
+    expect_reject("头 index 字段翻转", bad, true);
+  }
+
+  // ④ 砍掉尾部（模拟写一半掉电）→ 长度自相矛盾 → 必须判损坏。
+  {
+    std::string bad = blob.substr(0, blob.size() - 16);
+    expect_reject("尾部截断（半截写）", bad, true);
+  }
+
+  // ⑤ 空盘 / 非本格式 → 视为无快照（corrupt=false，绝不能 abort）。
+  expect_reject("空 blob（首次启动）", std::string(), false);
+  expect_reject("非本格式数据", std::string(64, 'Z'), false);
+
+  // ⑥ 老格式 V1（无 CRC）必须仍可读：向前兼容，且不判损坏。
+  {
+    std::string v1;
+    v1.append("RAFTSNP1", 8);
+    auto put32 = [](std::string& s, int32_t v) {
+      const uint32_t u = static_cast<uint32_t>(v);
+      for (int i = 0; i < 4; ++i)
+        s.push_back(static_cast<char>((u >> (i * 8)) & 0xFFu));
+    };
+    put32(v1, 5);
+    put32(v1, 2);
+    put32(v1, 3);
+    v1.append("abc");
+    int idx = 0, term = 0;
+    std::string raw;
+    bool corrupt = true;
+    if (!DecodeSnapshotBlob(v1, &idx, &term, &raw, &corrupt))
+      throw TestFailure("V1 老格式应被兼容读取，却解码失败");
+    if (idx != 5 || term != 2 || raw != "abc" || corrupt)
+      throw TestFailure("V1 老格式解码内容 / corrupt 标志不符");
+  }
+}
+
+// ===========================================================================
 // 新增：崩溃恢复硬化（文件模式）+ #2.2 磁盘水位保护验证
 // ===========================================================================
 
@@ -5120,6 +5213,7 @@ static const TestCase kTests[] = {
     // §2.1 分块快照流式传输（etcd snap.Message 语义：offset/done/crc/chunk_size）
     {"TestChunkedSnapshotTransmit", TestChunkedSnapshotTransmit},
     {"TestChunkedSnapshotLargeStateMachine", TestChunkedSnapshotLargeStateMachine},
+    {"TestSnapshotBlobCrc", TestSnapshotBlobCrc},
 
     // ./build/raft_test CheckQuorum     # 精确命中 TestCheckQuorum（唯一含 CheckQuorum 的）
     // ./build/raft_test ReadIndex       # 同时命中 TestReadIndex + TestReadIndexNoStale

@@ -34,6 +34,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -50,6 +51,22 @@
 
 namespace raft {
 int Crc32(const char* data, size_t n);
+// 增量 CRC：在「已算好的 crc」基础上续算一段数据，返回新的 CRC。
+// 用途：算 [头‖payload] 的整体 CRC 时，不必先拼出一份几百 MB 的临时串（零额外拷贝）。
+// 约定：初值传 0（空串的 CRC32 就是 0）即等价于 Crc32(data, n)。
+uint32_t Crc32Update(uint32_t crc, const char* data, size_t n);
+
+// ---------------------------------------------------------------------------
+// 磁盘上 snapshot blob 的自描述头（P1-1：V2 起带 CRC，防 bit rot / 半截写）
+// ---------------------------------------------------------------------------
+constexpr size_t kSnapHeaderSizeV1 = 8 + 4 + 4 + 4;        // V1: magic+index+term+len
+constexpr size_t kSnapHeaderSize = kSnapHeaderSizeV1 + 4;  // V2: 再 +crc(4B)
+std::string EncodeSnapshotBlob(int index, int term, const std::string& raw);
+// corrupt 出参（默认 nullptr → 老调用点零改动）：
+//   true  = blob 是本格式（magic 对得上）但内容/长度对不上 = 真损坏 → 调用方应 fail-stop；
+//   false = 空 / 老格式 / 非本格式 = 视为无快照（首次启动的合法情形，绝不能 abort）。
+bool DecodeSnapshotBlob(const std::string& blob, int* index, int* term,
+                        std::string* raw, bool* corrupt = nullptr);
 // 日志里存的命令。Go 版是 interface{}，C++ 里我们用字符串，
 // 到了 Lab 3（KV 服务）你可以把它塞成任意序列化的字节。
 using Command = std::string;
