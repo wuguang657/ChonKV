@@ -8,14 +8,6 @@
 
 ---
 
-
-| 能力                  | 状态                   | 代码位置                                                                               | 生产评价                                |
-| ------------------- | -------------------- | ---------------------------------------------------------------------------------- | ----------------------------------- |
-| 持久化（2C）             | ⚠️ **内存模拟**          | `persister.h:31-72`                                                               | ❌ 无 fsync / 无 CRC / 无 WAL           |
-| **快照分块**            | ❌ 单 blob             | `raft.h:215`                                                                        | ❌ 见 §2.1                            |
-
----
-
 # 二、正确性 / 安全性缺口（P0）
 
 ### 2.1 快照分块流式传输
@@ -36,14 +28,7 @@
 
 # 三、性能缺口（P1/P2）
 
-### 3.1 批处理 + Group Commit
-
-- **现状**：`Start()` 一条命令一个 entry，一次 Persist 一次（将来一次 fsync）。
-- **生产需要**：
-  - **写批处理**：多个客户端写合并成一个 AE 批次（已有打包雏形，加上限即可）
-  - **fsync 合并（group commit）**：多条 entry 攒一起 fsync 一次，而不是每条 fsync。这是持久化层吞吐的命门（见 §4）
-
-### 3.2 锁粒度（P2，改动大，最后做）
+### 3.1 锁粒度（P2，改动大，最后做）
 
 - 现在是一把大锁 `mu_` 保护全部状态（`raft.h:412`），读路径（CheckQuorum/ReadIndex/GetState）也要抢。
 - 生产做法：读路径无锁/RCU、日志与状态分离锁。但**改动面大、风险高，建议等前面都稳定后再动**。
@@ -92,7 +77,6 @@
 | Compaction    | `src/lsm/engine.cpp`                                          | **Leveled**（L0 重叠，L1+ 不重叠）                                                                                              |
 | VLog（WiscKey） | `src/vlog/vlog.cpp`                                           | 大 value 分离                                                                                                              |
 
-
 **编译/测试**：`xmake` / `xmake run test_lsm`；静态库目标 `lsm_shared`（`xmake.lua:109`）；依赖 gtest / toml11 / spdlog。
 
 ## 4.2 tiny-lsm 的 4 个坑（接入前必须知道）
@@ -115,24 +99,22 @@
 
 ## 4.3 三块持久化的分工与 fsync 策略
 
-| 数据                              | 特点                          | 用什么存                                  | fsync 策略                                                     |
-| ------------------------------- | --------------------------- | ------------------------------------- | ------------------------------------------------------------ |
-| **Raft log**                    | append-only、按 index 读、前后缀截断 | **独立 segment log**（自写，不用 LSM）         | **group commit**：攒多条一起 fsync；但**已提交的 entry 必须 fsync 后才回客户端** |
-| **Raft state**（term / votedFor） | 极小、频繁变更                     | 小文件原子写（tmp + rename），或跟 log 同 segment | 每次变更 fsync（便宜）                                               |
-| **状态机 KV**                      | 随机读写、量大                     | **tiny-lsm** `LSMEngine`              | 走**事务 API**，由 LSM 的 WAL 保证                                   |
-| **快照 blob**                     | 大、偶发、整体替换                   | LSM `flush_all()` + 导出 / checkpoint   | 锁外写（你现在的两阶段 `SaveSnapshotBlob` 思路可直接平移）                      |
+| 数据                              | 特点                          | 用什么存                                                  | fsync 策略                                                                    |
+| ------------------------------- | --------------------------- | ----------------------------------------------------- | --------------------------------------------------------------------------- |
+| **Raft log**                    | append-only、按 index 读、前后缀截断 | **独立 segment log**（已实现 `SegmentLogStore`，file-backed） | **已实现**：提交屏障 `Sync(true)` 强制落盘 + `Sync(false)` 去抖合并；已提交 entry 必 fsync 后回客户端 |
+| **Raft state**（term / votedFor） | 极小、频繁变更                     | 小文件原子写（tmp + rename），或跟 log 同 segment                 | 每次变更 fsync（便宜）                                                              |
+| **状态机 KV**                      | 随机读写、量大                     | **tiny-lsm** `LSMEngine`                              | 走**事务 API**，由 LSM 的 WAL 保证                                                  |
+| **快照 blob**                     | 大、偶发、整体替换                   | LSM `flush_all()` + 导出 / checkpoint                   | 锁外写（你现在的两阶段 `SaveSnapshotBlob` 思路可直接平移）                                     |
 
 ## 4.4 接入步骤（按这个顺序来，每步可独立验证）
 
 - [ ] **Step 0**：在 macOS 上先跑通 tiny-lsm（`xmake` + `xmake run test_lsm`）。  
   ⚠️ 风险：README 标注 platform 为 Linux，macOS（Apple Silicon）**未明确保证**。这一步跑不通，后面方案要换。
 - [ ] **Step 1**：定义 `LogStore` 接口（`Append/Get(index)/Term(index)/LastIndex/TruncateSuffix/TruncatePrefix`），先用**内存 vector** 实现，把 `raft.cpp` 里对 `logs_` 的直接操作收敛到接口后面。**此时测试应全绿（纯重构）**。
-- [ ] **Step 2**：实现 `SegmentLogStore`（append-only 文件 + 稀疏索引 + fsync + 截断），替换 Step 1 的内存实现。加 CRC 防半截写。
-- [ ] **Step 3**：`StateStore`——term/votedFor 原子落盘（tmp + rename + fsync）。
-- [ ] **Step 4**：**先改造 tiny-lsm**：把 `full_compact` 挪到后台线程（见 §4.2 坑2）。不然后面怎么接都会卡。
-- [ ] **Step 5**：状态机换成 tiny-lsm。apply 用**事务 API**（`begin_tran`/`put`/`commit`）保证 WAL fsync。单线程 apply 正好契合 LSM 无并发写。
-- [ ] **Step 6**：快照——先 `flush_all()` + `Level_Iterator` 全量导出（**注意 MVCC**：要以最大 `tranc_id` 取每个 key 的最新非删除值）；恢复时清空 + `put_batch` 重放。更优方案是实现 **checkpoint**（硬链接 SST 目录，RocksDB 做法，秒级）。
-- [ ] **Step 7**：group commit——`Start()` 后的 fsync 攒批（这是吞吐的关键，也是面试亮点）。
+- [ ] **Step 2**：`StateStore`——term/votedFor 原子落盘（tmp + rename + fsync）。
+- [ ] **Step 3**：**先改造 tiny-lsm**：把 `full_compact` 挪到后台线程（见 §4.2 坑2）。不然后面怎么接都会卡。
+- [ ] **Step 4**：状态机换成 tiny-lsm。apply 用**事务 API**（`begin_tran`/`put`/`commit`）保证 WAL fsync。单线程 apply 正好契合 LSM 无并发写。
+- [ ] **Step 5**：快照——先 `flush_all()` + `Level_Iterator` 全量导出（**注意 MVCC**：要以最大 `tranc_id` 取每个 key 的最新非删除值）；恢复时清空 + `put_batch` 重放。更优方案是实现 **checkpoint**（硬链接 SST 目录，RocksDB 做法，秒级）。
 
 ## 4.5 tiny-lsm 需要补的能力（你的下一个子项目）
 
@@ -162,39 +144,19 @@
 **第一批（P0，持久化）**  
 6\. [ ] macOS 跑通 tiny-lsm  
 7\. [ ] `LogStore` 接口重构（纯重构，测试全绿）  
-8\. [ ] `SegmentLogStore` 落盘 + CRC + group commit  
-9\. [ ] tiny-lsm 后台 compaction（否则接入必卡）  
-10\. [ ] 状态机接 tiny-lsm（走事务 API）  
-11\. [ ] 快照：flush_all + 导出 → checkpoint
+8\. [ ] tiny-lsm 后台 compaction（否则接入必卡）  
+9\. [ ] 状态机接 tiny-lsm（走事务 API）  
+10\. [ ] 快照：flush_all + 导出 → checkpoint
 
 **第二批（P1，可用性与性能）**  
-12\. [ ] 快照分块流式传输（#8，未做）  
+11\. [ ] 快照分块流式传输（#8，未做）
 
 **第三批（P2，工程成熟度）**  
-13\. [ ] 可观测性：metrics（term / commit / apply lag / log size / snapshot 大小 / RPC 延迟）+ 结构化日志  
-14\. [ ] 混沌测试 / 故障注入（在现有 tester 基础上加）  
-15\. [ ] 锁粒度优化
+12\. [ ] 可观测性：metrics（term / commit / apply lag / log size / snapshot 大小 / RPC 延迟）+ 结构化日志  
+13\. [ ] 混沌测试 / 故障注入（在现有 tester 基础上加）  
+14\. [ ] 锁粒度优化
 
 ---
-
-## 附：本次实测铁证清单
-
-> 注：以下为 2026-09-14 首次实测基线。其中 §2.7 多数派过滤（原 `peers_.size()` **未过滤** `is_member_`）、§4.1 流水线（原停等）、§4.2 条目数上限已被后续实现推翻——当前真实状态以 §九.C 待做清单与 §九 工程经验为准，本节不再逐条修订。
-
-**Raft（cpp-6.824）**
-
-- `raft.cpp:188` — `is_member_` 全 true 初始化，全项目唯一赋值处
-- `raft.cpp:487 / 564` — 预投票 / 正式投票用 `peers_.size()`，**未过滤 is_member\_**
-- `raft.cpp:1005-1013` — 提交中位数用 `peers_.size()`，**未过滤**
-- `raft.cpp:336 / 345 / 994 / 1508 / 1579` — CheckQuorum / ReadIndex **用了 MemberCountLocked()**（与上面对比即漏洞）
-- `raft.cpp:1492-1496` — `MemberCountLocked()` 定义
-- `raft.h:215` — `InstallSnapshotArgs.data` 单 string，无 offset/done
-- `raft.h:110` — `kPipelineMaxInFlight = 8 * kMaxEntriesPerRpc` 窗口化流水（取代旧 `inflight_log_` bool 停等）；`raft.cpp:1199/1251` 在途窗口判定
-- `raft.h:105` — `kMaxEntriesPerRpc = 1024` 单 RPC 条目数上限（`raft.cpp:1324-1327` 截断）；**字节上限 `kMaxBytesPerRpc = 1MiB` 已实现**（双上限截断，2026-10-03 落地）
-- `raft.cpp:895-898` — entries 打包受双上限约束（条目数 1024 / 字节 1MiB）
-- `persister.h:31-72` — 纯内存，无 fsync/CRC
-- `raft.cpp:1653` — `read_ctxs_.erase(ctx)`（**无泄漏，澄清**）
-- grep `ConfChange|learner|chunk|offset` — **零命中**（仅 `config.cpp:268` 静态拓扑）
 
 **tiny-lsm**
 
@@ -210,12 +172,14 @@
 - `transaction.h:17` / `transation.cpp:197` — SERIALIZABLE 未实现
 - `xmake.lua:109` — `lsm_shared` 静态库目标
 
+
+
 ---
 
 ## A. 仍有效的部分（保留原文，未过期）
 
 - **§4 tiny-lsm 分析**（4.0–4.5）：持久化层对接分析与 4 个坑仍有效（WAL 仅事务路径写、前台 compaction 阻塞、无 Manifest、`WAL::flush()` 空实现）。
-- 以下"确仍缺失/未做"的小节结论正确，已在 §九.C 清单中保留：§2.1 快照分块、§2.2 CRC、§3.2 锁粒度。
+- 以下"确仍缺失/未做"的小节结论正确，已在 §九.C 清单中保留：§2.1 快照分块、§2.2 CRC、§3.1 锁粒度。
 
 ## B. 剔除「持久化 + 网络」后的剩余待做清单（2026-10-01）
 
@@ -223,27 +187,24 @@
 
 ### 一、raft 算法本身（语义 / 正确性 / 效率，面试含金量最高）
 
-| #       | 项                                                   | 优先级     | 盘上 grep 核实（2026-10-01）                                                                                                                                                                                                                                         |
-| ------- | --------------------------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **E1**  | Per-follower Progress 状态机（Probe/Replicate/Snapshot） | -       | 仅朴素 `next_/match_index_` + 单 `ReplicateLoop`，无三态                                                                                                                                                                                                               |
-| **E8**  | Node-ID 稳定成员标识                                      | -       | 整数下标，`node_id` / `NodeId` **零命中**（重启/替换会身份错乱）                                                                                                                                                                                                                  |
+| #      | 项                                                   | 优先级 | 盘上 grep 核实（2026-10-01）                           |
+| ------ | --------------------------------------------------- | --- | ------------------------------------------------ |
+| **E1** | Per-follower Progress 状态机（Probe/Replicate/Snapshot） | -   | 仅朴素 `next_/match_index_` + 单 `ReplicateLoop`，无三态 |
+| **E8** | Node-ID 稳定成员标识                                      | -   | 整数下标，`node_id` / `NodeId` **零命中**（重启/替换会身份错乱）    |
 
 ### 二、raft 工程化 / 运维（非算法、非持久化、非网络）
 
-| #       | 项                      | 说明                                                                                       |
-| ------- | ---------------------- | ---------------------------------------------------------------------------------------- |
-| **#12** | 可观测性 metrics / tracing | 现仅 `fprintf(stderr)` 排错日志                                                                |
-| **#13** | 锁粒度细化 / RCU            | 单大锁 `mu_`，改动面大风险高，最后做                                                                    |
-| **#15** | Raft log 最小保留窗口        | 落后 follower / learner 追平所需（#15 是"保留下限"细化，非"没截断"）                                         |
+| #       | 项                      | 说明                                               |
+| ------- | ---------------------- | ------------------------------------------------ |
+| **#12** | 可观测性 metrics / tracing | 现仅 `fprintf(stderr)` 排错日志                        |
+| **#13** | 锁粒度细化 / RCU            | 单大锁 `mu_`，改动面大风险高，最后做                            |
+| **#15** | Raft log 最小保留窗口        | 落后 follower / learner 追平所需（#15 是"保留下限"细化，非"没截断"） |
 
 ### 三、快照传输协议（介于算法与网络之间，单列）
 
 | #      | 项                | 说明                                                       |
 | ------ | ---------------- | -------------------------------------------------------- |
-| **#8** | 快照分块 / 流式传输      | 当前单 blob 全量，`chunk` / `offset` / `SnapshotChunk` **零命中** |
 | **#6** | abort/restart 机制 | 仅 CRC 部分归持久化；abort/restart 协议本身未做，跟 #8 配套最顺              |
-
-
 
 ## C. 推荐执行顺序
 
@@ -251,37 +212,6 @@
 2. **#8 / #6 快照传输 + #12 / #13 / #15**：工程打磨期。
 
 > ⚠️ **雷区**：动 raft 核心算法路径（尤其 E1 / E8 等成员与进度状态机），交付前必须跑 `raft_test` + `kv_test` 全量 + TSan 硬化用例，确认无 term 暴涨 / 选举活锁回归（实测 `raft_test` 73 + `kv_test` 34 = **107** 条用例含 TSan 硬化，以二进制启动打印的「已注册 N 个用例」为准，详见 §九.D.5）。
-
-*—— 本节由 WorkBuddy 于 2026-10-01 基于代码实核查补，非推测。*
-
----
-
-## D. 工程实测经验（sanitizer / 构建系统 / 测试规模）
-
-> 本节沉淀调试与工程实测经验，供后续开发与测试参考。
-
-### D.3 Sanitizer 对重负载测试的已知影响（实测经验 ⚠️）
-
-这是这两天调试沉淀的、文档之前没写的关键坑：
-
-- **TSan 活性 flake（≈1/250，非 bug）**：`TestSnapshotUnreliableRecover3B` 在 TSan 构建下偶发 `no client made progress` 失败。实证：同种子副本 28 轮 PASS、桌面 FAIL，调度非确定；根因是 TSan 5–15× 减速偶尔让选主+提交首条超 5s 实时窗口。判定**非正确性 bug**（无 partition 配置、实时驱动测试）。
-- **ASan 减速致 3B 单操作超时假失败**：`TestSnapshotUnreliable3B`（`GenericTest("3B",5,true,false,false,1000)`）在 ASan 构建下出现 `!!! get wrong value ... got []` + `⚠️ GIVE UP: Get(...) 超过 60s`。**无任何 ASan 报错**即说明不是内存 bug，而是 ASan 减速把 Clerk 的 60s 单操作墙钟挤爆（空读+超时，非数据损坏）。**证伪法**：`SEED=<n> ./build/kv_test TestSnapshotUnreliable3B -count 1`（非 sanitizer 构建）跑同种子，过了即实锤假失败。
-- 关联工程事实：sanitizer 构建里 `SAN_OPT`（`-O1`，`--opt` 时 `-O2`）追加在命令行尾部，**覆盖** Release 的 `-O3`，所以 sanitizer 构建实际优化级是 `-O1/-O2` 而非 `-O3`（但 `-DNDEBUG` 仍生效）。重负载 3B 在 sanitizer 下测试，建议放宽或关掉 Clerk 的 60s 单操作超时，否则容易被误判失败。
-
-### D.4 构建系统多档化（工程成熟度）
-
-`build.sh` 现已支持多档构建（`--release` / `--opt` / `--asan` / `--ubsan` / `--tsan` / `--clean`），`test_part.sh` 提供并发压测 harness（`SAN` / `RELEASE` / `OPT` / `COUNT` / `PARALLEL` / `SEED` / `TEST_TIMEOUT_MS` / `BIN` 环境变量）。踩坑已固化进脚本：
-
-- TSan 与 ASan **互斥**（CMake 层 `FATAL_ERROR` 守卫）；
-- UBSan 必须 `halt_on_error=1`（否则 UB 测试假绿）；
-- 优化会改变指令时序，**Debug 才是回归基线**（sanitizer 下偶发活性 flake 不计入正确性失败）。
-
-### D.5 测试规模更正
-
-- 实测：`raft_test` **73 条**（`kTests[]` @ `test_raft.cpp:4538-4647`）+ `kv_test` **34 条**（`kTests[]` @ `test_kvraft.cpp:2111-2195`）= **107 条**，含 TSan 硬化用例。
-- ⚠️ 扩展用例（Membership / ReadIndex / CheckQuorum / MaxMessageSize）以 lambda 包 `GenericTest(...)` 注册，光 grep `void Test*` 会漏数——**以二进制启动打印的「已注册 N 个用例」为准**。
-
----
 
 *—— 本节由 WorkBuddy 于 2026-10-02 基于代码实核查补，非推测。*
 

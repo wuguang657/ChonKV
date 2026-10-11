@@ -55,6 +55,8 @@ int Crc32(const char* data, size_t n);
 // 用途：算 [头‖payload] 的整体 CRC 时，不必先拼出一份几百 MB 的临时串（零额外拷贝）。
 // 约定：初值传 0（空串的 CRC32 就是 0）即等价于 Crc32(data, n)。
 uint32_t Crc32Update(uint32_t crc, const char* data, size_t n);
+// 底层 CRC32 原语（不做末态取反的「原始循环」），供 Crc32Update 与 SegmentLogStore 共用。
+uint32_t Crc32Raw(uint32_t crc, const char* data, size_t n);
 
 // ---------------------------------------------------------------------------
 // 磁盘上 snapshot blob 的自描述头（P1-1：V2 起带 CRC，防 bit rot / 半截写）
@@ -411,6 +413,11 @@ struct StartResult {
 int CountGrantedVotes(const std::vector<MemberRole>& is_member,
                       const std::vector<int>& votes);
 
+// 前置声明：Raft log 的 append-only 段文件存储（file_backed 模式专用）。
+// 完整定义见 raft.cpp（含 CRC 校验、ftruncate 截断、Group Commit 批量 fsync）。
+class SegmentLogStore;
+
+
 class Raft : public std::enable_shared_from_this<Raft> {
  public:
   Raft(std::vector<std::shared_ptr<labrpc::ClientEnd>> peers, int me,
@@ -689,6 +696,9 @@ class Raft : public std::enable_shared_from_this<Raft> {
 
   // ---- 2B：日志 ----
   std::vector<LogEntry> logs_;    // logs_[0] 是哨兵，index = snapshot_index_
+  // file_backed 模式：把 logs_ 镜像到 append-only 段文件（SegmentLogStore）。
+  // 内存模式（file_backed=false）时为 nullptr，读路径全走 logs_ 向量，零额外开销。
+  std::unique_ptr<SegmentLogStore> seg_log_;
   int commit_index_ = 0;
   int last_applied_ = 0;
   std::shared_ptr<raftcpp::Chan<ApplyMsg>> apply_ch_;
@@ -866,7 +876,9 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // 由 PersistLocked() 编码后写入；ReadPersist() 末尾用一次 EncodeRaftStateLocked() 初始化（构造期仅一次）。
   // 读取方须持 mu_（Start() / RaftStateSize() / ProposeConfChangeTo 均持锁）。
   size_t raft_state_bytes_ = 0;
-  size_t RaftStateSizeLocked() const { return raft_state_bytes_; }
+  // 实现见 raft.cpp：需在 SegmentLogStore 完整定义之后，故不能在此内联。
+  // 段文件模式下会把 raft.log.seg 大小补进 RaftStateSize，保证磁盘水位保护（#2.2）仍生效。
+  size_t RaftStateSizeLocked() const;
 
   // ---- 重定向用：本节点认知的 leader 编号 ----
   // 收到合法 AppendEntries（含心跳）时记为 args.leader_id；自己当选时记为 me_。

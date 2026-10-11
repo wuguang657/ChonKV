@@ -1,8 +1,16 @@
 // raft.cpp —— Raft 核心实现（2A / 2B / 2C / 2D 均已完整实现）
 
 #include "raft.h"
+#include "segment_log_store.h"
 #include <cstdio>
 #include <cstdlib>  // std::abort（P1-1：坏 snapshot blob 的 fail-stop）
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <cerrno>
+#include <cstring>
+#include <chrono>
 
 namespace raft {
 
@@ -42,11 +50,13 @@ static void Trace(const char* fmt, ...) {
 #endif
 
 // 原始循环（不做「末态取反」），供增量续算复用。
+// 注意：这是「底层 CRC32 原语」，被两处共用——raft.cpp 的 Crc32Update（P1-1
+// snapshot blob 校验）与 segment_log_store.cpp 的 SegmentLogStore（段文件记录校验）。
+// 故定义为非 static、在 raft.h 中声明，供两个翻译单元共享，避免两份拷贝。
 RAFT_NO_SANITIZE_THREAD
-static uint32_t Crc32Raw(uint32_t crc, const char* data, size_t n) {
-  // C++11 magic statics：lambda 内 static 表 + 外层 static 指针，
-  // 首次调用由运行时保证线程安全的单次初始化，消除 TSan data race。
-  // 不再用手写 if(!inited) 双检查锁（那正是竞态根源）。
+uint32_t Crc32Raw(uint32_t crc, const char* data, size_t n) {
+  // C++11 magic statics：lambda 内 static 表，首次调用由运行时保证线程安全的
+  // 单次初始化，消除 TSan data race。不再用手写 if(!inited) 双检查锁（那正是竞态根源）。
   static const uint32_t* table = []() {
     static uint32_t t[256];
     for (uint32_t i = 0; i < 256; ++i) {
@@ -72,6 +82,8 @@ int Crc32(const char* data, size_t n) {
   // 空串的 CRC32 == 0，故以 0 起算即为标准 CRC32。
   return static_cast<int>(Crc32Update(0, data, n));
 }
+
+
 
 // ===========================================================================
 // 第一部分：序列化（已实现，不用改）
@@ -274,6 +286,12 @@ Raft::Raft(std::vector<std::shared_ptr<labrpc::ClientEnd>> peers, int me,
   // 上越界读 → 段错误（2A 一启动就崩）。
   last_send_time_.assign(peers_.size(), raftcpp::TimePoint{});   // 复制线程上次发包时刻，用于节流
   inflight_log_time_.assign(peers_.size(), raftcpp::TimePoint{});// 在途 RPC 发出时刻，用于超时重发
+
+  // SegmentLogStore：file_backed 模式下把日志镜像到 append-only 段文件。
+  // 必须在 ReadPersist 之前创建——ReadPersist 要从段文件回放重建 logs_。
+  if (persister_->FileBacked() && !persister_->Dir().empty()) {
+    seg_log_ = SegmentLogStore::Open(persister_->Dir());
+  }
 
   // 重启后从磁盘恢复 raft state（含快照边界，见 ReadPersist）。
   ReadPersist(persister_->ReadRaftState());
@@ -804,10 +822,10 @@ void Raft::BecomeLeaderIfQuorumLocked() {
       Trace("S%d 当选补 no-op: term=%d idx=%d (commitIndex=%d, 有未提交旧尾巴)",
             me_, current_term_,
             LastLogIndexLocked() + 1, commit_index_);
-      logs_.push_back(
-          LogEntry{current_term_,
-                   LastLogIndexLocked() + 1, Command(""),
-                   EntryType::kNoOp});
+      LogEntry noop{current_term_, LastLogIndexLocked() + 1, Command(""),
+                    EntryType::kNoOp};
+      logs_.push_back(noop);
+      if (seg_log_) seg_log_->Append(noop);
       PersistLocked();
       // 读安全点 = 这条 no-op 自身的下标（push 之后 LastLogIndexLocked()
       // 就是它），不是它再 +1 —— 否则 no-op 提交后 commit_index_ 永远差 1，
@@ -1046,11 +1064,17 @@ void Raft::AppendEntries(const AppendEntriesArgs& args,
         // 任期冲突：砍掉从 e.index 开始的所有旧条目，再接上新的
         logs_.resize(pos);
         logs_.push_back(e);
+        // 段文件镜像：先截断尾部到 e.index-1，再追加这条新的（保证与 logs_ 对齐）
+        if (seg_log_) {
+          seg_log_->TruncateSuffix(e.index - 1);
+          seg_log_->Append(e);
+        }
         log_changed = true;
       }
       // 任期一样 = 已经有了，什么都不做（保证幂等）
     } else {
       logs_.push_back(e);
+      if (seg_log_) seg_log_->Append(e);
       log_changed = true;
     }
   }
@@ -1076,6 +1100,8 @@ void Raft::AppendEntries(const AppendEntriesArgs& args,
     if (new_commit > commit_index_) {
       commit_index_ = new_commit;
       apply_cv_.notify_all();
+      // Group Commit：已提交条目在对外成功前必须落盘 → 强制 fsync（忽略去抖窗口）
+      if (seg_log_) seg_log_->Sync(true);
     }
   }
 
@@ -1136,6 +1162,7 @@ void Raft::AdvanceCommitIndexLocked() {
     bool term_ok = (pos < logs_.size() && logs_[pos].term == current_term_);
     if (term_ok) {
       commit_index_ = n;
+      if (seg_log_) seg_log_->Sync(true);  // 已提交条目强制落盘
       apply_cv_.notify_all();
       heartbeat_seq_++;
       replicator_cv_.notify_all();
@@ -1184,7 +1211,9 @@ StartResult Raft::Start(const Command& command) {
   }
 
   int index = LastLogIndexLocked() + 1;
-  logs_.push_back(LogEntry{current_term_, index, command});
+  LogEntry entry{current_term_, index, command};
+  logs_.push_back(entry);
+  if (seg_log_) seg_log_->Append(entry);
   PersistLocked();
 
   result.is_leader = true;
@@ -1910,6 +1939,7 @@ void Raft::Snapshot(int index, const std::string& snapshot) {
     new_logs.push_back(std::move(logs_[i]));
   }
   logs_.swap(new_logs);
+  if (seg_log_) seg_log_->TruncatePrefix(index);  // 丢弃 <= 快照点的条目
 
   snapshot_index_ = index;
   snapshot_term_ = snap_term;
@@ -2111,10 +2141,17 @@ void Raft::InstallSnapshot(const InstallSnapshotArgs& args,
       }
       new_logs[0] = LogEntry{args.last_included_term, args.last_included_index, ""};
       logs_.swap(new_logs);
+      // ⚠️ 边界条目对齐：上方 pos 分支把 entry@last_included_index 一并保留进 logs_
+      // （哨兵与新日志首条同为 last_included_index，属于冗余保留，与非段模式状态机一致）。
+      // 因此段文件镜像也必须【保留】该边界条目 → 用 L-1（丢弃 <= L-1，保留 >= L）。
+      // 注意：Snapshot()（leader 自截）走的是另一条路——它会把边界条目从 logs_ 剔除，
+      // 所以那边用的是 TruncatePrefix(L)（丢弃 <= L）。两者语义不同，不要混用。
+      if (seg_log_) seg_log_->TruncatePrefix(args.last_included_index - 1);
     } else {
       // 极落后 follower：logs_ 整段被快照覆盖，重建只剩新哨兵。
       logs_.clear();
       logs_.push_back(LogEntry{args.last_included_term, args.last_included_index, ""});
+      if (seg_log_) seg_log_->TruncatePrefix(args.last_included_index);
     }
 
     // 推进 commit/lastApplied：snap 覆盖的条目都已被 leader 提交，ApplyLoop
@@ -2302,6 +2339,7 @@ StartResult Raft::ProposeConfChangeTo(int server, MemberRole target) {
   // 条目时必能看到该 cap。ApplyLoop apply 时还会再设一次（覆盖 follower / 重启重放）。
   // 非 kRemoved（加回 voter / 降级 learner）→ 清除冻结，否则加回后仍被误冻结。
   removed_at_index_[server] = (target == MemberRole::kRemoved) ? e.index : -1;
+  if (seg_log_) seg_log_->Append(e);
   logs_.push_back(std::move(e));
   pending_conf_index_ = e.index;           // 记下"这条在飞行"，单飞保护
   PersistLocked();
@@ -2322,10 +2360,16 @@ std::string Raft::EncodeRaftStateLocked() const {
   labrpc::Encoder e;
   e.Int(current_term_).Int(voted_for_);
   e.Int(snapshot_index_).Int(snapshot_term_);  // 快照元数据也要随状态恢复
-  e.Int(static_cast<int>(logs_.size()));
-  for (const LogEntry& en : logs_) {
-    e.Int(en.term).Int(en.index).Bytes(en.command)
-    .Int(static_cast<int>(en.type)).Int(en.conf_server).Int(en.conf_role);
+  if (seg_log_) {
+    // 段文件模式：日志独立落盘到 raft.log.seg，state blob 不再携带日志，
+    // 否则每次 PersistLocked 又变成 O(日志长度) 整体重写，失去 SegmentLogStore 意义。
+    e.Int(0);
+  } else {
+    e.Int(static_cast<int>(logs_.size()));
+    for (const LogEntry& en : logs_) {
+      e.Int(en.term).Int(en.index).Bytes(en.command)
+      .Int(static_cast<int>(en.type)).Int(en.conf_server).Int(en.conf_role);
+    }
   }
   // 持久化当前成员配置（与日志一起落盘，重启能恢复）。
   e.Int(static_cast<int>(is_member_.size()));
@@ -2345,11 +2389,22 @@ void Raft::PersistLocked() {
   std::string blob = EncodeRaftStateLocked();
   raft_state_bytes_ = blob.size();
   persister_->SaveRaftState(std::move(blob));
+  // Group Commit：把累积的段文件 append 按 debounce 窗口合并成一次 fsync。
+  // （内存模式 seg_log_ 为 nullptr，此行为空操作；state 仍由上面 SaveRaftState 原子落盘。）
+  if (seg_log_) seg_log_->Sync(false);
 }
 
 size_t Raft::RaftStateSize() const {
   std::lock_guard<std::mutex> lk(mu_);
   return RaftStateSizeLocked();
+}
+
+size_t Raft::RaftStateSizeLocked() const {
+  size_t sz = raft_state_bytes_;
+  // 段文件模式：日志独立落盘到 raft.log.seg，state blob 不含日志，
+  // 必须把段文件大小补进 RaftStateSize，否则磁盘水位保护（#2.2）会低估已落盘体积。
+  if (seg_log_) sz += seg_log_->FileSize();
+  return sz;
 }
 
 void Raft::ReadPersist(const std::string& data) {
@@ -2363,15 +2418,27 @@ void Raft::ReadPersist(const std::string& data) {
   if (n < 0 || n > (1 << 22)) return;
 
   std::vector<LogEntry> logs;
-  logs.reserve(static_cast<size_t>(n));
-  for (int i = 0; i < n; i++) {
-    LogEntry en;
-    int et = 0;
-    if (!(d.Int(en.term) && d.Int(en.index) && d.Bytes(en.command) &&
-          d.Int(et) && d.Int(en.conf_server) && d.Int(en.conf_role)))
-      return;
-    en.type = static_cast<EntryType>(et);
-    logs.push_back(std::move(en));
+  if (seg_log_) {
+    // 段文件模式：日志不在 state blob 里，从 raft.log.seg 回放重建。
+    // 此时 n 必为 0（EncodeRaftStateLocked 在段模式下写 0），上面循环体为空，
+    // 这里直接用段文件镜像覆盖。snap_idx/snap_term 用于构造哨兵。
+    // ⚠️ 参数顺序必须与 Replay(int snap_term, int snap_idx) 签名一致：
+    // 之前写成 Replay(snap_idx, snap_term) 把两参交换，导致哨兵被构造成
+    // LogEntry{term=snap_idx, index=snap_term}（term=20, index=1），
+    // leader 发 prev_log_index=20 时取到 logs_[0].term=20 → 与 follower
+    // （entry@20 真实 term=1）永远不一致 → TestFileBackedCrashAfterSnapshot 偶发卡死。
+    logs = seg_log_->Replay(snap_term, snap_idx);
+  } else {
+    logs.reserve(static_cast<size_t>(n));
+    for (int i = 0; i < n; i++) {
+      LogEntry en;
+      int et = 0;
+      if (!(d.Int(en.term) && d.Int(en.index) && d.Bytes(en.command) &&
+            d.Int(et) && d.Int(en.conf_server) && d.Int(en.conf_role)))
+        return;
+      en.type = static_cast<EntryType>(et);
+      logs.push_back(std::move(en));
+    }
   }
 
   current_term_ = term;
@@ -2454,6 +2521,11 @@ void Raft::ReadPersist(const std::string& data) {
       saved_blob_index_ = snapshot_index_;
     }
   }
+  // 段文件模式：以权威内存日志 logs 为基准，重建段文件镜像 entries_，保证
+  // 「entries_ == logs 去掉哨兵」这一不变式在重启后恒成立（覆盖 blob 追认、
+  // InstallSnapshot 保留边界条目等导致 logs_ 与 entries_ 漂移的场景）。
+  // 内部带 O(n) 等值校验：一致时直接跳过昂贵的整文件重写 + fsync，不引入额外延迟。
+  if (seg_log_) seg_log_->ResetFromLogs(logs);
   logs_ = std::move(logs);
   // 恢复成员配置（与 state 一起落盘）。peer 数与磁盘不符时退化为全 voter（安全默认）。
   {

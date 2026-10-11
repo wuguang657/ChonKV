@@ -66,6 +66,7 @@ add_executable(raft_test
   ${CMAKE_CURRENT_SOURCE_DIR}/src/raft/config.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/raft/test_raft.cpp
   ${RAFT_SRC}
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/raft/segment_log_store.cpp
 )
 
 # src/ 用来引 "common/..."、"labrpc/..."；src/raft 用来引 "raft.h"
@@ -110,6 +111,7 @@ endif()
 add_executable(kv_test
   ${CMAKE_CURRENT_SOURCE_DIR}/src/labrpc/labrpc.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/raft/raft.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/raft/segment_log_store.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/kvraft/server.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/kvraft/client.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/kvraft/config.cpp

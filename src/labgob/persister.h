@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <dirent.h>
 
 namespace labgob {
 // inline关键字：该函数被多次.h包含编译合法
@@ -119,13 +120,6 @@ inline std::string CopyDir(const std::string& src) {
   static std::atomic<uint64_t> seq{0};   // 全局自增，保证每次克隆的目录名不撞车
   std::string::size_type slash = src.find_last_of('/');
   std::string parent = (slash == std::string::npos) ? "." : src.substr(0, slash);
-  // ⚠️ 扁平命名：副本名只由全局自增 seq 决定，刻意【不】沿用源目录名。
-  //   旧写法 dst = parent + "/" + base + "_copy_" + seq（base 取源目录 basename），
-  //   会在反复重启时逐层嵌套：node_3 → node_3_copy_54 → node_3_copy_54_copy_64 …
-  //   Figure 8 等高频 crash/重启用例几十轮后目录名撑爆 NAME_MAX(255)，
-  //   mkdir 失败 → MkdirAll 返 false → std::abort() 把整个测试进程打挂。
-  //   改成 copy_<seq> 后，无论重启多少次，单路径分量长度恒定（"copy_" + 19 位十进制），
-  //   绝不会超 255。所有副本仍落在同一 parent 下，Cleanup 的 RemoveTree(base) 一并清掉。
   std::string dst;
   do {
     dst = parent + "/copy_" + std::to_string(++seq);
@@ -135,24 +129,33 @@ inline std::string CopyDir(const std::string& src) {
     std::fprintf(stderr, "Persister: CopyDir MkdirAll failed: %s\n", dst.c_str());
     std::abort();
   }
-  for (const char* name : {"raft_state.bin", "snapshot.bin"}) {
+  // 克隆目录下【所有】常规落盘文件（raft_state.bin / snapshot.bin /
+  // raft.log.seg 等），不再写死文件名。
+  DIR* d = ::opendir(src.c_str());
+  if (d == nullptr) {
+    std::fprintf(stderr, "Persister: CopyDir opendir failed: %s\n", src.c_str());
+    std::abort();
+  }
+  for (struct dirent* ent = ::readdir(d); ent != nullptr; ent = ::readdir(d)) {
+    std::string name = ent->d_name;
+    if (name == "." || name == "..") continue;
+    if (name.size() >= 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) continue;
     std::string src_file = src + "/" + name;
-    // 文件不存在 = 源目录里本来就没它（比如该节点还没落过快照），合法，跳过
-    if (!FileExists(src_file)) continue;
+    struct stat st;
+    if (::stat(src_file.c_str(), &st) != 0) continue;
+    if (!S_ISREG(st.st_mode)) continue;  // 只拷常规文件，跳过子目录
     std::string content;
-    // 读不到 = 源目录里本来就没这个文件（比如该节点还没落过快照），合法，跳过
-    // 存在却读不出来 = 磁盘 I/O 错误，绝不能跳过，否则副本残缺、新节点「失忆」
     if (!ReadFile(src_file, &content)) {
       std::fprintf(stderr, "Persister: CopyDir read failed: %s\n", src_file.c_str());
       std::abort();
     }
-    // 写失败 = 磁盘拒绝了这次写，是真错误，绝不能当无事发生
     if (!WriteFileSync(dst + "/" + name, content)) {
       std::fprintf(stderr, "Persister: CopyDir write failed: %s/%s\n",
-                   dst.c_str(), name);
+                   dst.c_str(), name.c_str());
       std::abort();
     }
   }
+  ::closedir(d);
   return dst;
 }
 

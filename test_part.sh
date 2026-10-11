@@ -155,6 +155,11 @@ case "$PART" in
       TestChunkedSnapshotTransmit
       TestChunkedSnapshotLargeStateMachine
     ) ;;
+  SegmentLog)
+    TESTS=(
+      TestSegmentLogStore
+      TestSegmentLogStoreAbort
+    );;
   # ---- 生产级扩展（raft_test 的 Ext 用例）----
   # 每条进程拿【全名】当过滤词，命中 main() 的精确匹配模式 —— 这些用例名
   # 互为前缀（TestReadIndex vs TestReadIndexNoStale...），若走子串匹配
