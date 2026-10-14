@@ -143,18 +143,17 @@
 
 **第一批（P0，持久化）**  
 6\. [ ] macOS 跑通 tiny-lsm  
-7\. [ ] `LogStore` 接口重构（纯重构，测试全绿）  
-8\. [ ] tiny-lsm 后台 compaction（否则接入必卡）  
-9\. [ ] 状态机接 tiny-lsm（走事务 API）  
-10\. [ ] 快照：flush_all + 导出 → checkpoint
+7\. [ ] tiny-lsm 后台 compaction（否则接入必卡）  
+8\. [ ] 状态机接 tiny-lsm（走事务 API）  
+9\. [ ] 快照：flush_all + 导出 → checkpoint
 
 **第二批（P1，可用性与性能）**  
-11\. [ ] 快照分块流式传输（#8，未做）
+10\. [ ] 快照分块流式传输（#8，核心分块+CRC+频率节流已完成；abort 协议/断点续传/mTLS 待做）
 
 **第三批（P2，工程成熟度）**  
-12\. [ ] 可观测性：metrics（term / commit / apply lag / log size / snapshot 大小 / RPC 延迟）+ 结构化日志  
-13\. [ ] 混沌测试 / 故障注入（在现有 tester 基础上加）  
-14\. [ ] 锁粒度优化
+11\. [ ] 可观测性：metrics（term / commit / apply lag / log size / snapshot 大小 / RPC 延迟）+ 结构化日志  
+12\. [ ] 混沌测试 / 故障注入（在现有 tester 基础上加）  
+13\. [ ] 锁粒度优化
 
 ---
 
@@ -171,19 +170,6 @@
 - `sst.h:72` — BloomFilter 已接入
 - `transaction.h:17` / `transation.cpp:197` — SERIALIZABLE 未实现
 - `xmake.lua:109` — `lsm_shared` 静态库目标
-
-
-
----
-
-## A. 仍有效的部分（保留原文，未过期）
-
-- **§4 tiny-lsm 分析**（4.0–4.5）：持久化层对接分析与 4 个坑仍有效（WAL 仅事务路径写、前台 compaction 阻塞、无 Manifest、`WAL::flush()` 空实现）。
-- 以下"确仍缺失/未做"的小节结论正确，已在 §九.C 清单中保留：§2.1 快照分块、§2.2 CRC、§3.1 锁粒度。
-
-## B. 剔除「持久化 + 网络」后的剩余待做清单（2026-10-01）
-
-> **过滤口径**：持久化类（#10 真持久化 tiny-lsm、#11 Group Commit、#7 真·磁盘占比、#6 的 CRC、C4 log CRC、E4 Storage 接口、E5 Ready/Advance、E6 unstable 缓冲、D7 WAL 分离）与网络类（#14 网络流控、C2 字节 inflight、D2 快照限速、D3 Msg 优先级）已剔除。以下为剩下的真·待做。
 
 ### 一、raft 算法本身（语义 / 正确性 / 效率，面试含金量最高）
 

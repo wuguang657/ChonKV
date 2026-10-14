@@ -5212,7 +5212,7 @@ static bool RaftUnitTestSegmentLogStore(std::string* err) {
 
   // ---- 1) 追加 1..5 + 回放 ----
   {
-    auto s = SegmentLogStore::Open(dir);
+    auto s = SegmentLogStorage::Open(dir);
     for (int i = 1; i <= 5; i++) s->Append(mkentry(1, i, "cmd" + std::to_string(i)));
     s->Sync(true);
     std::vector<LogEntry> logs = s->Replay(0, 0);  // 哨兵(0,0) + 1..5
@@ -5222,7 +5222,7 @@ static bool RaftUnitTestSegmentLogStore(std::string* err) {
   }
   // ---- 2) 重新打开（模拟重启）→ 仍 1..5 ----
   {
-    auto s = SegmentLogStore::Open(dir);
+    auto s = SegmentLogStorage::Open(dir);
     std::vector<LogEntry> logs = s->Replay(0, 0);
     if (!check(logs.size() == 6 && logs.back().index == 5, "reopen replay != 1..5"))
       return false;
@@ -5235,7 +5235,7 @@ static bool RaftUnitTestSegmentLogStore(std::string* err) {
   }
   // ---- 3) 重新打开 → 只有 1..3；再前缀截断到 2（保留 3）----
   {
-    auto s = SegmentLogStore::Open(dir);
+    auto s = SegmentLogStorage::Open(dir);
     std::vector<LogEntry> logs = s->Replay(0, 0);
     if (!check(logs.size() == 4 && logs.back().index == 3, "reopen after trunc suffix"))
       return false;
@@ -5246,7 +5246,7 @@ static bool RaftUnitTestSegmentLogStore(std::string* err) {
     s->Sync(true);
   }
   {
-    auto s = SegmentLogStore::Open(dir);
+    auto s = SegmentLogStorage::Open(dir);
     std::vector<LogEntry> logs = s->Replay(0, 0);
     if (!check(logs.size() == 2 && logs.back().index == 3, "reopen after trunc prefix"))
       return false;
@@ -5255,7 +5255,7 @@ static bool RaftUnitTestSegmentLogStore(std::string* err) {
   {
     cleanup();
     mkdirs();
-    auto s = SegmentLogStore::Open(dir);
+    auto s = SegmentLogStorage::Open(dir);
     for (int i = 1; i <= 3; i++) s->Append(mkentry(1, i, "x" + std::to_string(i)));
     s->Sync(true);
     // 翻转段文件尾部第 5 字节（落在最后一条记录的 crc/数据区）
@@ -5267,7 +5267,7 @@ static bool RaftUnitTestSegmentLogStore(std::string* err) {
     std::fseek(f, -5, SEEK_END);
     std::fputc(c ^ 0xFF, f);
     std::fclose(f);
-    auto s2 = SegmentLogStore::Open(dir);  // Rebuild 应拒绝损坏的最后一条
+    auto s2 = SegmentLogStorage::Open(dir);  // Rebuild 应拒绝损坏的最后一条
     std::vector<LogEntry> logs = s2->Replay(0, 0);
     if (!check(logs.size() == 3 && logs.back().index == 2, "crc corrupt tail != 1..2"))
       return false;
@@ -5276,7 +5276,7 @@ static bool RaftUnitTestSegmentLogStore(std::string* err) {
   {
     cleanup();
     mkdirs();
-    auto s = SegmentLogStore::Open(dir);
+    auto s = SegmentLogStorage::Open(dir);
     for (int i = 1; i <= 3; i++) s->Append(mkentry(1, i, "r" + std::to_string(i)));
     s->Sync(true);
     // 5a) 传与 entries_ 完全一致的 logs → 不变式保持（fast-path 不重写也正确）
@@ -5299,7 +5299,7 @@ static bool RaftUnitTestSegmentLogStore(std::string* err) {
   {
     cleanup();
     mkdirs();
-    auto s = SegmentLogStore::Open(dir);
+    auto s = SegmentLogStorage::Open(dir);
     for (int i = 1; i <= 3; i++) s->Append(mkentry(1, i, "l" + std::to_string(i)));
     s->Sync(true);
     // 翻转第一条记录 len 字段最高字节（offset 3，LE 高位）使其 > 256MB → 非法长度
@@ -5309,7 +5309,7 @@ static bool RaftUnitTestSegmentLogStore(std::string* err) {
     std::fseek(f, 3, SEEK_SET);
     std::fputc(0xFF, f);  // MSB of record1 len → huge → 非法长度
     std::fclose(f);
-    auto s2 = SegmentLogStore::Open(dir);  // Rebuild: 非法长度 → 安全丢弃全部
+    auto s2 = SegmentLogStorage::Open(dir);  // Rebuild: 非法长度 → 安全丢弃全部
     std::vector<LogEntry> logs = s2->Replay(0, 0);
     if (!check(logs.size() == 1 && logs[0].index == 0,
                "len 损坏非法长度未安全丢弃（应仅剩哨兵）"))
@@ -5363,7 +5363,7 @@ static bool RaftUnitTestSegmentLogStoreAbort(std::string* err) {
     std::system(("rm -rf " + dir).c_str());
     std::system(("mkdir -p " + dir).c_str());
     {
-      auto s = SegmentLogStore::Open(dir);
+      auto s = SegmentLogStorage::Open(dir);
       for (int i = 1; i <= 3; i++) s->Append(mk(1, i, "x" + std::to_string(i)));
       s->Sync(true);
     }  // s 析构关闭 fd，再破坏文件
@@ -5376,7 +5376,7 @@ static bool RaftUnitTestSegmentLogStoreAbort(std::string* err) {
     std::fputc(c ^ 0xFF, f);
     std::fclose(f);
     bool aborted = SegLogExpectAbort([&]() {
-      auto s = SegmentLogStore::Open(dir);  // Rebuild 检测到中段 CRC 损坏 → abort
+      auto s = SegmentLogStorage::Open(dir);  // Rebuild 检测到中段 CRC 损坏 → abort
       (void)s;
     });
     std::system(("rm -rf " + dir).c_str());
@@ -5391,7 +5391,7 @@ static bool RaftUnitTestSegmentLogStoreAbort(std::string* err) {
     std::system(("rm -rf " + dir).c_str());
     std::system(("mkdir -p " + dir).c_str());
     bool aborted = SegLogExpectAbort([&]() {
-      auto s = SegmentLogStore::Open(dir);
+      auto s = SegmentLogStorage::Open(dir);
       s->Append(mk(1, 1, "a"));
       s->Append(mk(1, 3, "c"));  // 跳过 index 2 → 非连续
     });

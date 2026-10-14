@@ -413,9 +413,9 @@ struct StartResult {
 int CountGrantedVotes(const std::vector<MemberRole>& is_member,
                       const std::vector<int>& votes);
 
-// 前置声明：Raft log 的 append-only 段文件存储（file_backed 模式专用）。
-// 完整定义见 raft.cpp（含 CRC 校验、ftruncate 截断、Group Commit 批量 fsync）。
-class SegmentLogStore;
+// 前置声明：Raft log 持久化后端的抽象接口（依赖反转，只认接口不认具体类）。
+// 完整定义见 segment_log_store.h（含 SegmentLogStorage / MemoryLogStorage / 工厂）。
+class LogStorage;
 
 
 class Raft : public std::enable_shared_from_this<Raft> {
@@ -696,9 +696,10 @@ class Raft : public std::enable_shared_from_this<Raft> {
 
   // ---- 2B：日志 ----
   std::vector<LogEntry> logs_;    // logs_[0] 是哨兵，index = snapshot_index_
-  // file_backed 模式：把 logs_ 镜像到 append-only 段文件（SegmentLogStore）。
-  // 内存模式（file_backed=false）时为 nullptr，读路径全走 logs_ 向量，零额外开销。
-  std::unique_ptr<SegmentLogStore> seg_log_;
+  // 日志持久化后端（依赖反转：只认 LogStorage 接口，不认具体类）。
+  // 由 CreateLogStorage 工厂按 file_backed 注入 SegmentLogStorage / MemoryLogStorage；
+  // 内存模式下注入 MemoryLogStorage（null-object），读路径仍全走 logs_ 向量。
+  std::unique_ptr<LogStorage> log_store_;
   int commit_index_ = 0;
   int last_applied_ = 0;
   std::shared_ptr<raftcpp::Chan<ApplyMsg>> apply_ch_;
@@ -876,7 +877,7 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // 由 PersistLocked() 编码后写入；ReadPersist() 末尾用一次 EncodeRaftStateLocked() 初始化（构造期仅一次）。
   // 读取方须持 mu_（Start() / RaftStateSize() / ProposeConfChangeTo 均持锁）。
   size_t raft_state_bytes_ = 0;
-  // 实现见 raft.cpp：需在 SegmentLogStore 完整定义之后，故不能在此内联。
+  // 实现见 raft.cpp：需在 LogStorage 完整定义之后，故不能在此内联。
   // 段文件模式下会把 raft.log.seg 大小补进 RaftStateSize，保证磁盘水位保护（#2.2）仍生效。
   size_t RaftStateSizeLocked() const;
 
