@@ -180,14 +180,15 @@ void Network::SendReq(std::shared_ptr<ReqMsg> req) {
     dropped->cancel = req->cancel;
     dropped->kind = EventKind::kDeliverReply;
     dropped->ok = false;
-    Schedule(dropped, 0);
+    Schedule(dropped, 0);  // 0延迟，把失败回信事件立即塞进TimerLoop中
     return;
   }
-
+  // .....................
   count_.fetch_add(1);
   bytes_.fetch_add(static_cast<int64_t>(req->args.size()));
 
-  // 在锁里读一次快照，出了锁就只能相信这份快照（Go 版也是这么干的）。
+  // 在锁里读一次快照，返回当前endname网线状态。里面包含该endname连接到的server
+  // 网线状态（三个混沌开关），是否enabled
   EndInfo info;
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -204,7 +205,7 @@ void Network::SendReq(std::shared_ptr<ReqMsg> req) {
   e->servername = info.servername;
   e->server = info.server;
   e->reliable = info.reliable;
-  e->longreordering = info.longreordering;
+  e->longreordering = info.longreordering; // 是否延迟回包
 
   if (info.enabled && info.server) {
     // 通路正常，准备投递给服务端
@@ -223,11 +224,13 @@ void Network::Schedule(std::shared_ptr<TimerEvent> e, int64_t delay_ms) {
   {
     std::lock_guard<std::mutex> lk(mu_);
     auto at = raftcpp::Now() + std::chrono::milliseconds(delay_ms);
-    timers_.emplace(at, std::move(e));
+    timers_.emplace(at, std::move(e));    // multimap  xx时刻有一个发信/回信事件
   }
-  timer_cv_.notify_one();
+  timer_cv_.notify_one();     // 唤醒notify_one立即投递
 }
 
+// 一张 TimerEvent 工单，塞进按时间排序的 multimap；回包时同一张工单翻成"送回顾客"状态再塞回同一个 multimap；请求侧有一道 10% 丢包闸，回包侧在塞回前有一道 10% 丢包闸 + 一道乱序延迟闸；全在本地进程内模拟。
+// 每塞一张，就按截止时间自动插到正确的位置
 void Network::TimerLoop() {
   std::unique_lock<std::mutex> lk(mu_);
   while (!stopped_.load()) {
@@ -236,12 +239,7 @@ void Network::TimerLoop() {
       continue;
     }
     auto first = timers_.begin();
-    // ⚠️ macOS libc++ 兼容性修复（不改变 Lab 2 语义）。
-    // 不能直接 wait_until(绝对 time_point)：当 first->first 已经"刚刚过去"时，
-    // libc++ 会转出 tv_sec 为负的非法 timespec，pthread_cond_timedwait 返回
-    // EINVAL → 抛 system_error("condition_variable timed_wait failed: Invalid argument")。
-    // KV 测试（3B 重启用例）高频重建定时器时极易踩中。改用相对 wait_for 并先做
-    // "已过期则跳过"的保护，逻辑完全等价。
+
     auto due_in = first->first - raftcpp::Now();
     if (due_in > std::chrono::milliseconds(0)) {
       timer_cv_.wait_for(lk, due_in);

@@ -197,6 +197,7 @@ class Server {
 // 生产部署或测试可用 SetMaxMessageBytes() 收紧。
 constexpr size_t kMaxRpcMessageBytesDefault = 64u * 1024u * 1024u;  // 64 MiB
 
+// 中央交换机
 class Network {
  public:
   Network();
@@ -241,7 +242,7 @@ class Network {
   bool IsStopped() const { return stopped_.load(); }
 
  private:
-  enum class EventKind { kDispatch, kDeliverReply };
+  enum class EventKind { kDispatch, kDeliverReply }; // 投递请求还是投递回包
 
   struct TimerEvent {
     EventKind kind = EventKind::kDispatch;

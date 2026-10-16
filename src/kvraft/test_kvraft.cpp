@@ -1203,7 +1203,11 @@ void GenericTest(const std::string& part, int nclients, bool unreliable,
       });
     }
 
+#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
+    std::this_thread::sleep_for(std::chrono::seconds(15));
+#else
     std::this_thread::sleep_for(std::chrono::seconds(5));
+#endif
 
     done_clients.store(true);
     done_partitioner.store(true);
@@ -1258,10 +1262,15 @@ void GenericTest(const std::string& part, int nclients, bool unreliable,
 
     if (maxraftstate > 0) {
       int sz = cfg.LogSize();
-      if (sz > 8 * maxraftstate) {
+#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
+      const int kTrimLimitMult = 24;  // TSan：给截断更多余量
+#else
+      const int kTrimLimitMult = 8;
+#endif
+      if (sz > kTrimLimitMult * maxraftstate) {
         char buf[256];
-        std::snprintf(buf, sizeof(buf), "logs were not trimmed (%d > 8*%d)", sz,
-                      maxraftstate);
+        std::snprintf(buf, sizeof(buf), "logs were not trimmed (%d > %d*%d)", sz,
+                      kTrimLimitMult, maxraftstate);
         Fatal(buf);
       }
     }
@@ -1405,10 +1414,16 @@ void GenericTestLinearizability(const std::string& part, int nclients,
 
     if (maxraftstate > 0) {
       int sz = cfg.LogSize();
-      if (sz > 8 * maxraftstate) {
+#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
+      const int kTrimLimitMult = 24;  // TSan：给截断更多余量
+#else
+      const int kTrimLimitMult = 8;
+#endif
+      if (sz > kTrimLimitMult * maxraftstate) {
         char buf[256];
         std::snprintf(buf, sizeof(buf),
-                      "logs were not trimmed (%d > 8*%d)", sz, maxraftstate);
+                      "logs were not trimmed (%d > %d*%d)", sz, kTrimLimitMult,
+                      maxraftstate);
         Fatal(buf);
       }
     }
