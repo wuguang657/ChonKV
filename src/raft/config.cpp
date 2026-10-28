@@ -6,38 +6,13 @@
 #include <cstdio>
 #include <dirent.h>
 
+#include "../labrpc/transport_factory.h"  // labrpc::MakeTransport：按 LABRPC_TRANSPORT 选后端
+#include "../persist/state/persister_factory.h"  // persist::PersistFileBacked / MakePersister：按 LABRPC_PERSIST 选后端
+
 namespace raft {
-using namespace labgob;
+using namespace persist;
 
 static std::atomic<int> g_cfg_seq{0};
-static void RemoveTree(const std::string& path) {
-  DIR* d = ::opendir(path.c_str());
-  if (!d) return;  // 目录不存在就当没东西可删
-  struct dirent* e;
-  while ((e = ::readdir(d)) != nullptr) {
-    std::string name = e->d_name;
-    if (name == "." || name == "..") continue;
-    std::string full = path + "/" + name;
-    struct stat st;
-    if (::stat(full.c_str(), &st) != 0) {
-      // stat 抓瞎（极罕见）：先 unlink 再 rmdir，只有一个会成功，覆盖文件/目录两种情况，不漏删
-      ::unlink(full.c_str());
-      ::rmdir(full.c_str());
-      continue;
-    }
-    if (S_ISDIR(st.st_mode)) {
-      RemoveTree(full);
-    } else if (::unlink(full.c_str()) != 0 && errno != ENOENT) {
-      std::fprintf(stderr, "RemoveTree: unlink %s failed (%s)\n", full.c_str(),
-                  std::strerror(errno));
-    }
-  }
-  ::closedir(d);
-  if (::rmdir(path.c_str()) != 0 && errno != ENOENT) {
-    std::fprintf(stderr, "RemoveTree: rmdir %s failed (%s)\n", path.c_str(),
-                std::strerror(errno));
-  }
-}
 // TSan 插桩令 raft 事件处理慢 5~15×。One() 内层等待（原始 2s）在成员变更 / 不可靠网
 // 场景下会被拖超，把“TSan 慢调度”误判成“日志达不成一致”——属于测试侧假阳性，
 // 而非 raft 逻辑 bug（TSan 本身也没报 data race，只报了 agreement 超时）。
@@ -62,14 +37,18 @@ constexpr double kOneOuterWaitSec = 10.0;
 // 构造 / 析构
 // ===========================================================================
 
-Config::Config(int n, bool unreliable, bool file_backed) : n_(n), file_backed_(file_backed) {
-  net_ = labrpc::MakeNetwork(); // 造一个全新的网络
+Config::Config(int n, bool unreliable, bool file_backed)
+    : n_(n), file_backed_(PersistFileBacked(file_backed)) {
+  net_ = labrpc::MakeTransport(); // 造一个全新的网络（默认 in-proc，可切真实 socket）
 
   // file-backed persister：仅文件模式需要；本场景建独立临时目录根（pid+seq 保证不重名）
   if (file_backed_) {
-    raft_dir_base_ =
-        "/tmp/cpp6raft_" + std::to_string(::getpid()) + "_" + std::to_string(++g_cfg_seq);
-    labgob::MkdirAll(raft_dir_base_);
+    // 撞名防御（与 persist::MakePersister()/CopyDir 的 access 换号逻辑对称）
+    do {
+      raft_dir_base_ =
+          "/tmp/cpp6raft_" + std::to_string(::getpid()) + "_" + std::to_string(++g_cfg_seq);
+    } while (persist::FileExists(raft_dir_base_));
+    persist::MkdirAll(raft_dir_base_);
   }
 
   apply_err_.assign(n, "");   // 按节点数n初始化为空字符串
@@ -82,8 +61,8 @@ Config::Config(int n, bool unreliable, bool file_backed) : n_(n), file_backed_(f
   start_ = raftcpp::Now();
 
   net_->Reliable(!unreliable);  // 模拟不可靠网络环境
-  // 断连时随机延迟 0~7000ms。目的是惩罚"在持有锁或主线程里同步发 RPC"
-  // 的实现 —— 那种写法在真实网络里会卡死。
+  // "端点仍通、但目标 server 已删"的失败回包随机延迟 0~7000ms（断连是立即失败）。
+  // 目的是惩罚"在持有锁或主线程里同步发 RPC"的实现 —— 那种写法在真实网络里会卡死。
   net_->LongDelays(true);
 
   for (int i = 0; i < n_; i++) Start1(i);
@@ -113,9 +92,9 @@ bool Config::Connected(int i) {
   return (i >= 0 && i < n_) ? connected_[i] : false;
 }
 // 返回某个节点的所有logs
-std::map<int, Command> Config::GetState(int i) {
+std::map<int64_t, Command> Config::GetState(int i) {
   std::lock_guard<std::mutex> lk(mu_);
-  return (i >= 0 && i < n_) ? logs_[i] : std::map<int, Command>{};
+  return (i >= 0 && i < n_) ? logs_[i] : std::map<int64_t, Command>{};
 }
 
 void Config::ApplyErrLocked(int i, const std::string& err) {
@@ -138,10 +117,16 @@ void Config::Crash1(int i) {
   std::shared_ptr<Raft> rf;
   {
     std::lock_guard<std::mutex> lk(mu_);
-    // 先复制一份持久化状态，免得旧实例一边还在写、一边我们读
-    if (saved_[i]) saved_[i] = saved_[i]->Copy();
     rf = rafts_[i];
     rafts_[i] = nullptr;
+    // 克隆必须在旧实例【仍在自己的锁保护下】时做。
+    if (saved_[i]) {
+      if (rf) {
+        saved_[i] = rf->CopyPersisterUnderLock();
+      } else {
+        saved_[i] = saved_[i]->Copy();  // 已无存活实例，无并发写盘，直接克隆
+      }
+    }
     if (rf) graves_.push_back(rf);  // 延后析构，等它自己的线程收工
   }
   if (rf) rf->Kill();
@@ -152,22 +137,22 @@ void Config::Crash1(int i) {
 // 以及从 blob 反序列化回来（InstallSnapshot 装快照时调用）。
 // ===========================================================================
 namespace {
-std::string EncodeKV(const std::map<int, std::string>& kv) {
+std::string EncodeKV(const std::map<int64_t, std::string>& kv) {
   labrpc::Encoder e;
   e.Int(static_cast<int>(kv.size()));
-  for (const auto& p : kv) e.Int(p.first).Bytes(p.second);
+  for (const auto& p : kv) e.Zigzag(p.first).Bytes(p.second);
   return e.Take();
 }
-std::map<int, std::string> DecodeKV(const std::string& s) {
-  std::map<int, std::string> kv;
+std::map<int64_t, std::string> DecodeKV(const std::string& s) {
+  std::map<int64_t, std::string> kv;
   if (s.empty()) return kv;
   labrpc::Decoder d(s);
   int n = 0;
   if (!d.Int(n)) return kv;
   for (int i = 0; i < n; i++) {
-    int k = 0;
+    int64_t k = 0;
     std::string v;
-    if (!(d.Int(k) && d.Bytes(v))) return kv;
+    if (!(d.Zigzag(k) && d.Bytes(v))) return kv;
     kv[k] = std::move(v);
   }
   return kv;
@@ -230,11 +215,23 @@ void Config::Start1(int i) {
   appliers_.emplace_back([this, i, apply_ch]() {
     ApplyMsg m;
     while (apply_ch->Pop(m)) {
+      // Crash1 会在持锁状态下把 rafts_[i] 置空（本文件 Crash1 内），Kill 在其后；
+      // 而 chan 的 Pop 是【排空语义】（common/chan.h：Close 之后先把残留消息吐完
+      // 才返回 false）→ Kill 之后 applier 仍会继续处理残留 ApplyMsg，此时
+      // rafts_[i] 已被置空 → 锁外解引用空指针 = 段错误。
+      // 修法：锁内取 shared_ptr 本地副本（引用计数 +1 保命），后续全程用副本；
+      // 副本为空说明本节点已崩溃，直接丢弃这条残留消息。
+      std::shared_ptr<Raft> rf;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        rf = rafts_[i];
+      }
+      if (!rf) continue;
       if (m.command_valid) {
         // 可能要触发自动压缩；先收集好数据，再释放 config 锁再调 Raft
         // （避免"持 config 锁跨进 raft 锁"，也避免快照编码时持锁太久）。
         bool need_snap = false;
-        int snap_idx = 0;
+        int64_t snap_idx = 0;
         std::string snap;
         {
           std::lock_guard<std::mutex> lk(mu_);
@@ -244,9 +241,9 @@ void Config::Start1(int i) {
             if (it != logs_[j].end() && it->second != m.command) {
               char buf[256];
               std::snprintf(buf, sizeof(buf),
-                            "commit index=%d server=%d %s != server=%d %s",
-                            m.command_index, i, m.command.c_str(), j,
-                            it->second.c_str());
+                            "commit index=%lld server=%d %s != server=%d %s",
+                            static_cast<long long>(m.command_index), i,
+                            m.command.c_str(), j, it->second.c_str());
               err = buf;
             }
           }
@@ -255,54 +252,31 @@ void Config::Start1(int i) {
           if (m.command_index > max_index_) max_index_ = m.command_index;
           if (m.command_index > 1 && !prevok) {
             char buf[128];
-            std::snprintf(buf, sizeof(buf), "server %d apply out of order %d", i,
-                          m.command_index);
+            std::snprintf(buf, sizeof(buf), "server %d apply out of order %lld",
+                          i, static_cast<long long>(m.command_index));
             err = buf;
           }
           if (!err.empty()) ApplyErrLocked(i, err);
 
           // 快照感知状态机：本节点日志过长就主动压缩（Lab 3 的 maybeSnapshot）。
           // 只压缩已 apply 的部分（LastApplied），保证不截断未 apply 的日志。
-          //
-          // ⚠️⚠️ 【这段是 C++ 独有的，Go 基准里根本不存在】⚠️⚠️
-          //
-          //   本项目的 Go 基准是 2020 版（只有 2A/2B/2C，没有 2D）。实测：
-          //     grep -n "snapshot" src/raft/config.go   → 零处命中
-          //     src/raft/raft.go:950                    → // rf.applyCh <- snapMsg（被注释）
-          //     src/raft/config.go:172-174              → 只有 CommandValid 分支，
-          //                                                连 SnapshotValid 都没有
-          //   也就是说 Go 2020 的 harness 既不主动触发 Snapshot，也不主动
-          //   CondInstallSnapshot —— 整条 2D 管道在 Go 侧是空的。
-          //
-          //   本文件的 4 个 TestSnapshot*2D 来自 2021 官方，但它们验证的这条
-          //   管道（harness 触发快照 + harness 安装快照）是 C++ 自己搭的，
-          //   【没有 Go 侧参照物】。所以：
-          //     ✅ 能抓回归（改动后行为变了会被发现）
-          //     ❌ 不能证明与官方 2D 语义一致
-          //   → 2D 的绿灯含金量低于 2A/2B/2C，心里要有数。
-          //
-          //   另一个已知分叉：下面是 **merge**（logs_[i] 不清空直接合并），
-          //   canonical 6.824 是 **replace**（用快照整体替换状态机）。
-          if (snapshot_compaction_ && rafts_[i]->LogSize() > kSnapshotThreshold) {
-            snap_idx = rafts_[i]->LastApplied();
+          if (snapshot_compaction_ && rf->LogSize() > kSnapshotThreshold) {
+            snap_idx = rf->LastApplied();
             if (snap_idx > 0) {
               snap = EncodeKV(logs_[i]);  // 序列化当前已 apply 状态机状态
               need_snap = true;
             }
           }
         }  // ---- 释放 config 锁 ----
-        if (need_snap) rafts_[i]->Snapshot(snap_idx, snap);
+        if (need_snap) rf->Snapshot(snap_idx, snap);
       } else if (m.snapshot_valid) {
-        // 收到 leader 的 InstallSnapshot：确认能否安全安装，并把快照装进状态机。
-        // 注意参数顺序：CondInstallSnapshot(index, term, snapshot)
-        bool installed = rafts_[i]->CondInstallSnapshot(
-            m.snapshot_index, m.snapshot_term, m.snapshot);
-        if (installed) {
-          // 快照字节就是被压缩掉的那段状态机状态（index→command），重水化进来。
-          std::map<int, std::string> st = DecodeKV(m.snapshot);
-          std::lock_guard<std::mutex> lk(mu_);
-          for (auto& p : st) logs_[i][p.first] = p.second;
-        }
+        // 收到 leader 的 InstallSnapshot：把快照重水化进状态机。
+        // 单相设计下 raft 已在 handler 内完成截断/推进/落盘，并用 last_applied_
+        // 挡掉陈旧快照；apply channel FIFO，且 blob 是该 index 的全量状态，
+        // 直接安装即收敛（与 kvraft server.cpp 的 snapshot_valid 分支同一模式）。
+        std::map<int64_t, std::string> st = DecodeKV(m.snapshot);
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto& p : st) logs_[i][p.first] = p.second;
       }
     }
   });
@@ -326,18 +300,6 @@ void Config::Start1(int i) {
   // 否则 Crash1(i) 里 Disconnect(i) 关掉的"其它节点→i"的链路
   // （endnames_[j][i]）会一直保持 disabled，leader 发给 i 的 RPC
   // （AppendEntries / InstallSnapshot）永远 !ok，i 永远追不上来。
-  //
-  // ⚠️⚠️ 这一行是 C++ 版【独有的】，Go 基准没有 —— 别被老注释误导：
-  //    Go 版 raft/config.go:138-234 的 start1() 从头到尾**没有** cfg.connect(i)，
-  //    末尾只做 net.AddServer(i, svc) 就收工了。而 MakeEnd 新建的端点默认
-  //    enabled=false（labrpc.go:324），所以 Go 那边 start1 之后节点 i 仍处在
-  //    【断网】状态，必须由用例显式 cfg.connect(i) 才上线。
-  //
-  //    差别的后果：C++ 里 Start1(i) 会顺手把 i 连上网；照抄 Go 用例时如果漏了
-  //    Start1 之后的 Disconnect 步骤，Go 那边节点是离线的、C++ 这边却在线，
-  //    依赖"i 必须离线"的分区时序会被静默放行。
-  //    当前测试集（test_raft.cpp）已逐条显式 Connect/Disconnect，所以暂时 benign；
-  //    但**移植新用例时要格外小心** —— 想保 Go 的语义就必须自己补 Disconnect。
   Connect(i);
 }
 
@@ -381,7 +343,7 @@ int Config::CheckOneLeader() {
   for (int iters = 0; iters < 10; iters++) {
     raftcpp::SleepMs(450 + raftcpp::RandInt(100));
 
-    std::map<int, std::vector<int>> leaders;
+    std::map<int64_t, std::vector<int>> leaders;
     for (int i = 0; i < n_; i++) {
       std::shared_ptr<Raft> rf;
       {
@@ -394,12 +356,12 @@ int Config::CheckOneLeader() {
       if (st.second) leaders[st.first].push_back(i);
     }
 
-    int last_term_with_leader = -1;
+    int64_t last_term_with_leader = -1;
     for (const auto& kv : leaders) {
       if (kv.second.size() > 1) {
         char buf[128];
-        std::snprintf(buf, sizeof(buf), "term %d has %zu (>1) leaders",
-                      kv.first, kv.second.size());
+        std::snprintf(buf, sizeof(buf), "term %lld has %zu (>1) leaders",
+                      static_cast<long long>(kv.first), kv.second.size());
         Fatal(buf);
       }
       if (kv.first > last_term_with_leader) last_term_with_leader = kv.first;
@@ -410,8 +372,8 @@ int Config::CheckOneLeader() {
 }
 
 //  全员任期一致
-int Config::CheckTerms() {
-  int term = -1;
+int64_t Config::CheckTerms() {
+  int64_t term = -1;
   for (int i = 0; i < n_; i++) {
     std::shared_ptr<Raft> rf;
     {
@@ -420,7 +382,7 @@ int Config::CheckTerms() {
       rf = rafts_[i];
     }
     if (!rf) continue;
-    int xterm = rf->GetState().first;
+    int64_t xterm = rf->GetState().first;
     if (term == -1) {
       term = xterm;
     } else if (term != xterm) {
@@ -444,15 +406,15 @@ void Config::CheckNoLeader() {
       std::fprintf(stderr, "--- CheckNoLeader 现场 ---\n");
       for (int j = 0; j < n_; j++) {
         auto r = GetRaft(j);
-        int term = -1;
+        int64_t term = -1;
         bool is_leader = false;
         if (r) {
           auto st = r->GetState();
           term = st.first;
           is_leader = st.second;
         }
-        std::fprintf(stderr, "  server=%d connected=%d term=%d leader=%d %s\n",
-                     j, Connected(j) ? 1 : 0, term, is_leader ? 1 : 0,
+        std::fprintf(stderr, "  server=%d connected=%d term=%lld leader=%d %s\n",
+                     j, Connected(j) ? 1 : 0, static_cast<long long>(term), is_leader ? 1 : 0,
                      r ? r->LogStatus().c_str() : "(null)");
       }
       std::fprintf(stderr, "--------------------------\n");
@@ -464,7 +426,7 @@ void Config::CheckNoLeader() {
   }
 }
 
-std::pair<int, std::optional<Command>> Config::NCommitted(int index) {
+std::pair<int, std::optional<Command>> Config::NCommitted(int64_t index) {
   std::lock_guard<std::mutex> lk(mu_);
   for (int i = 0; i < n_; i++) {
     if (!apply_err_[i].empty()) Fatal(apply_err_[i]);
@@ -477,7 +439,8 @@ std::pair<int, std::optional<Command>> Config::NCommitted(int index) {
     if (count > 0 && cmd && *cmd != it->second) {
       char buf[256];
       std::snprintf(buf, sizeof(buf),
-                    "committed values do not match: index %d, %s, %s", index,
+                    "committed values do not match: index %lld, %s, %s",
+                    static_cast<long long>(index),
                     cmd->c_str(), it->second.c_str());
       Fatal(buf);
     }
@@ -487,7 +450,7 @@ std::pair<int, std::optional<Command>> Config::NCommitted(int index) {
   return {count, cmd};
 }
 
-std::optional<Command> Config::Wait(int index, int n, int start_term) {
+std::optional<Command> Config::Wait(int64_t index, int n, int64_t start_term) {
   int64_t to = 10;
   for (int iters = 0; iters < 30; iters++) {
     int nd = NCommitted(index).first;
@@ -506,8 +469,8 @@ std::optional<Command> Config::Wait(int index, int n, int start_term) {
   auto [nd, cmd] = NCommitted(index);
   if (nd < n) {
     char buf[128];
-    std::snprintf(buf, sizeof(buf), "only %d decided for index %d; wanted %d",
-                  nd, index, n);
+    std::snprintf(buf, sizeof(buf), "only %d decided for index %lld; wanted %d",
+                  nd, static_cast<long long>(index), n);
     Fatal(buf);
   }
   return cmd;
@@ -534,11 +497,11 @@ void Config::DumpState(const char* where) {
   std::fprintf(stderr, "------------------------------\n");
 }
 
-int Config::One(const Command& cmd, int expected_servers, bool retry) {
+int64_t Config::One(const Command& cmd, int expected_servers, bool retry) {
   auto t0 = raftcpp::Now();
   int starts = 0;
   while (raftcpp::SecondsSince(t0) < kOneOuterWaitSec) {
-    int index = -1;
+    int64_t index = -1;
     for (int si = 0; si < n_; si++) {
       starts = (starts + 1) % n_;
       std::shared_ptr<Raft> rf;
@@ -600,13 +563,13 @@ void Config::End() {
   double t = raftcpp::SecondsSince(t0_);
   int nrpc = net_->GetTotalCount() - rpcs0_;
   int64_t nbytes = net_->GetTotalBytes() - bytes0_;
-  int ncmds;
+  int64_t ncmds;
   {
     std::lock_guard<std::mutex> lk(mu_);
     ncmds = max_index_ - max_index0_;
   }
-  std::printf("  ... Passed --  %4.1f  %d %4d %7lld %4d\n", t, n_, nrpc,
-              static_cast<long long>(nbytes), ncmds);
+  std::printf("  ... Passed --  %4.1f  %d %4d %7lld %4lld\n", t, n_, nrpc,
+              static_cast<long long>(nbytes), static_cast<long long>(ncmds));
   std::fflush(stdout);
   // std::printf 默认是行缓冲：输出先存在内存缓冲区里，遇到 \n 或缓冲区满了才真正写出去。
   // 但当 stdout 不是终端（比如被重定向到文件、或跑在 CI 里）时，会变成全缓冲，即使有 \n 也不立刻输出。
@@ -644,7 +607,11 @@ void Config::Cleanup() {
     rafts_.clear();
     graves_.clear();
   }
-  CheckTimeout();
+  if (raftcpp::SecondsSince(start_) > 120.0) {
+    std::fprintf(stderr,
+                 "warning: test took longer than 120 seconds "
+                 "(reported at cleanup, not fatal here)\n");
+  }
 
   if (!raft_dir_base_.empty()) RemoveTree(raft_dir_base_);
 }

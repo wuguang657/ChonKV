@@ -74,9 +74,27 @@ fi
 cmake -S . -B "$DIR" -DCMAKE_BUILD_TYPE="$BUILD_TYPE" "${EXTRA[@]:-}" > /dev/null
 cmake --build "$DIR" -j "$(sysctl -n hw.ncpu 2>/dev/null || echo 8)"
 
+# ---------------------------------------------------------------------------
+# 网络层自测是【闸门】。
+SELFTEST_FAILED=0
+
 echo
-echo "=== 先跑网络层自测 ==="
-"./$DIR/labrpc_selftest" || true
+echo "=== 先跑网络层自测（in-proc 后端）==="
+if ! "./$DIR/labrpc_selftest"; then
+  SELFTEST_FAILED=1
+  echo "*!* 网络层自测（in-proc）有失败断言（见上面 FAIL 行）" >&2
+fi
+
+if [[ "${LABRPC_TRANSPORT:-inproc}" == "inproc" ]]; then
+  SOCK_BASE="${LABRPC_SOCKET_BASE:-19090}"
+  echo
+  echo "=== 网络层自测（socket 后端，base=${SOCK_BASE}）==="
+  if ! LABRPC_TRANSPORT=socket LABRPC_SOCKET_BASE="$SOCK_BASE" \
+      "./$DIR/labrpc_selftest"; then
+    SELFTEST_FAILED=1
+    echo "*!* 网络层自测（socket）有失败断言（见上面 FAIL 行）" >&2
+  fi
+fi
 
 # 按过滤词挑要跑哪个二进制：2* → Raft，3* → KV，都没写 → 两个都跑
 FILTER="${ARGS[0]:-}"
@@ -96,3 +114,10 @@ for b in "${BINS[@]}"; do
   echo "=== $TITLE ==="
   "./$DIR/$b" "${ARGS[@]:-}"
 done
+
+if (( SELFTEST_FAILED )); then
+  echo
+  echo "错误：网络层自测有失败断言，./build.sh 以退出码 1 结束。" >&2
+  echo "      （早先这里写作 \`|| true\`，红了的自测被静默吞掉，脚本照样 exit 0）" >&2
+  exit 1
+fi

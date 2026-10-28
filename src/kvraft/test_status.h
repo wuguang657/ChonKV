@@ -48,14 +48,6 @@ struct TestFailure : std::exception {
 //   主线程调用 → 抛 TestFailure，立刻中断当前用例，runner 接住后继续跑
 //                下一个（等价于 Go 的 t.Fatalf → runtime.Goexit）。
 //   子线程调用 → 只记录 + 打印，**不抛**。
-//
-//   为什么子线程不能抛？GenericTest 里的客户端线程是裸 std::thread
-//   （test_kvraft.cpp:253 / 304 等），lambda 外面没人 catch，异常逃出线程
-//   函数会直接 std::terminate() 干掉整个进程 —— 汇总都打不出来，
-//   比"继续跑完"糟糕得多。这类断言由 g_failed 记账，一样会判失败。
-//
-//   所以本函数是"条件 [[noreturn]]"：不能真的标 [[noreturn]]，
-//   否则编译器会假定子线程分支不可达。
 void Fatal(const std::string& msg);
 
 }  // namespace kvraft

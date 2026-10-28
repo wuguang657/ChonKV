@@ -42,6 +42,19 @@ struct IntOut {
   int v = 0;  // 期望的新 state
 };
 
+// porcupine 的 DFS 缓存用 std::hash<State> 散列（porcupine.cpp 的 StateHash）——
+// 自定义 State 必须提供 std::hash 特化，否则本文件编译不过。
+// （正式 kv 路径 State = std::string 恰好自带 hash，所以这个坑只在自测里暴露：
+//   曾经在缓存从 vector 桶改成 unordered_map 之后，本文件忘记跟着适配而 bit-rot。）
+namespace std {
+template <>
+struct hash<IntState> {
+  size_t operator()(const IntState& s) const noexcept {
+    return hash<int>{}(s.v);
+  }
+};
+}  // namespace std
+
 int main() {
   using namespace porcupine;
   using Op = Operation<IntOp, IntOut>;

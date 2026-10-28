@@ -139,20 +139,6 @@ void Unlift(Node<I, O>* entry) {
 // ---------------------------------------------------------------------------
 //
 // 输入格式：每个 op 有两条 entry（call 在前，return 在后）。
-//
-// ⚠️ 关键修复（对比 Go 版 src/porcupine/checker.go）：
-// 必须把每个 op 拆成 (call, return) 两条**独立** entry 后，**按 time 整体排序**
-// 再串链表 —— Go 版 `makeEntries` 就是 `sort.Sort(byTime(entries))`。
-// 修复前 C++ 版直接按 history 顺序串链表，导致链表里每个 call 紧跟自己的 ret
-// （call→ret 在一起），算法 POP 之后 entry = call.next = 自己 ret → 触发 RETURN
-// → 又 POP → 直接弹光栈 → 永远判 Illegal。
-// 修复后链表按 (call_time, ret_time) 整体排序，call 后面是别的 op 的 call，
-// POP 之后 entry 跳到下一个 call，DFS 能正常推进。
-//
-// 反向遍历：root 始终是"最后一个 entry"。
-// ⚠️ 关键顺序：必须【先插入 return、再插入 call】。原因是 insertBefore(n, root)
-// 把 n 放到 root 之前。所以 Go 的原版先 insertBefore(return, root)，再
-// insertBefore(call, root) —— 这样 call 最终跑到 return 前面，时间顺序才对。
 template <typename Input, typename Output>
 Node<Input, Output>* MakeLinkedEntries(
     std::vector<Operation<Input, Output>> history) {
@@ -287,17 +273,27 @@ bool CheckSingle(const Model<Input, Output, State>& model,
 
   NodeT* entry = head_sentinel->next;
 
+  // 统一收尾：先释放 calls 栈里仍被 Lift（已脱离链表）的 call/return 节点对，
+  // 再遍历链表删剩余节点，最后删 sentinel。
+  auto cleanup_all = [&]() {
+    for (auto& c : calls) {
+      if (c.entry->match != nullptr) delete c.entry->match;
+      delete c.entry;
+    }
+    calls.clear();
+    NodeT* p = head_sentinel->next;
+    while (p != nullptr) {
+      NodeT* nx = p->next;
+      delete p;
+      p = nx;
+    }
+    delete head_sentinel;
+  };
+
   while (entry != nullptr) {
     if (kill->load() != 0) {
       // 别的分片已判 Illegal，提前退出
-      // 先把链表清掉
-      NodeT* p = head_sentinel->next;
-      while (p != nullptr) {
-        NodeT* nx = p->next;
-        delete p;
-        p = nx;
-      }
-      delete head_sentinel;
+      cleanup_all();
       return false;
     }
 
@@ -342,13 +338,7 @@ bool CheckSingle(const Model<Input, Output, State>& model,
       // ---- Return 节点：撞到栈顶 call 的 return → 回溯 ----
       if (calls.empty()) {
         // 没可回溯的候选了，但链表还有 entry → 这条历史找不到合法线性化
-        NodeT* p = head_sentinel->next;
-        while (p != nullptr) {
-          NodeT* nx = p->next;
-          delete p;
-          p = nx;
-        }
-        delete head_sentinel;
+        cleanup_all();
         return false;
       }
       CallsEntry<Input, Output, State> top = calls.back();
@@ -361,14 +351,8 @@ bool CheckSingle(const Model<Input, Output, State>& model,
     }
   }
 
-  // 链表空了 → 找到完整线性化。清理链表
-  NodeT* p = head_sentinel->next;
-  while (p != nullptr) {
-    NodeT* nx = p->next;
-    delete p;
-    p = nx;
-  }
-  delete head_sentinel;
+  // 链表空了 → 找到完整线性化。
+  cleanup_all();
   return true;
 }
 
@@ -385,26 +369,45 @@ CheckResult CheckParallel(const Model<Input, Output, State>& model,
   std::vector<std::future<bool>> futs;
   futs.reserve(partitions.size());
 
-  for (size_t i = 0; i < partitions.size(); ++i) {
-    futs.emplace_back(promises[i].get_future());
-    threads.emplace_back([&model, &partitions, i, &kill, &promises] {
-      bool ok = false;
-      try {
-        auto* head = MakeLinkedEntries(partitions[i]);
-        ok = CheckSingle(model, head, &kill);
-      } catch (const std::exception& e) {
-        // 任何异常都判 Illegal（保守策略：宁可误报不要漏报）
-        std::fprintf(stderr,
-                     "porcupine: CheckSingle 异常 (partition %zu): %s\n", i,
-                     e.what());
-        ok = false;
-      } catch (...) {
-        std::fprintf(stderr, "porcupine: CheckSingle 未知异常 (partition %zu)\n",
-                     i);
-        ok = false;
-      }
-      promises[i].set_value(ok);
-    });
+  try {
+    for (size_t i = 0; i < partitions.size(); ++i) {
+      futs.emplace_back(promises[i].get_future());
+      threads.emplace_back([&model, &partitions, i, &kill, &promises] {
+        bool ok = false;
+        try {
+          auto* head = MakeLinkedEntries(partitions[i]);
+          ok = CheckSingle(model, head, &kill);
+        } catch (const std::exception& e) {
+          // 任何异常都判 Illegal（保守策略：宁可误报不要漏报）
+          std::fprintf(stderr,
+                       "porcupine: CheckSingle 异常 (partition %zu): %s\n", i,
+                       e.what());
+          ok = false;
+        } catch (...) {
+          std::fprintf(stderr, "porcupine: CheckSingle 未知异常 (partition %zu)\n",
+                       i);
+          ok = false;
+        }
+        promises[i].set_value(ok);
+      });
+    }
+  } catch (const std::exception& e) {
+    std::fprintf(stderr,
+                 "porcupine: 创建检查线程失败（已创建 %zu/%zu 个）: %s\n",
+                 threads.size(), partitions.size(), e.what());
+    kill.store(1);
+    for (auto& t : threads) {
+      if (t.joinable()) t.join();
+    }
+    return CheckResult::Unknown;
+  } catch (...) {
+    std::fprintf(stderr, "porcupine: 创建检查线程失败（已创建 %zu/%zu 个）\n",
+                 threads.size(), partitions.size());
+    kill.store(1);
+    for (auto& t : threads) {
+      if (t.joinable()) t.join();
+    }
+    return CheckResult::Unknown;
   }
 
   bool ok = true;

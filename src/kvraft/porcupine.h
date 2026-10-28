@@ -8,7 +8,7 @@
 // Go 版用 interface{} 在运行时分发；C++ 版用模板，三个核心类型
 // 由调用方指定（KV 测试用 KvInput / KvOutput / KvState = std::string）。
 //
-// ⚠️ 算法的正确性关键在于两个不变式：
+// 算法的正确性关键在于两个不变式：
 //   (1) 链表按时间排序：同 op 的 call 一定在 return 之前
 //   (2) lift/unlift 对称：把 (call, return) 一对从链表同时摘下 / 同时挂回
 //   任何破坏这两条的改动都会让线性化结果变成 false negative 或 false positive。

@@ -21,7 +21,6 @@
 #include <cstdio>
 #include <cstdlib>  // std::getenv (KV_MINI_LIN 调试开关)
 #include <functional>
-#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -152,20 +151,6 @@ bool MiniLinEnabled() {
 }
 
 int RandInt(int n) {
-  // ⚠️ 原来这里是 `std::mt19937 rng(std::random_device{}())` —— 拿真随机源
-  //    播种，SEED 环境变量【完全管不到】。后果：启动横幅那句"固定种子让偶发
-  //    失败可复现"是假承诺 —— 客户端选 Append 还是 Get、选哪个 key，走的都
-  //    是这条流，每次运行都换一套，偶发失败根本复现不出来。
-  //
-  //    改成转发 raftcpp::RandInt：它用 MixSeed(RandSeed(), 线程流编号) 播种，
-  //    SEED 固定 → 序列固定。两个附带好处：
-  //      * 内部是 thread_local 引擎，不需要这里的 mutex；
-  //      * 用 uniform_int_distribution 而不是 `rng() % n`，分布更均匀
-  //        （原始引擎低位规律性会被取模放大）。
-  //
-  //    可复现到什么程度（见 common/util.h:99-105 的诚实说明）：主线程严格可
-  //    复现，子线程是"大概率"—— 线程领号顺序仍受调度影响。想做到严格可复现
-  //    要用 raftcpp::RandIntFor(逻辑编号, n) 把流绑到逻辑实体而非 OS 线程。
   return raftcpp::RandInt(n);
 }
 
@@ -190,14 +175,6 @@ constexpr int kElectionTimeoutMs = 1000;  // Go: electionTimeout = 1s
 // ===========================================================================
 // Go 版用 goroutine + channel + select(time.After) 来断言"这个操作在 N 秒内
 // 不许返回"。C++ 没有 select，用 atomic flag + 轮询实现同样的语义。
-//
-//   AsyncOp op([&]{ DoPut(&cfg, cku.get(), "1", "15"); });
-//   if (op.WaitDone(1000)) Fatal("少数派里的 Put 竟然返回了");
-//   cfg.ConnectAll();
-//   if (!op.WaitDone(3000)) Fatal("heal 之后 Put 还是没完成");
-//
-// ⚠️ 析构时会 join —— 所以必须确保操作最终能返回，否则析构会把测试挂死。
-//   上面的用法里 heal 之后操作一定会返回，安全。
 class AsyncOp {
  public:
   template <typename F>
@@ -254,14 +231,6 @@ static bool WaitForLeader(Config& cfg, int* out, int budget_ms = 5000) {
 
 // 最简单的一个：Put 进去、Get 出来；Append 追加。
 void TestBasic3A() {
-  // 对齐 Go 版 test_test.go:448 —— TestBasic3A 就是 GenericTest 的
-  // nclients=1 版本（跑 3 轮，每轮 5 秒并发随机 Append/Get，
-  // 结束调 CheckClntAppends 自检）。
-  //
-  // ⚠️ 之前这里是手写的 3 个固定 op（Put + 2×Append + 查不存在的 key），
-  //    单线程、无并发、无重试 —— 完全不锻炼"客户端重试去重 / 并发自校验"
-  //    路径。一个只在【并发重试】下才暴露的 exactly-once bug 会直接漏过。
-  //    改回调 GenericTest 补回覆盖（与 TestConcurrent3A 的做法一致）。
   GenericTest("3A", /*nclients=*/1, /*unreliable=*/false, /*crash=*/false,
               /*partitions=*/false, /*maxraftstate=*/-1);
 }
@@ -420,7 +389,7 @@ void TestKVBackpressureBusy() {
   a1.client_id = 70001;
   a1.seq_id = 1;
   PutAppendReply r1;
-  std::thread t1([&] { cfg.kvserver(leader)->PutAppend(a1, r1); });
+  AsyncOp t1([&] { cfg.kvserver(leader)->PutAppend(a1, r1); });
 
   // 等 leader 把第 1 条塞进日志（未提交计数达到 1）。50ms 足矣，且远在 CheckQuorum
   // 退位（~150ms）之前，leader 身份稳定。
@@ -448,8 +417,12 @@ void TestKVBackpressureBusy() {
   }
 
   // 收尾：恢复网络让第 1 条最终能提交，线程自然返回，再清理。
+  // 为什么不需要额外的 join 守卫：WaitOp 自带 1s 硬超时（server.cpp 的
+  // kWaitTimeout），该线程最迟 ~1s 内必然从 PutAppend 返回，WaitDone(30000)
+  // 给它 30 倍余量；返回时线程已结束工作，之后 End()/Cleanup() 动 kvservers_
+  // 不会再被它摸到。函数退出时 AsyncOp 析构的 join 只是收尸。
   cfg.ConnectAll();
-  if (t1.joinable()) t1.join();
+  t1.WaitDone(30000);
   cfg.End();
   cfg.Cleanup();
 }
@@ -585,13 +558,8 @@ void TestKVSessionsEviction() {
       cfg.kvserver(i)->SetSessionLimitForTest(cap, max_idle);
     }
   };
-  // ⚠️ 不可靠网络下 200 次顺序写可能跨越一次选举：目标 leader 中途易主，
-  //    直写旧 leader 会偶发 ErrWrongLeader。生产 Clerk 会自动换 leader 重试，
-  //    这里裸写必须自己处理 —— 否则该用例在部分 seed 下必红（已实测
-  //    SEED=100268241 在 client 160 处炸）。拿到 ErrWrongLeader 就重新找当前
-  //    leader 再试，并同步更新外层 `leader`（final 测量也用它），保证"写"和
-  //    "测"落在同一台。注意：这不改变测试意图——仍是往"当前 leader"灌 200 个
-  //    不同 client 把会话表撑爆，单台不变量的断言完全成立。
+  //  不可靠网络下 200 次顺序写可能跨越一次选举：目标 leader 中途易主，
+  //    直写旧 leader 会偶发 ErrWrongLeader。
   auto write_one = [&](int cid, int seq, const std::string& key) {
     PutAppendArgs pa;
     pa.key = key;
@@ -693,7 +661,7 @@ void TestKVSessionsEviction() {
   // ---- 阶段 C：各副本淘汰行为一致 ----
   // 等所有节点 apply 到同一条日志，再比对会话表规模。
   // 只要淘汰是确定性的，这里必然相等；一旦有人引入时钟/哈希序，这里就会炸。
-  int target = cfg.kvserver(leader)->LastCmdIndexForTest();
+  int64_t target = cfg.kvserver(leader)->LastCmdIndexForTest();
   bool converged = false;
   for (int retry = 0; retry < 200 && !converged; retry++) {
     converged = true;
@@ -742,7 +710,7 @@ void TestKVSessionsSnapshotRoundTrip() {
   const int visits[] = {1, 2, 1, 3, 2, 4, 1, 5, 3, 6};
   uint64_t idx = 1;
   for (int cid : visits) {
-    int s = replay.Get(cid, idx);
+    int64_t s = replay.Get(cid, idx);
     replay.Put(cid, s + 1, idx);
     replay.Reap(idx);
     ++idx;
@@ -751,11 +719,11 @@ void TestKVSessionsSnapshotRoundTrip() {
   // ---- 路径 B：导出成快照，再按同样顺序装回另一张表 ----
   struct Rec {
     int cid;
-    int seq;
+    int64_t seq;
     uint64_t li;
   };
   std::vector<Rec> recs;
-  replay.ForEach([&](int cid, int seq, uint64_t li) {
+  replay.ForEach([&](int cid, int64_t seq, uint64_t li) {
     recs.push_back(Rec{cid, seq, li});
   });
 
@@ -764,7 +732,7 @@ void TestKVSessionsSnapshotRoundTrip() {
 
   auto dump = [](const SessionTable& t) {
     std::vector<std::pair<int, uint64_t>> out;
-    t.ForEach([&](int cid, int seq, uint64_t li) {
+    t.ForEach([&](int cid, int64_t seq, uint64_t li) {
       out.emplace_back(cid, (static_cast<uint64_t>(seq) << 32) | li);
     });
     return out;
@@ -783,7 +751,7 @@ void TestKVSessionsSnapshotRoundTrip() {
     int cid = 100 + (i % 7);
     uint64_t now = idx + static_cast<uint64_t>(i);
     auto feed = [&](SessionTable& t) {
-      int s = t.Get(cid, now);
+      int64_t s = t.Get(cid, now);
       t.Put(cid, s + 1, now);
       t.Reap(now);
     };
@@ -890,7 +858,7 @@ void TestKVSessionsDeterminismWithSnapshots() {
   cfg.ConnectAll();
 
   // ---- 阶段 3：等所有副本追平 ----
-  int target = cfg.kvserver(leader)->LastCmdIndexForTest();
+  int64_t target = cfg.kvserver(leader)->LastCmdIndexForTest();
   bool converged = false;
   for (int retry = 0; retry < 400 && !converged; retry++) {
     converged = true;
@@ -905,8 +873,8 @@ void TestKVSessionsDeterminismWithSnapshots() {
   if (!converged) {
     char buf[256];
     std::snprintf(buf, sizeof(buf),
-                  "replicas did not converge after reconnect (target=%d)",
-                  target);
+                  "replicas did not converge after reconnect (target=%lld)",
+                  static_cast<long long>(target));
     Fatal(buf);
   }
 
@@ -965,10 +933,6 @@ void TestUnreliable3A() {
 void TestUnreliableOneKey3A() {
   // 对齐 Go 版 test_test.go:463-493：
   //   nservers=3、nclient=5、upto=10（每个客户端【固定】append 10 次后停）。
-  //
-  // ⚠️ 之前是 nservers=5 / nclients=10 / 主线程 sleep 5 秒（次数不定）——
-  //    把 Go 的"确定性 50 次 append 校验"改成了"时长驱动的随机量"，
-  //    每次跑的负载都不同、出问题难复现。改回固定次数与 Go 一致。
   const int nservers = 3;
   const int nclients = 5;
   const int upto = 10;
@@ -1042,8 +1006,6 @@ void TestOnePartition3A() {
   AsyncOp op_put([&] { DoPut(&cfg, ckp2a.get(), "1", "15"); });
   AsyncOp op_get([&] { DoGet(&cfg, ckp2b.get(), "1"); });
 
-  // ⚠️ 注意这两个是"不该返回"的断言，和 op_get/op_put 的析构顺序无关：
-  //    下面第三段会先 ConnectAll + ConnectClient 让它们返回，才析构。
   if (op_put.WaitDone(kElectionTimeoutMs)) {
     Fatal("Put in minority completed");
   }
@@ -1069,14 +1031,6 @@ void TestOnePartition3A() {
   std::this_thread::sleep_for(std::chrono::milliseconds(kElectionTimeoutMs));
 
   // 少数派里挂着的 Put / Get 现在必须能完成。
-  //
-  // ⚠️ Go 版这里只等 3 秒（time.After(30 * 100 * time.Millisecond)），
-  //    C++ 版必须放宽，否则会随机失败：
-  //    ckp2a / ckp2b 在分区期间只连着 2 台，另外 3 台是断连的 —— 而发往
-  //    断连节点的 RPC 会被网络层延迟 rand()%7000 ms 才返回失败
-  //    （labrpc.cpp:188，与 Go 版 labrpc.go:296 一致）。heal 之后，那个
-  //    "已经在途"的 RPC 仍要按原定延迟走完（最多 7 秒）才轮得到下一台。
-  //    等 3 秒不够，等 10 秒够。
   if (!op_put.WaitDone(10000)) {
     Fatal("Put did not complete");
   }
@@ -1084,9 +1038,6 @@ void TestOnePartition3A() {
     Fatal("Get did not complete");
   }
 
-  // ⭐ 核心断言：heal 之后，少数派发出的那条 Put("1","15") 必须真正生效。
-  //    它比第二段多数派的 "16" 更晚被提交，所以最终值必须是 "15" 而不是 "16"。
-  //    少了这一行，一个"heal 后把旧请求直接丢弃"的实现照样能全绿。
   DoCheck(&cfg, ck.get(), "1", "15");
 
   cfg.End();
@@ -1100,14 +1051,6 @@ void TestManyPartitionsOneClient3A() {
 }
 
 void TestManyPartitionsManyClients3A() {
-  // TSan 下插桩让 raft 事件慢 5~15×：5 客户端 + 高频分区把 CPU 饿死，
-  // 分区愈合墙钟被拖到 > clerk 180s GIVE UP 预算 → 偶发 got[] 误报
-  // （test_kvraft.cpp:1057 把"超时返回空"当"数据损坏"硬 Fatal）。
-  // 这是"改测试本身"让 TSan 下确定性通过，而非用 .sh 重试外壳绕过：
-  //   ① nclients 5→2：少一半客户端，缓解 raft 线程 CPU 争抢；
-  //   ② gentlePartitions=true：分区间隔 ×3 + 愈合等待 ×3（见 GenericTest），
-  //     把愈合窗口压回 clerk 180s 预算内。
-  // 非 TSan（CI 普通 release/debug）保持原样 5 客户端，覆盖率不降。
 #if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
   GenericTest("3A", 2, false, false, true, -1, false, true);
 #else
@@ -1119,6 +1062,30 @@ void TestManyPartitionsManyClients3A() {
 // ===========================================================================
 // 3B：日志压缩（快照）
 // ===========================================================================
+
+// ---- 日志截断检查（带 drain 等待）----
+static void CheckLogsTrimmed(Config& cfg, int maxraftstate) {
+#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
+  const int kTrimLimitMult = 24;  // TSan：给截断更多余量
+#else
+  const int kTrimLimitMult = 8;
+#endif
+  const int limit = kTrimLimitMult * maxraftstate;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  int sz = cfg.LogSize();
+  while (sz > limit && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    sz = cfg.LogSize();
+  }
+  if (sz > limit) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "logs were not trimmed (%d > %d*%d, waited 30s for drain)",
+                  sz, kTrimLimitMult, maxraftstate);
+    Fatal(buf);
+  }
+}
 
 // 通用的"混沌测试"驱动器。参数含义和 Go 版 GenericTest 一一对应：
 //   unreliable：开不可靠网络
@@ -1188,14 +1155,6 @@ void GenericTest(const std::string& part, int nclients, bool unreliable,
           // 用固定比例的 MakePartition 会把形态锁死成 4 vs 3（n=7），
           // 12 次分区几乎一模一样，测不到 1v6 / 全员连通。
           cfg.MakePartitionRandom(&p1, &p2);
-          // ⚠️ 间隔必须 ≈1 个选举超时（对齐 Go 版：
-          // electionTimeout + rand%200 ms）。
-          // 之前这里是 200~500ms，而选出一个 leader 本身就要 ~1 秒 ——
-          // 结果就是 leader 刚上位网络就被切开，客户端几乎没有推进，
-          // counts[i] 全是 0，最后 CheckClntAppends(cli, v, 0)
-          // "什么都不检查就直接通过"，用例变成了摆设。
-          // TSan(gentlePartitions) 下间隔 ×3：插桩让 raft 事件慢 5~15×，
-          // 降低分区 churn 让被饿的 raft 线程有喘息，愈合窗口压回 180s 预算。
           std::this_thread::sleep_for(std::chrono::milliseconds(
               (gentlePartitions ? 3 : 1) * kElectionTimeoutMs + RandInt(200)));
         }
@@ -1261,18 +1220,7 @@ void GenericTest(const std::string& part, int nclients, bool unreliable,
     }
 
     if (maxraftstate > 0) {
-      int sz = cfg.LogSize();
-#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
-      const int kTrimLimitMult = 24;  // TSan：给截断更多余量
-#else
-      const int kTrimLimitMult = 8;
-#endif
-      if (sz > kTrimLimitMult * maxraftstate) {
-        char buf[256];
-        std::snprintf(buf, sizeof(buf), "logs were not trimmed (%d > %d*%d)", sz,
-                      kTrimLimitMult, maxraftstate);
-        Fatal(buf);
-      }
+      CheckLogsTrimmed(cfg, maxraftstate);
     }
     if (maxraftstate < 0) {
       int ssz = cfg.SnapshotSize();
@@ -1304,11 +1252,6 @@ void GenericTest(const std::string& part, int nclients, bool unreliable,
 //   TestPersistPartitionUnreliableLinearizable3A  →  15 clients / 7 servers
 //   TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable3B
 //                                                  →  15 clients / 7 servers
-//
-// ⚠️ 注意，Go 版 client_id 是用 cli 编号固定下来的（操作记录的 ClientId 字段
-// 就是 goroutine 编号 0..nclients-1）。C++ 端 Clerk 拿全局 NRand 当 client_id，
-// 每次 outer iter 都新 MakeClient → 新 client_id 串。这不影响线性一致性
-// 判定（porcupine 的 client_id 只用于可视化），但会让 dump 不那么直观。
 void GenericTestLinearizability(const std::string& part, int nclients,
                                 int nservers, bool unreliable, bool crash,
                                 bool partitions, int maxraftstate) {
@@ -1320,7 +1263,7 @@ void GenericTestLinearizability(const std::string& part, int nclients,
   title += (nclients > 1 ? "many clients" : "one client");
   title += ", linearizability checks (" + part + ")";
 
-  // 🐞 调试开关：KV_MINI_LIN=1 时把 outer iter / sleep 拉短，
+  // 调试开关：KV_MINI_LIN=1 时把 outer iter / sleep 拉短，
   // 让 dump 出的 history 尽量小 (≤几十条 ops)，方便手算锁定非法 op 对。
   // 不影响原 3A/3B 入口（它们都是用默认 3 iter × 5 秒跑）。
   static const bool kMiniLin = MiniLinEnabled();
@@ -1333,6 +1276,9 @@ void GenericTestLinearizability(const std::string& part, int nclients,
   for (int iter = 0; iter < kIterCount; iter++) {
     std::atomic<bool> done_clients{false};
     std::atomic<bool> done_partitioner{false};
+    // 与 GenericTest 同款：记录每个客户端成功 append 的次数，用于
+    // "空转通过"自检（见下面 join 之后的 total_appends 检查）。
+    std::vector<int> counts(nclients, 0);
     std::vector<std::thread> threads;
 
     for (int cli = 0; cli < nclients; cli++) {
@@ -1342,19 +1288,6 @@ void GenericTestLinearizability(const std::string& part, int nclients,
         // 关键：随机 key —— 跨 client 互相写同一个 key。
         //
         // 本实现的比例：50% Append / 10% Put / 40% Get。
-        //
-        // ⚠️ 这和 Go 版【并不相同】，别被"对齐"的说法误导。
-        //    Go 版 test_test.go:352/356 是两次【独立】取随机数：
-        //        if      (rand.Int()%1000) < 500   → Append  50%
-        //        else if (rand.Int()%1000) < 100   → Put     50% × 10% = 5%
-        //        else                              → Get     50% × 90% = 45%
-        //    即 Go 的真实比例是 50 / 5 / 45。这里用单次 `r` 判断，Put 拿到
-        //    的是 500..600 那一段（10%），是 Go 的两倍。
-        //
-        //    保留 10% 是有意的：Put 是覆盖而非追加，比例越高越容易撞出
-        //    lost update。代价是出问题时没法用 Go 版交叉验证。
-        //    想严格对齐 Go，把下面的条件改成再取一次随机数即可：
-        //        } else if (RandInt(1000) < 100) {
         while (!done_clients.load()) {
           std::string key = std::to_string(RandInt(nclients));
           std::string nv =
@@ -1372,6 +1305,7 @@ void GenericTestLinearizability(const std::string& part, int nclients,
           }
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
+        counts[cli] = j;
       });
     }
 
@@ -1412,20 +1346,27 @@ void GenericTestLinearizability(const std::string& part, int nclients,
 
     for (auto& t : threads) t.join();
 
+    // ---- 进度自检：防"空转通过"（与 GenericTest 1245 行同款）----
+    // 没有这道自检时，若某轮所有 append 都失败（极端饿死 / 分区 churn），
+    // history 里只剩 Get 记录 → porcupine 对"全 Get 历史"判 Ok → 用例
+    // 假通过。GenericTest 早有同款检查，Linearizability 版当初漏移植。
+    int total_appends = 0;
+    for (int c : counts) total_appends += c;
+    if (total_appends == 0) {
+      Fatal("no client made progress: 一轮内没有任何 append 成功，"
+            "porcupine 只会看到 Get 历史并判 Ok —— 这个用例等于没跑"
+            "（常见原因：分区过于频繁 / 网络线程池饥饿 / 集群选不出 leader）");
+    } else if (total_appends < nclients) {
+      char buf[256];
+      std::snprintf(buf, sizeof(buf),
+                    "(warning) 第 %d 轮只有 %d 次 append / %d 个客户端，进度偏低",
+                    iter, total_appends, nclients);
+      std::printf("    %s\n", buf);
+      std::fflush(stdout);
+    }
+
     if (maxraftstate > 0) {
-      int sz = cfg.LogSize();
-#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
-      const int kTrimLimitMult = 24;  // TSan：给截断更多余量
-#else
-      const int kTrimLimitMult = 8;
-#endif
-      if (sz > kTrimLimitMult * maxraftstate) {
-        char buf[256];
-        std::snprintf(buf, sizeof(buf),
-                      "logs were not trimmed (%d > %d*%d)", sz, kTrimLimitMult,
-                      maxraftstate);
-        Fatal(buf);
-      }
+      CheckLogsTrimmed(cfg, maxraftstate);
     }
     if (maxraftstate < 0) {
       int ssz = cfg.SnapshotSize();
@@ -1821,15 +1762,6 @@ void TestKVSessionsClientProtocol() {
 // ===========================================================================
 // 生产化：墓碑（tombstone）的取值必须正确
 // ===========================================================================
-// 【为什么要单独测】会话被 Evict 时登记进 fenced_ 的，不只是一个 cid，还有它
-// 那一刻的 last_seq —— 这就是"墓碑"。它存在的意义是：apply 去重时若会话记录
-// 已被擦除，还能用它挡住"迟到重试"。
-//
-// ⚠️ 上面 5 个用例一个都没验证墓碑的值是否正确。如果 Evict 的 on_evict 回调
-//    忘了传 last_seq（或传错变量），fenced_ 里的 value 会变成 0/垃圾，
-//    IsFencedForTest / FenceSizeForTest 全都还能通过（它们只看 key 在不在），
-//    但 apply 去重会彻底失效 → 迟到重试被重复执行 → 数据被污染。
-//    这条用例就是专门把这个隐患钉死的。
 //
 // 做法：给某个 cid 连写 N 条（让它 last_seq = N），再灌别的 cid 把它挤出去，
 // 然后直接读它的墓碑值，必须正好等于 N。
@@ -1899,16 +1831,16 @@ void TestKVSessionsTombstoneValue() {
   if (!cfg.kvserver(leader)->IsFencedForTest(target)) {
     Fatal("target session should be fenced after eviction");
   }
-  int got_seq = -1;
+  int64_t got_seq = -1;
   if (!cfg.kvserver(leader)->FenceLastSeqForTest(target, &got_seq)) {
     Fatal("fenced cid is missing its last_seq tombstone");
   }
   if (got_seq != want_seq) {
     char buf[256];
     std::snprintf(buf, sizeof(buf),
-                  "wrong tombstone value: cid %d got last_seq=%d, want %d "
+                  "wrong tombstone value: cid %d got last_seq=%lld, want %d "
                   "(Evict callback must carry the pre-eviction last_seq)",
-                  target, got_seq, want_seq);
+                  target, static_cast<long long>(got_seq), want_seq);
     Fatal(buf);
   }
 
@@ -2006,7 +1938,7 @@ void TestKVSessionsTombstoneSnapshot() {
   cfg.ConnectAll();
 
   // ---- 阶段 3：等所有副本追平 ----
-  int target = cfg.kvserver(leader)->LastCmdIndexForTest();
+  int64_t target = cfg.kvserver(leader)->LastCmdIndexForTest();
   bool converged = false;
   for (int retry = 0; retry < 400 && !converged; retry++) {
     converged = true;
@@ -2021,8 +1953,8 @@ void TestKVSessionsTombstoneSnapshot() {
   if (!converged) {
     char buf[256];
     std::snprintf(buf, sizeof(buf),
-                  "replicas did not converge after reconnect (target=%d)",
-                  target);
+                  "replicas did not converge after reconnect (target=%lld)",
+                  static_cast<long long>(target));
     Fatal(buf);
   }
 
@@ -2044,10 +1976,11 @@ void TestKVSessionsTombstoneSnapshot() {
         std::snprintf(
             buf, sizeof(buf),
             "fence table diverged at position %zu: server %d has "
-            "(cid=%d,seq=%d), leader has (cid=%d,seq=%d) — fence_fifo_ order "
+            "(cid=%d,seq=%lld), leader has (cid=%d,seq=%lld) — fence_fifo_ order "
             "or last_seq is not deterministic across the snapshot boundary",
-            k, i, got_fence[k].first, got_fence[k].second, want_fence[k].first,
-            want_fence[k].second);
+            k, i, got_fence[k].first,
+            static_cast<long long>(got_fence[k].second), want_fence[k].first,
+            static_cast<long long>(want_fence[k].second));
         Fatal(buf);
       }
     }
@@ -2263,7 +2196,7 @@ void TestFollowerReadAfterSnapshot() {
 
   cfg.ConnectAll();  // 让 victim 通过安装快照追回
   // 等 victim 的已 apply 下标追上 leader 当前进度
-  int target = cfg.kvserver(leader)->LastCmdIndexForTest();
+  int64_t target = cfg.kvserver(leader)->LastCmdIndexForTest();
   bool caught = false;
   for (int t = 0; t < 50; ++t) {
     if (cfg.kvserver(victim)->LastCmdIndexForTest() >= target) {
@@ -2537,6 +2470,21 @@ int main(int argc, char** argv) {
     for (const auto& n : failed_names) std::printf("    - %s\n", n.c_str());
   }
   std::printf("========================================\n");
+
+  // 「一个用例都没跑」绝不能算成功（与 raft_test 的 main 同一条纪律，
+  // 血案见那里的注释）：test_part.sh 判一轮通过的唯一依据就是退出码，
+  // 过滤词打错 = 打印 "25/25 通过" 而一个用例都没跑。
+  if (passed == 0 && failed == 0) {
+    if (!filter.empty()) {
+      std::printf(
+          "  错误：过滤词 \"%s\" 没有匹配到任何用例 —— 这不是\"通过\"，"
+          "是一个用例都没跑。\n",
+          filter.c_str());
+    } else {
+      std::printf("  错误：kTests[] 里没有任何用例 —— 一个用例都没跑。\n");
+    }
+    return 2;
+  }
 
   return failed == 0 ? 0 : 1;
 }

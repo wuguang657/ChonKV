@@ -1,6 +1,6 @@
 // config.h —— 测试脚手架（Go 版 src/raft/config.go 的移植）
 //
-// 这个文件【不用改】，它提供：
+// 这个文件，它提供：
 //   * 起一堆 Raft 实例、接进同一个模拟网络
 //   * 断开 / 恢复某个节点、杀掉 / 重启某个节点
 //   * one()     提交一条命令并等待多数派达成共识
@@ -28,7 +28,7 @@
 #include "../common/chan.h"
 #include "../common/util.h"
 #include "../labrpc/labrpc.h"
-#include "../labgob/persister.h"
+#include "../persist/state/persister.h"
 #include "raft.h"
 
 namespace raft {
@@ -74,16 +74,16 @@ class Config {
 
   // ---------- 断言 ----------
   int CheckOneLeader();       // 返回 leader 的下标
-  int CheckTerms();           // 所有连通节点任期必须一致
+  int64_t CheckTerms();           // 所有连通节点任期必须一致
   void CheckNoLeader();
 
   // ---------- 提交 / 等待 ----------
   // 返回 (有多少台认为该下标已提交, 该下标的值)
-  std::pair<int, std::optional<Command>> NCommitted(int index);
+  std::pair<int, std::optional<Command>> NCommitted(int64_t index);
   // 等 index 被 n 台提交；返回 nullopt 表示"大家已经进入更高任期，别等了"
-  std::optional<Command> Wait(int index, int n, int start_term);
+  std::optional<Command> Wait(int64_t index, int n, int64_t start_term);
   // 提交一条命令，返回它落在的下标
-  int One(const Command& cmd, int expected_servers, bool retry);
+  int64_t One(const Command& cmd, int expected_servers, bool retry);
 
   // ---------- 网络控制 / 统计 ----------
   void SetUnreliable(bool b) { net_->Reliable(!b); }
@@ -92,7 +92,7 @@ class Config {
   int RpcTotal() { return net_->GetTotalCount(); }
   int64_t BytesTotal() { return net_->GetTotalBytes(); }
 
-  // ---------- C3 单条消息字节上限（转发给 labrpc::Network）----------
+  // ---------- C3 单条消息字节上限（转发给传输层后端）----------
   // net_ 是私有的，测试要压低闸门必须经这里转发，避免为此放宽封装。
   void SetMaxRpcMessageBytes(size_t n) { net_->SetMaxMessageBytes(n); }
   int64_t OversizedDropped() { return net_->OversizedDropped(); }
@@ -103,7 +103,7 @@ class Config {
   int n() const { return n_; }
 
   // 读某节点"已 apply 的状态机状态"（index → command），用于校验快照再水化。
-  std::map<int, Command> GetState(int i);
+  std::map<int64_t, Command> GetState(int i);
 
   // 打开"快照感知状态机"的自动压缩：applier 在日志过长时主动调 rf.Snapshot()。
   // 默认关闭，避免影响 2B/2C 原有测试；快照测试里显式打开。
@@ -118,7 +118,7 @@ class Config {
 
   mutable std::mutex mu_;
   int n_ = 0;
-  std::shared_ptr<labrpc::Network> net_;
+  std::shared_ptr<labrpc::Transport> net_;  // 可插拔：默认 in-proc，可切真实 socket
   std::string raft_dir_base_;
   bool file_backed_ = false;  // 由构造函数参数设定；false=内存模式, true=文件模式
   
@@ -131,10 +131,10 @@ class Config {
   std::vector<bool> connected_;
   std::vector<std::shared_ptr<Persister>> saved_;
   std::vector<std::vector<std::string>> endnames_;
-  std::vector<std::map<int, Command>> logs_;  // 每台机器已提交的下标 → 命令
+  std::vector<std::map<int64_t, Command>> logs_;  // 每台机器已提交的下标 → 命令
   std::vector<std::shared_ptr<raftcpp::Chan<ApplyMsg>>> apply_chs_;
   std::vector<std::thread> appliers_;
-  int max_index_ = 0;
+  int64_t max_index_ = 0;
 
   // 快照感知状态机：applier 是否在日志过长时主动压缩（由 EnableSnapshotCompaction 打开）。
   bool snapshot_compaction_ = false;
@@ -143,7 +143,7 @@ class Config {
   raftcpp::TimePoint t0_;
   int rpcs0_ = 0;
   int64_t bytes0_ = 0;
-  int max_index0_ = 0;
+  int64_t max_index0_ = 0;
 
   bool cleaned_ = false;
 };

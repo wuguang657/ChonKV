@@ -42,37 +42,25 @@
 #include <utility>
 #include <vector>
 #include <unordered_set>
+#ifdef RAFT_BENCH_METRICS
+#include <unordered_map>  // propose_ts_（仅埋点构建需要）
+#endif
 
 #include "../common/chan.h"
 #include "../common/thread_tracker.h"
 #include "../common/util.h"
 #include "../labrpc/labrpc.h"
-#include "../labgob/persister.h"
+#include "../persist/state/persister.h"
+#include "raft_protocol.h"
+#include "raft_util.h"
+#include "../common/metrics.h"  // 性能埋点（未定义 RAFT_BENCH_METRICS 时为空头，零开销）
 
 namespace raft {
-int Crc32(const char* data, size_t n);
-// 增量 CRC：在「已算好的 crc」基础上续算一段数据，返回新的 CRC。
-// 用途：算 [头‖payload] 的整体 CRC 时，不必先拼出一份几百 MB 的临时串（零额外拷贝）。
-// 约定：初值传 0（空串的 CRC32 就是 0）即等价于 Crc32(data, n)。
-uint32_t Crc32Update(uint32_t crc, const char* data, size_t n);
-// 底层 CRC32 原语（不做末态取反的「原始循环」），供 Crc32Update 与 SegmentLogStore 共用。
-uint32_t Crc32Raw(uint32_t crc, const char* data, size_t n);
 
-// ---------------------------------------------------------------------------
-// 磁盘上 snapshot blob 的自描述头（P1-1：V2 起带 CRC，防 bit rot / 半截写）
-// ---------------------------------------------------------------------------
-constexpr size_t kSnapHeaderSizeV1 = 8 + 4 + 4 + 4;        // V1: magic+index+term+len
-constexpr size_t kSnapHeaderSize = kSnapHeaderSizeV1 + 4;  // V2: 再 +crc(4B)
-std::string EncodeSnapshotBlob(int index, int term, const std::string& raw);
-// corrupt 出参（默认 nullptr → 老调用点零改动）：
-//   true  = blob 是本格式（magic 对得上）但内容/长度对不上 = 真损坏 → 调用方应 fail-stop；
-//   false = 空 / 老格式 / 非本格式 = 视为无快照（首次启动的合法情形，绝不能 abort）。
-bool DecodeSnapshotBlob(const std::string& blob, int* index, int* term,
-                        std::string* raw, bool* corrupt = nullptr);
-// 日志里存的命令。Go 版是 interface{}，C++ 里我们用字符串，
-// 到了 Lab 3（KV 服务）你可以把它塞成任意序列化的字节。
-using Command = std::string;
-using Persister = labgob::Persister;
+// 线上协议数据结构（RPC 消息 / 日志条目 / apply 消息 / 成员角色）见 raft_protocol.h；
+// CRC32 / 快照 blob 编解码 / Trace 调试日志 / 计票纯函数见 raft_util.h。
+
+using Persister = persist::Persister;
 // ---------------------------------------------------------------------------
 // 常量：选举超时 / 心跳间隔
 // ---------------------------------------------------------------------------
@@ -108,12 +96,6 @@ constexpr int kCQStaleWindowMs = 150;
 // 可开关：true = 读走 LeaseRead 快路径（租约内跳过心跳确认）；
 //         false = 每轮都用心跳确认（安全，默认）。
 constexpr bool kEnableLeaseRead = false;
-// 同一个 follower，两次 AppendEntries 之间的最小间隔。
-// 复制是"发射后不管"的，没有这个节流，follower 一旦慢/断线，
-// leader 会在一个 while 循环里疯狂往外打 RPC。
-constexpr int kMinSendIntervalMs = 10;
-// 带日志的 AppendEntries 发出去后，超过这个时间还没回音就重发
-// （回信丢了也要能恢复，否则日志永远推不过去）
 constexpr int kLogRetryMs = 300;
 // 流水线（滑动窗口）：单条 AppendEntries 携带的日志条目上限。
 // 同时修复"单条 AE 条目无上限"的缺口 —— follower 落后 100 万条时不再一条 RPC 全塞。
@@ -171,225 +153,6 @@ inline const char* StateName(ServerState s) {
 }
 
 // ---------------------------------------------------------------------------
-// 成员角色（成员变更 / Learner 三态）
-// ---------------------------------------------------------------------------
-// 论文里"C_old 与 C_new 的多数派必有交集"的论证，落地点就是这个角色数组。
-//   kRemoved : 不在当前配置 C 里（已被移除 / 尚未加入）→ 不收 RPC、不投票、不计入多数派
-//   kLearner : 在 C 里但【只追数据不投票】（扩容零可用性损失，见文档 §2.6）
-//   kVoter   : 正式成员，参与一切（选举计票 / 日志提交 / CheckQuorum / ReadIndex）
-enum class MemberRole {
-  kRemoved = 0,
-  kLearner = 1,
-  kVoter = 2,
-};
-// 只有 kVoter 计入多数派 / 能投票 / 能当选。
-inline bool IsVoter(MemberRole r) { return r == MemberRole::kVoter; }
-// Q2 隐私加固的"冻结判据"：leader 是否该停止向 s 复制【新数据】。
-// 两个信息源必须取"或"——缺任何一个都会漏出一条真实路径：
-//   (a) removed_at_index_[s] >= 0：提案时 / apply 时写入的"冻结点"下标。
-//       覆盖【提案 → apply】这段窗口（此间 is_member_[s] 仍是 kVoter）。
-//   (b) is_member_[s] == kRemoved：配置视图。
-//       覆盖【经 InstallSnapshot 恢复配置】的场景：快照把 conf 条目截断了，
-//       新 leader 上任扫描 logs_ 扫不到那条 conf，removed_at_index_ 重建不出来，
-//       若只看 (a) 就会继续给 removed 节点发新数据（隐私泄漏）。
-// 只用 (b) 是旧 bug（㉓ 偶发 40%）：提案到 apply 之间 cap 形同虚设。
-inline bool IsRemovedFrozen(const std::vector<MemberRole>& is_member,
-                            const std::vector<int>& removed_at_index, int s) {
-  if (s < 0) return false;
-  if (s < static_cast<int>(removed_at_index.size()) &&
-      removed_at_index[s] >= 0) {
-    return true;
-  }
-  if (s < static_cast<int>(is_member.size()) &&
-      is_member[s] == MemberRole::kRemoved) {
-    return true;
-  }
-  return false;
-}
-
-enum class EntryType {
-  kNormal,     // 普通客户端命令
-  kConfChange, // 成员变更条目
-  kNoOp        // leader 当选时为建立读安全点补的空日志
-};
-
-struct LogEntry {
-  int term = 0;
-  int index = 0;
-  Command command;
-  EntryType type = EntryType::kNormal;  // E7：统一 entry 类型，替代 is_conf 特判
-  // ---- 成员变更配置条目 ----
-  // 普通命令 type=kNormal；成员变更条目 type=kConfChange，并携带目标节点与加/删。
-  // 节点必须【apply 到这条 entry 时】才切换本地 is_member_（不是收到就切），
-  // 且同一时刻只允许一个 conf 变更在飞行（ProposeConfChange 里的 pending_conf_index_ 保证）。
-  int conf_server = -1;  // 目标节点编号
-  // 目标角色的整型值（MemberRole：0=kRemoved, 1=kLearner, 2=kVoter）。
-  // 原来是 bool conf_add，只能表达"加 / 删"两态，塞不下 learner 这个第三态，
-  // 所以升级成 int，直接存 MemberRole 的值。
-  int conf_role = 0;
-};
-
-// 提交给上层状态机的消息
-struct ApplyMsg {
-  bool command_valid = false;
-  Command command;
-  int command_index = 0;
-  // E7-hardening：携带本 entry 的类型，让上层（KV）显式分流，
-  // 不必再用「空串=no-op / 反序列化失败=配置」这类隐式 content heuristic。
-  EntryType entry_type = EntryType::kNormal;
-
-  // Lab 3（快照）才会用到，这里先留着
-  bool snapshot_valid = false;
-  std::string snapshot;
-  int snapshot_term = 0;
-  int snapshot_index = 0;
-};
-
-// ---- RPC 消息 ----
-// 每个结构都有 Serialize()/Deserialize()，网络层靠它们把对象变成字节流。
-// 顺序必须严格一致：编码写进去几个字段、什么顺序，解码就怎么读出来。
-
-struct RequestVoteArgs {
-  int term = 0;
-  int candidate_id = 0;
-  int last_log_index = 0;
-  int last_log_term = 0;
-
-  std::string Serialize() const;
-  bool Deserialize(const std::string& s);
-};
-
-struct RequestVoteReply {
-  int term = 0;
-  bool vote_granted = false;
-
-  std::string Serialize() const;
-  bool Deserialize(const std::string& s);
-};
-
-// ---- 预投票 RPC（lab 增强：治 term 暴涨）----
-struct RequestPreVoteArgs {
-  int term = 0;
-  int candidate_id = 0;
-  int last_log_index = 0;
-  int last_log_term = 0;
-
-  std::string Serialize() const;
-  bool Deserialize(const std::string& s);
-};
-
-struct RequestPreVoteReply {
-  int term = 0;
-  bool vote_granted = false;
-
-  std::string Serialize() const;
-  bool Deserialize(const std::string& s);
-};
-
-struct AppendEntriesArgs {
-  int term = 0;
-  int leader_id = 0;
-  int prev_log_index = 0;
-  int prev_log_term = 0;
-  std::vector<LogEntry> entries;   // 空 = 纯心跳
-  int leader_commit = 0;
-  int read_ctx = 0;
-
-  std::string Serialize() const;
-  bool Deserialize(const std::string& s);
-};
-
-struct AppendEntriesReply {
-  int term = 0;
-  bool success = false;
-  // 快速回退优化：失败时告诉 leader "你下次从这个下标开始试"
-  // 没有这个优化，TestBackup2B 会跑很久（leader 一次只退一格）
-  int next_index = 0;
-  int read_ctx = 0;
-
-  std::string Serialize() const;
-  bool Deserialize(const std::string& s);
-};
-
-// Follower ReadIndex：follower 向 leader 索要一个「经多数派确认」的线性化读点。
-// leader 在自己的 Raft 层做"多数派心跳确认"后，把当前 commit_index_ 回给 follower，
-// follower 等自己的状态机 apply 到该点再本地读 —— 从而把线性一致读从 leader 单点
-// 平摊到所有节点，解除 leader 读瓶颈（不依赖 lease，安全性与 leader-only ReadIndex 等价）。
-// 对应 raft.cpp 的 Raft::ReadIndex()（follower 分支）与 Raft::ReadIndexRPC()（leader 端）。
-struct ReadIndexArgs {
-  int term = 0;  // follower 的 currentTerm，leader 用来判断自己是否过时
- 
-  std::string Serialize() const;
-  bool Deserialize(const std::string& s);
-};
-
-struct ReadIndexReply {
-  int term = 0;          // leader 的 currentTerm（follower 据此校验 leader 新鲜度）
-  int read_index = -1;   // leader 确认身份后的 commit_index_；<0 表示被拒
-
-  std::string Serialize() const;
-  bool Deserialize(const std::string& s);
-};
-
-// 快照 RPC（Lab 3 日志压缩）：leader 给落后太多的 follower 直接发整块快照，
-// 跳过漫长的日志重放。data 是上层状态机的序列化 blob，Raft 不解析。
-struct InstallSnapshotArgs {
-  int term = 0;                   // leader 的 currentTerm
-  int leader_id = 0;              // 便于 follower 重定向客户端
-  int last_included_index = 0;    // 快照覆盖的最后一条日志下标的逻辑 index
-  int last_included_term = 0;     // 该下标的 term
-  int offset = 0;                 // 本 chunk 在完整 blob 中的字节偏移
-  int chunk_size = 0;             // 本 chunk 字节数
-  bool done = false;              // 是否为最后一块
-  int crc = 0;                    // 完整 blob 的 CRC32（截断成 int，比较用）
-  int epoch = 0;                  // 本次分块传输的代号：每次 leader 起一帧新传输就 +1，
-                                  // 跟随同一帧的所有 chunk 共享同一 epoch。follower 只接受
-                                   // 当前期望 epoch 的片，旧 epoch 残片（乱序迟到）一律忽略，
-                                   // 避免「上一帧没装成的残片」冲掉「当前在途新快照」的重组缓冲。
-  std::string data;               // 本 chunk 的状态机 blob 切片
-  // 成员配置随快照一起传：落后太多的 follower 装快照时本地 logs_ 可能已不含
-  // 覆盖区间内的 conf 条目（被截断），必须按 leader 在快照点处的角色数组重建。
-  std::vector<int> members;       // 各节点角色（MemberRole 的整型值）
-
-  std::string Serialize() const;
-  bool Deserialize(const std::string& s);
-};
-
-struct InstallSnapshotReply {
-  int term = 0;  // follower 当前 term，leader 据以退位
-  bool ok_install = false;  // 仅当「本 chunk 是 done 且 follower 真正安装成功」时为 true；
-                            // leader 据此推进 match_index_。中间 chunk / 校验失败均为 false。
-  std::string Serialize() const;
-  bool Deserialize(const std::string& s);
-};
-
-struct ReadIndexCtx {
-  int ctx = 0;         // 自身身份号(0=无在飞读轮),复用作"无"哨兵,与旧 active_read_ctx_ 语义一致
-  int term = 0;        // 发起读时的 currentTerm，term 一变该 ctx 作废
-  int read_index = 0;  // 发起读那一刻的 commitIndex（本次读至少要看到它）
-  std::vector<char> acked_;  // 按 server 下标去重：记录哪些节点已回过 ack（leader 自己那一票在 ReadIndex() 里置位）
-  bool done = false;   // 是否已攒够多数派
-  int waiters = 0;     // 【读合并】挂在该 ctx 上的并发读者计数(per-ctx 引用计数,最后一个离开者清理)
-};
-
-// Start() 的返回值。Go 版返回 (index, term, isLeader) 三元组，
-// C++ 里没有多返回值，包成结构体更清楚。
-struct StartResult {
-  bool is_leader = false;
-  int index = -1;
-  int term = 0;
-  // C1 背压标记：本节点【确实是 leader】，但因未提交 entry 已达上限而拒绝提案。
-  // 与 is_leader=false 区分开 —— 后者可能是"我不是 leader"，本标记专指"我是
-  // leader 但被限流了"，调用方可据此选择"稍后重试"而不是"换 leader 重试"。
-  bool backpressure = false;
-  // #2.2 磁盘水位保护：本节点【是 leader】，但 raft state 落盘体积已超阈值，
-  // 拒绝本次新写入，逼上层去调 Snapshot() 压缩。与 backpressure 同构但语义不同：
-  // backpressure=未提交过多（内存/复制压力）；disk_full=raft state 太大（磁盘水位）。
-  // 调用方看到 disk_full 应触发快照后重试，而非换节点。
-  bool disk_full = false;
-};
-
-// ---------------------------------------------------------------------------
 // Raft
 // ---------------------------------------------------------------------------
 
@@ -400,21 +163,9 @@ struct StartResult {
 // 万一这时候 Raft 已经被测试框架释放了（crash1 之后），回调里再摸
 // this 就是赤裸裸的野指针。持有一份 shared_ptr，就能保证"只要还有
 // 在途的 RPC，对象就还活着"。
-// ===========================================================================
-// 选举计票：纯函数，便于单元测试直接构造输入验证口径（见 test_raft.cpp）
-// ===========================================================================
-// 只统计"当前仍是 voter"的节点投出的赞成票。
-// 必须与 QuorumSizeLocked()（MemberCountLocked 只数 IsVoter）保持
-// 【分子分母同口径】：否则已移除 / learner 节点的票会混进分子，却用
-// "当前 voter 多数"作门槛 —— 候选者可能靠一张已作废的票凑够 quorum
-// 当选，leader 并非由当前配置多数选出（选举合法性被破坏）。
-//
-//   votes[i]: 0 = 未投/未回, 1 = 授予, -1 = 拒绝
-int CountGrantedVotes(const std::vector<MemberRole>& is_member,
-                      const std::vector<int>& votes);
 
 // 前置声明：Raft log 持久化后端的抽象接口（依赖反转，只认接口不认具体类）。
-// 完整定义见 segment_log_store.h（含 SegmentLogStorage / MemoryLogStorage / 工厂）。
+// 完整定义见 persist/log_store.h（接口），段文件/内存两后端在 persist/log/。
 class LogStorage;
 
 
@@ -439,7 +190,7 @@ class Raft : public std::enable_shared_from_this<Raft> {
   void Start();
 
   // 返回 (currentTerm, 我是否是 leader)
-  std::pair<int, bool> GetState();
+  std::pair<int64_t, bool> GetState();
 
   // 重定向用：返回本节点"认知到的 leader 编号"。
   // 收到合法 AppendEntries（含心跳）时记下 args.leader_id；自己当选时记 me_。
@@ -457,14 +208,14 @@ class Raft : public std::enable_shared_from_this<Raft> {
   void SetMaxRaftStateBytes(size_t n) { max_raft_state_bytes_ = n; }
   // 当前 raft state 序列化字节数（与 persister 写入的 RaftState 大小一致，不含快照 blob）。
   size_t RaftStateSize() const;
-  int ReadIndex();
-  // 生产级扩展 ③：提议一次【单节点】成员变更（一次只加/减一个）。
+  int64_t ReadIndex();
+  // 提议一次【单节点】成员变更（一次只加/减一个，非 lab 原生）。
   // add=true  → 把 server 设为 kVoter；add=false → 设为 kRemoved。
   // 内部会追加一条 conf 配置条目，节点在【apply 到该条目时】才切换本地配置；
   // 若已有未提交的变更在途（pending_conf_index_ != 0）则拒绝（单飞保护）。
   // 非 leader / 目标越界 / 有在途变更 → 返回 is_leader=false 且不做事。
   StartResult ProposeConfChange(int server, bool add);
-  // 生产级扩展 ③b：把 server 设为【指定角色】（kRemoved / kLearner / kVoter 三态）。
+  // 把 server 设为【指定角色】（kRemoved / kLearner / kVoter 三态）。
   // 与 ProposeConfChange 走完全相同的"追加配置条目 → apply 时切换"路径，
   // 差别只是目标角色由调用方指定，因此支持 kLearner：
   //   kLearner = 在集群里【只追数据、不投票、不计入多数派】，
@@ -490,7 +241,7 @@ class Raft : public std::enable_shared_from_this<Raft> {
   void SetMaxUncommittedEntries(int n);
   int MaxUncommittedEntries() const;
   // 当前未提交条目数 = LastLogIndex() - commit_index_（调试/测试用）。
-  int UncommittedCount() const;
+  int64_t UncommittedCount() const;
 
   // ---- C5 被移除节点主动退场 ----
   // 本节点是否已被配置变更移除（apply 到"移除自己"那条 conf 条目之后为真）。
@@ -502,7 +253,7 @@ class Raft : public std::enable_shared_from_this<Raft> {
   int ElectionSuppressedCount() const;
   // 调试/测试：本节点日志最新下标。
   // 用来验证"learner 虽不投票，但仍在持续接收并追加日志（追数据）"。
-  int LastLogIndex() const;
+  int64_t LastLogIndex() const;
 
   // §5.2 生产加固：单条 AppendEntries 字节上限的观测接口（测试/调试用，不影响生产逻辑）。
   // 因"单条 RPC 字节数超过 kMaxBytesPerRpc"而截断的批次数（已发至少一条仍超时不截断）。
@@ -519,7 +270,7 @@ class Raft : public std::enable_shared_from_this<Raft> {
     std::lock_guard<std::mutex> lk(mu_);
     return static_cast<int>(logs_.size());
   }
-  int SnapshotIndex() const {
+  int64_t SnapshotIndex() const {
     std::lock_guard<std::mutex> lk(mu_);
     return snapshot_index_;
   }
@@ -530,11 +281,11 @@ class Raft : public std::enable_shared_from_this<Raft> {
     std::lock_guard<std::mutex> lk(mu_);
     return *snapshot_data_;
   }
-  int CommitIndex() const {
+  int64_t CommitIndex() const {
     std::lock_guard<std::mutex> lk(mu_);
     return commit_index_;
   }
-  int LastApplied() const {
+  int64_t LastApplied() const {
     std::lock_guard<std::mutex> lk(mu_);
     return last_applied_;
   }
@@ -542,12 +293,10 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // ---- RPC handler：由网络层在收到消息时调用 ----
   // 这两个函数【必须自己加锁】，因为网络线程会并发调用它们。
 
-  // TODO(2A)：实现投票逻辑
   void RequestVote(const RequestVoteArgs& args, RequestVoteReply& reply);
   void RequestPreVote(const RequestPreVoteArgs& args, RequestPreVoteReply& reply);
   void StartRealElection();  // 预投票拿到多数派后，真正自增 term 发起真实投票
   void SendRequestVoteRPCs();  // 真实投票 RPC 发送(StartRealElection 与 candidate 超时重发共用)
-  // TODO(2A)：实现心跳；TODO(2B)：追加日志冲突检测
   void AppendEntries(const AppendEntriesArgs& args, AppendEntriesReply& reply);
   // Follower ReadIndex 的服务端入口：follower 发来的读请求在这里被 leader 处理。
   // 内部复用 leader 本地 ReadIndex()（多数派心跳确认 + 等 apply），把 commit_index_ 回给 follower。
@@ -556,17 +305,21 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // ---- 快照（Lab 3 日志压缩）----
   // 上层状态机（KV 服务）调用：到 index 为止的状态机已持久化，
   // 让 Raft 截断日志、把快照存盘。index 必须 <= commit_index_。
-  void Snapshot(int index, const std::string& snapshot);
-
-  // 上层在收到 snapshot ApplyMsg 后调用，确认可以安全安装。
-  // 返回 true  ⟺ (index, term) 与 raft【当前】快照元数据一致（即"这就是刚装的那个"）；
-  // 返回 false ⟺ raft 已装了别的快照，这条消息过时了，装它会回退状态机。
-  // ⚠️ 不要再加 `last_applied_ > index` 这类判据：last_applied_ 是"raft 派发进度"
-  //    而非"状态机进度"，用它判旧会在正常时序下误伤（详见 raft.cpp 实现处的注释）。
-  bool CondInstallSnapshot(int index, int term, const std::string& snapshot);
+  void Snapshot(int64_t index, const std::string& snapshot);
 
   // 快照 RPC：leader 给落后太多的 follower 发送。
   void InstallSnapshot(const InstallSnapshotArgs& args, InstallSnapshotReply& reply);
+
+  // 在【持有本节点 mu_】的前提下克隆持久化目录（测试框架的"崩溃重启"专用）。
+  //
+  // 为什么需要持锁：文件模式下 raft.log.seg 的截断是原地 RewriteFile
+  // （ftruncate(0) + 逐条 pwrite，无 rename 原子性）。若 CopyDir 与后台线程的
+  // 截断并发，可能克隆出半截段文件 → 新实例重启后日志空洞。
+  // 持 mu_ 后，所有持锁写盘路径（SaveRaftState / log_store_ Append·Truncate*）
+  // 都被挡住；唯一漏网的 snapshot blob 是 tmp+rename 原子写，读到即完整旧/新文件。
+  //
+  // 调用方必须已通过 shared_ptr 持有本对象（克隆期间对象不得被析构）。
+  std::shared_ptr<Persister> CopyPersisterUnderLock();
 
  private:
   // ---- 后台线程（骨架已经帮你起好了，你需要实现循环体）----
@@ -586,7 +339,9 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // ---- 持久化（2C）----
 
   // 把需要持久化的状态写进 persister_。调用前必须持有 mu_。
-  void PersistLocked();
+  // 锁以 unique_lock 引用传入：file 模式下 group commit 等待落盘时需要它释放 mu_
+  // （见下方 persist_* 成员处的设计说明）。
+  void PersistLocked(std::unique_lock<std::mutex>& lk);
   // 从字节流恢复状态。Make() 时调用。
   void ReadPersist(const std::string& data);
 
@@ -605,17 +360,17 @@ class Raft : public std::enable_shared_from_this<Raft> {
   //   snap_io_mu_ 串行化所有 blob 写（避免两个并发写互相覆盖成更旧的），
   //   mu_ 只用来读写 saved_blob_index_（O(1)，纳秒级）。
   // 返回 false 表示「盘上已有 index >= 本 index 的 blob，无需重写」。
-  bool SaveSnapshotBlob(int index, int term, const std::string& raw_blob);
+  bool SaveSnapshotBlob(int64_t index, int64_t term, const std::string& raw_blob);
 
   // ---- 小工具。约定：名字以 Locked 结尾的，调用时必须已经持有 mu_ ----
-  int LastLogIndexLocked() const {
+  int64_t LastLogIndexLocked() const {
     return logs_.empty() ? 0 : logs_.back().index;
   }
-  int LastLogTermLocked() const {
+  int64_t LastLogTermLocked() const {
     return logs_.empty() ? 0 : logs_.back().term;
   }
   // 任期变大了 → 退回 follower。调用前必须持有 mu_。
-  void ConvertToFollowerLocked(int new_term);
+  void ConvertToFollowerLocked(int64_t new_term, std::unique_lock<std::mutex>& lk);
   // 统计"最近 window_ms 毫秒内确认过我"的节点数（含 leader 自己）。
   // CheckQuorum（我还能联系上多数派吗）和 Leader Lease（租约还成立吗）
   // 都基于这同一个计数。调用前必须持有 mu_。
@@ -637,29 +392,33 @@ class Raft : public std::enable_shared_from_this<Raft> {
   int CountGrantedPrevotesLocked() const;
   // 当选判定 + 上任初始化：够 quorum 就上任，否则什么也不做。调用前持 mu_。
   // 回包处与 StartRealElection 发完票后都要调一次（详见 raft.cpp 注释）。
-  void BecomeLeaderIfQuorumLocked();
+  void BecomeLeaderIfQuorumLocked(std::unique_lock<std::mutex>& lk);
   // 通用：n 个节点的多数派阈值（不依赖本节点配置）。
   int MajorityOf(int n) const { return n / 2 + 1; }
   // 给所有 follower 发一轮"带 read_ctx 的空心跳"，用于 ReadIndex 的身份确认。
   // 必须在锁外调用（RPC 异步，不能持 mu_ 发网络）。
-  void BroadcastReadHeartbeat(int ctx);
+  void BroadcastReadHeartbeat(uint64_t ctx);
   // 回包到达时按 ctx 把这一票记到对应读请求上；攒够多数派就标记 done 并唤醒。
   // 调用前必须持有 mu_。
-  void RecordReadAckLocked(int ctx, int server);
+  void RecordReadAckLocked(uint64_t ctx, int server);
   // 推进 commitIndex：取所有 voter 的 matchIndex 中位数，并要求该下标条目
   // term == current_term_（Figure 8 守卫）。leader 侧【唯一】提交入口。
   // 调用前必须持有 mu_。
   //
-  // ⚠️ 必须由三处调用：AE 回包回调（他人确认后）+ Start() +
+  // 必须由三处调用：AE 回包回调（他人确认后）+ Start() +
   // ProposeConfChangeTo()（追加日志后）。只靠回包回调的话，当 quorum=1
   // （单 voter 集群，或其余节点全部不可达 / 已 removed）时没有任何回包到达
   // → commit_index_ 永不推进 → 写永不提交、ReadIndex 永久返回 -1
   // → 集群完全不可用。Raft 语义上 leader 自身持有即计入多数派。
-  void AdvanceCommitIndexLocked();
+  void AdvanceCommitIndexLocked(std::unique_lock<std::mutex>& lk);
 
   mutable std::mutex mu_;
 
-  // ---- 构造时定下来的，之后不变（读它们不需要加锁）----
+  // =========================================================================
+  // 域 1 · 构造期固定 —— peers_/persister_/me_ 与两个原子开关
+  //   构造后不变（运行时只读，无需加锁）；killed_/cancel_rpcs_ 由 Kill()
+  //   置位，是"停后台线程 + 让在途 RPC 立即失败"的广播闸。
+  // =========================================================================
   std::vector<std::shared_ptr<labrpc::ClientEnd>> peers_;
   std::shared_ptr<Persister> persister_;
   int me_ = 0;
@@ -669,9 +428,16 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // 这样后台线程能迅速退出，不会卡在 7 秒的模拟延迟里。
   std::atomic<bool> cancel_rpcs_{false};
 
-  // ---- 2A：所有 server 都有的状态 ----
+  // =========================================================================
+  // 域 2 · 核心 volatile 状态 —— 论文里"所有 server 都有"的那一份
+  //   全部受 mu_ 保护。state_/current_term_/voted_for_ 是选举安全三件套；
+  //   vote_granted_/prevote_granted_ 记录"谁投的"而非只记票数，计票时才能
+  //   剔除"回包时已被移除 / 降级"的作废票（与 QuorumSizeLocked 同口径）。
+  //   leader_id_ 是唯一的非论文字段：KVServer 据此在 kWrongLeader 回包里
+  //   填 leader 地址，省掉客户端一轮盲目轮询。
+  // =========================================================================
   ServerState state_ = ServerState::kFollower;
-  int current_term_ = 0;
+  int64_t current_term_ = 0;
   // 事件驱动退位标志：ApplyLoop 检测到本节点已被移除/降级出 voter 时置 true，
   // 但【不立即退位】——继续当 leader，让 ReplicateLoop 把 leader_commit（含本移除
   // 配置）通过普通心跳带出去；宽限 kStepdownGraceMs 后由 ReplicateLoop 真正退位。
@@ -694,21 +460,51 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // 用来唤醒选举定时器（收到心跳 / 被 Kill 时 notify）
   std::condition_variable tick_cv_;
 
-  // ---- 2B：日志 ----
+  // ---- 重定向用：本节点认知的 leader 编号 ----
+  // 收到合法 AppendEntries（含心跳）时记为 args.leader_id；自己当选时记为 me_。
+  // 初始 -1（尚未认知任何 leader）。受 mu_ 保护（只在 AppendEntries /
+  // BecomeLeaderIfQuorumLocked / GetLeaderId 内读写）。
+  int leader_id_ = -1;
+
+  // =========================================================================
+  // 域 3 · 日志与 apply —— logs_/commit_index_/last_applied_ + apply 通道
+  //   logs_[0] 是哨兵（index == snapshot_index_）；commit_index_ 与
+  //   last_applied_ 之间就是"已提交未 apply"队列，由 ApplyLoop 消费。
+  //   apply 通道是【单发送者】契约：只有 ApplyLoop push（快照也走
+  //   pending_snapshot_ 中转，见域 4）；apply_cv_ 是它的唤醒源。
+  // =========================================================================
   std::vector<LogEntry> logs_;    // logs_[0] 是哨兵，index = snapshot_index_
   // 日志持久化后端（依赖反转：只认 LogStorage 接口，不认具体类）。
   // 由 CreateLogStorage 工厂按 file_backed 注入 SegmentLogStorage / MemoryLogStorage；
   // 内存模式下注入 MemoryLogStorage（null-object），读路径仍全走 logs_ 向量。
   std::unique_ptr<LogStorage> log_store_;
-  int commit_index_ = 0;
-  int last_applied_ = 0;
+  int64_t commit_index_ = 0;
+  int64_t last_applied_ = 0;
   std::shared_ptr<raftcpp::Chan<ApplyMsg>> apply_ch_;
+  // 唤醒 applier：commit_index_ 推进 / pending_snapshot_ 挂载 / Kill 时 notify。
+  std::condition_variable apply_cv_;
 
-  // ---- 2D：快照（日志压缩）----
+#ifdef RAFT_BENCH_METRICS
+  // 【仅 bench 埋点】index → 该提案进入 Start() 的时刻（ns，单调时钟）。
+  // Start() 追加日志时登记，ApplyLoop 收集到该 index 时注销并记录
+  // "propose→apply" 延迟。两处访问都在 mu_ 下（调用方均已持锁）。
+  // 当选 / 退位 / 快照时整体清空 —— 这些条目不会再被 apply，留着就是泄漏。
+  std::unordered_map<int64_t, uint64_t> propose_ts_;
+#endif
+
+  // =========================================================================
+  // 域 4 · 快照 —— 覆盖状态 / 分块传输 / 两阶段落盘 / applier 暂停门
+  //   横跨四块：2D 覆盖状态（snapshot_index_~recv_snap_epoch_）、leader 侧
+  //   分块传输（snap_epoch_/snap_in_flight_）、blob 两阶段落盘
+  //   （saved_blob_index_/snap_io_mu_）、apply 顺序保护
+  //   （pending_snapshot_/install_gate_depth_）。
+  //   锁序铁律：snap_io_mu_ → mu_（全项目仅 SaveSnapshotBlob 一处按此序，
+  //   无反向路径，不会死锁）。
+  // =========================================================================
   // 快照覆盖到最后这条日志（逻辑 index）。logs_[0].index 始终 == snapshot_index_，
   // 因此"逻辑 index - snapshot_index_" = 在 logs_ 中的下标。
-  int snapshot_index_ = 0; // 快照覆盖到最后这条日志（逻辑 index）
-  int snapshot_term_ = 0;  // 快照覆盖到最后这条日志（逻辑 term）
+  int64_t snapshot_index_ = 0; // 快照覆盖到最后这条日志（逻辑 index）
+  int64_t snapshot_term_ = 0;  // 快照覆盖到最后这条日志（逻辑 term）
   // 裸的状态机 blob（不含磁盘头）。恢复时由 persister 读出、剥头校验后填入。
   // P0-1/P0-2：用 shared_ptr 管理 blob，发送侧 O(1) 钉死这一波所用的 buffer，
   // 切片时按需拷 chunk（不整拷贝），且 Raft::Snapshot 走「原子替换」而非原地改，
@@ -719,10 +515,10 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // snap_crc_ 是相对哪个 snapshot_index_ 算出来的（-1 = 尚未计算）。
   // 【惰性 CRC】只有 leader 真正要发分块快照时才算，算完按此键缓存，
   // 一次快照最多算一次——避免每个节点每次生成快照都全量算一遍（见 raft.cpp 注释）。
-  int snap_crc_index_ = -1;
+  int64_t snap_crc_index_ = -1;
   std::string recv_snap_buf_;   // 正在重组的完整 blob
-  int recv_snap_last_term_ = -1;  // 正在重组的快照的 last_included_term（用于检测「新快照到来」重置缓冲）
-  int recv_snap_index_ = -1;    // 正在重组的快照 last_included_index
+  int64_t recv_snap_last_term_ = -1;  // 正在重组的快照的 last_included_term（用于检测「新快照到来」重置缓冲）
+  int64_t recv_snap_index_ = -1;    // 正在重组的快照 last_included_index
   int recv_snap_epoch_ = -1;    // 正在重组的传输代号（档2：旧残片靠它识别并丢弃）
 
   // 分块快照：leader 侧 per-follower 当前分块传输代号（每次开新传输 +1）。
@@ -749,7 +545,7 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // saved_blob_index_：盘上 blob 对应的 index，保证「盘上 blob 的 index 单调
   // 不减」。若放任旧 blob 覆盖新 blob，而 state 已截断到更新 index，恢复时
   // 丢弃该 blob 就再也重放不出来（日志已截断）→ 真丢数据。
-  int saved_blob_index_ = 0;
+  int64_t saved_blob_index_ = 0;
 
   // 只用于串行化 blob 落盘 I/O。★ 关键：慢 I/O 发生在 mu_ 之外，
   // 期间不占 raft 主锁。锁序恒为 snap_io_mu_ → mu_，且全项目仅
@@ -762,9 +558,34 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // 仿 Go 版 src/raft/raft.go:133 的 pendingSnapshot 字段。
   std::optional<ApplyMsg> pending_snapshot_;
 
-  // ---- 2B：只有 leader 用的状态 ----
-  std::vector<int> next_index_;   // 下一个要发给该 follower 的日志下标
-  std::vector<int> match_index_;  // 已经确认该 follower 复制到的最高下标
+  // InstallSnapshot 阶段 2 的「applier 暂停门」深度（持 mu_ 访问）。
+  //
+  // 阶段 2 在持锁完成「状态突变（snapshot_index_/logs_ 截断/last_applied_ 推进）
+  // → 落盘 → 挂 pending_snapshot_」；file 模式下 PersistLocked 等落盘时会
+  // 【释放 mu_】。若不暂停 applier，它会在窗口期内依据已突变的状态把
+  // last_applied_+1（快照覆盖点之后的条目）当普通命令先行派发 → 状态机
+  // last_cmd_index_ 超过 snapshot_index → 随后快照挂上来触发 KVServer 的
+  // InstallSnapshot 不变式 FATAL（TestSnapshotUnreliableRecoverConcurrent-
+  // PartitionLinearizable3B 600s 看门狗现场实测复现）。
+  // 旧实现 fsync 全程持 mu_，该交错不可能发生；group commit 放大了窗口。
+  //
+  // 为什么是深度而不是 bool：两个 InstallSnapshot 临界区可能套叠——B 可在 A 的
+  // 落盘等待期内拿到 mu_ 进入自己的临界区（leader 更换时新旧快照同时在途）。
+  // 先完成者若把门彻底打开，applier 会在 B 挂 pending 之前派发条目 → 同样的
+  // 不变式破坏。深度计数保证最后一个出门的才开门。
+  int install_gate_depth_ = 0;
+
+  // =========================================================================
+  // 域 5 · leader 复制 —— next/match_index + 心跳序号广播 + 节流/流水线
+  //   只有 leader 写这些。next_index_ 是【发送指针】（发新批前进），
+  //   match_index_ 是【确认指针】（ACK 前进、单调），二者之差即流水线
+  //   窗口占用（> kPipelineMaxInFlight 时暂停发新批）。
+  //   replicator_cv_ 是"有活儿干"的唤醒源：Start() 追加日志 /
+  //   heartbeat_seq_ 自增时 notify_all，n-1 个 ReplicateLoop 各自比对
+  //   last_heartbeat_seq_ 后行动——序号广播 + 每线程自比，去中心化分发。
+  // =========================================================================
+  std::vector<int64_t> next_index_;   // 下一个要发给该 follower 的日志下标
+  std::vector<int64_t> match_index_;  // 已经确认该 follower 复制到的最高下标
 
   // 心跳计数器：leader 每 kHeartbeatInterval 自增一次。
   // 每个复制线程记下自己上次处理到几号心跳（last_heartbeat_seq_），
@@ -780,8 +601,6 @@ class Raft : public std::enable_shared_from_this<Raft> {
   uint64_t heartbeat_seq_ = 0;
   std::vector<uint64_t> last_heartbeat_seq_;
 
-  // 每个 follower：上次真正发出 AppendEntries 的时刻（用于节流）
-  std::vector<raftcpp::TimePoint> last_send_time_;
   // 流水线（滑动窗口）实现说明：
   //   在途（已发未确认）条目数 = next_index_[s] - 1 - match_index_[s]。
   //   next_index_ 是【发送指针】，仅"发送新批次"时前进；
@@ -790,8 +609,16 @@ class Raft : public std::enable_shared_from_this<Raft> {
   //   不再需要 bool 在途标记：超时重发只需把发送指针回退到 match_index_+1（幂等重发）。
   // inflight_log_time_：最近一次"发出带日志 AE"的时刻，用于超时重发判定。
   std::vector<raftcpp::TimePoint> inflight_log_time_;
+  // Start() 追加日志、或 heartbeat_seq_ 变化时 notify_all() 唤醒所有复制线程
+  std::condition_variable replicator_cv_;
 
-  // ---- 生产级扩展 ①：CheckQuorum / Leader Lease / ReadIndex ----
+  // =========================================================================
+  // 域 6 · CheckQuorum 与 Leader Lease —— 失多数派退位 + 租约读前提
+  //   last_ack_time_（回包到达时刻）与 cq_consec_fail_（连续 RPC 失败计数）
+  //   是两路互补的存活信号：前者兜住"回包永远不到"的真断连，后者容忍
+  //   "延迟但终会到达"的长重排。lease_expire_ 仅 kEnableLeaseRead 打开时
+  //   用于跳过心跳确认（默认关，不信任时钟漂移）。
+  // =========================================================================
   // 【last_ack_time_】leader 侧记录：第 i 个 follower 最近一次"成功回复"
   // AppendEntries 的时刻。
   //   * CheckQuorum 靠它数"最近一个选举超时窗口内我还能联系上几个"；
@@ -811,12 +638,18 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // 只有 LeaseRead 打开时才被用来跳过心跳确认。
   raftcpp::TimePoint lease_expire_;
 
-  // 【ReadIndex 一轮"读确认"的状态机】
+  // =========================================================================
+  // 域 7 · ReadIndex —— follower 线性一致读的多数派确认状态机
+  //   next_read_ctx_ 全局发号（单调递增、永不复用）；active_read_ 是
+  //   【单槽在飞轮】（读合并：未完成轮允许并发读者挂入，done 后不收人）；
+  //   read_safe_commit_ 是线性一致的硬前提——本 term 的 no-op 必须先
+  //   提交，否则读到的是"还没应用进状态机"的 stale 值。
+  // =========================================================================
   // 唤醒"正在等多数派确认"的读线程
   std::condition_variable read_cv_;
 
     // 【ReadIndex 读确认：per-request ctx 设计】
-  std::atomic<int> next_read_ctx_{1};            // 全局唯一 ctx 号（单调递增，永不复用）
+  std::atomic<uint64_t> next_read_ctx_{1};         // 全局唯一 ctx 号（单调递增，永不复用）
   // 【ReadIndex 读合并 · 单槽 + 共享指针】任意时刻【最多一轮】在飞读轮:未完成的轮
   // (!done)允许并发读者挂入(合并心跳);done 后不再收人——安全性承重件:挂入者的调用
   // 时刻必须早于多数派 ack 完成时刻,领导权验证才不会过期(否则分区+新主已 ACK 的写
@@ -843,8 +676,14 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // Get 等 last_cmd_index_ >= 95 → 早就成立（applier 只 apply 到 commit_index_，所以它停在 95）
   // 持锁直读 kv_store_ → 那个 index 100 的 Append 根本还没进状态机
   // 客户端拿到一个比自己上一次读还要旧的值 → 违反线性一致性
-  int read_safe_commit_ = 0;
-  // ---- 生产级扩展 ③：成员变更 ----
+  int64_t read_safe_commit_ = 0;
+  // =========================================================================
+  // 域 8 · 成员变更 —— 三态角色 + 单飞保护 + Q2 冻结点
+  //   is_member_ 是论文"C_old 与 C_new 的多数派必有交集"的落地点；
+  //   pending_conf_index_ 是单飞闸（apply 时清零，新 leader 上任扫描重建）；
+  //   removed_at_index_ 是隐私冻结点（与 is_member_ 两源取或，见
+  //   raft_util.h 的 IsRemovedFrozen）。
+  // =========================================================================
   // 【is_member_】成员变更 / Learner 三态数组，is_member_[i] 表示节点 i 的角色：
   //   kVoter   : 正式投票成员，参与一切多数派判定
   //   kLearner : 在集群里只追数据、不投票、不计入多数派（扩容零可用性损失）
@@ -854,15 +693,23 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // 单飞保护：当前"已 propose 但还没 apply（commit）"的成员变更条目下标。
   // 0 表示没有在途变更。同一时刻只允许一个变更在飞行（文档 §2.4 运维纪律）。
   // 新 leader 上任时会扫描日志重建这个值，保证切主后不丢失"在途变更"状态。
-  int pending_conf_index_ = 0;
+  int64_t pending_conf_index_ = 0;
   // Q2 隐私加固配套：记录每个节点"被移除时"的配置条目下标（冻结点）。
   // removed_at_index_[i] >= 0 表示节点 i 已在下标 idx 处被移除，leader 向它复制的
   // 日志最多到 idx（含移除条目本身），之后彻底冻结、不再发任何新日志/快照/心跳。
   // -1 表示无冻结点（节点是 voter/learner，或刚重启尚未从 ApplyLoop 重建）。
   // 不持久化：重启后节点本就从日志重放拿到过移除条目，cap<0 → 直接冻结即可，无需补发。
-  std::vector<int> removed_at_index_;
+  std::vector<int64_t> removed_at_index_;
+  // 锁内版本：调用方必须已持有 mu_（Start()/ReadIndex() 内部用）。
+  bool IsRemovedSelfLocked() const;
 
-  // ---- C1 未提交 entry 上限（背压）----
+  // =========================================================================
+  // 域 9 · 提案保护与磁盘水位 —— Start() 入口两道闸 + 状态序列化
+  //   max_uncommitted_entries_：未提交条目数背压（防海量写把未提交日志
+  //   堆爆内存）；max_raft_state_bytes_：raft state 落盘体积水位（超了
+  //   逼上层调 Snapshot() 压缩）。raft_state_bytes_ 缓存让 RaftStateSize
+  //   从 O(日志条数) 降为 O(1)。
+  // =========================================================================
   // 由 SetMaxUncommittedEntries() 修改；默认 kMaxUncommittedEntriesDefault。
   // 受 mu_ 保护（只在 Start() 内读、由 SetMaxUncommittedEntries() 写）。
   int max_uncommitted_entries_ = kMaxUncommittedEntriesDefault;
@@ -881,27 +728,42 @@ class Raft : public std::enable_shared_from_this<Raft> {
   // 段文件模式下会把 raft.log.seg 大小补进 RaftStateSize，保证磁盘水位保护（#2.2）仍生效。
   size_t RaftStateSizeLocked() const;
 
-  // ---- 重定向用：本节点认知的 leader 编号 ----
-  // 收到合法 AppendEntries（含心跳）时记为 args.leader_id；自己当选时记为 me_。
-  // 初始 -1（尚未认知任何 leader）。受 mu_ 保护（只在 AppendEntries /
-  // BecomeLeaderIfQuorumLocked / GetLeaderId 内读写）。
-  int leader_id_ = -1;
+  // =========================================================================
+  // 域 10 · state 文件 group commit —— 单一写者 + 版本号（仅 file 模式）
+  //   单一写者是安全件：并发 votedFor 落盘若被后到的旧 blob 覆写回退，
+  //   就是同任期双票 → 选举安全性崩塌。版本号让"PersistLocked 返回即
+  //   耐久"的契约在异步化后仍逐字成立。
+  // =========================================================================
+  // SaveRaftState = write+fsync+rename+fsync(dir)（persister.h:79-121），两次
+  // 同步 fsync 全在 mu_ 内，是锁内最后的慢 I/O。机制（单一写者）：提案线程持
+  // mu_ 只做「编码+记版本+标记脏」后等自己版本落盘；PersistFlushLoop 不持 mu_
+  // 写最新 blob + fsync —— state blob 是全量快照，同一窗口多个提案的状态是嵌套
+  // 关系，一次落盘释放全部等待者（N 提案 → 1 次 fsync）。「PersistLocked 返回
+  // 即耐久」契约逐字保留（快照 blob→state→截断顺序、votedFor/term 应答前落盘
+  // 原样成立）。
+  // 为什么必须单一写者：并发 votedFor 落盘可能被后到的旧 blob 覆写回退 →
+  // 同任期双票 → 选举安全性崩塌。
+  // 仅 file 模式启用；内存模式只是存 string、无 fsync 可合并，走原同步路径。
+  bool persist_async_ = false;
+  bool persist_dirty_ = false;               // 有已编码未落盘的 blob（持 mu_）
+  uint64_t persist_version_ = 0;             // 每次登记脏时递增（持 mu_）
+  uint64_t persist_synced_ = 0;              // 已落盘到的版本（flusher 写，持 mu_）
+  std::string pending_state_blob_;           // 最新待落盘 state blob（持 mu_）
+  std::condition_variable persist_cv_;       // flusher 等活（Kill 时也靠它退出）
+  std::condition_variable persist_done_cv_;  // 提案者等落盘
+  void PersistFlushLoop();
 
-  // ---- C5 被移除节点主动退场 ----
-  // 因"自己已被移除"而被主动抑制的选举次数，只在选举定时器里自增。
-  // 存在的意义：证明静默逻辑【真的生效了】，而不是"碰巧没触发选举"——
-  // 没有它，删除 C5 的检查后测试依然全绿（假通过），mutation 检验抓不出来。
+  // =========================================================================
+  // 域 11 · 横切观测计数器 —— C5 静默计数 + AE 字节上限统计
+  //   均为锁外并发更新的 atomic：前者证明"被移除节点真的在静默"
+  //   （没有它，删除 C5 检查后测试仍全绿 = 假通过，mutation 抓不出来）；
+  //   后者观测单条 AE 双上限之字节上限的截断行为。
+  // =========================================================================
   std::atomic<int> election_suppressed_{0};
 
   // §5.2 单条 AE 字节上限的观测计数器（SendAppendEntries 在锁外并发更新，故用 atomic）。
   std::atomic<long long> ae_byte_truncated_count_{0};  // 因字节上限截断的批次数
   std::atomic<long long> max_ae_payload_bytes_{0};     // 单条 AE 最大 payload 字节
-  // 锁内版本：调用方必须已持有 mu_（Start()/ReadIndex() 内部用）。
-  bool IsRemovedSelfLocked() const;
-
-  // Start() 追加日志、或心跳计数变化时 notify_all() 唤醒所有复制线程
-  std::condition_variable replicator_cv_;
-  std::condition_variable apply_cv_;
 };
 
 // 把 Raft 对象包装成一个可以被 labrpc 调用的 Service。

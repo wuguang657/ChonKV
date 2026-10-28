@@ -3,7 +3,7 @@
 > 基于 MIT 6.824（2020）从零手写的 C++ Raft 实现，已显著超出原 lab 范围。
 > A from-scratch C++ Raft implementation on MIT 6.824, extended with production features.
 
-通过 Lab 2（选举/复制/持久化/快照）与 Lab 3（线性一致 KV + 快照）全套用例，并自研 Pre-Vote、CheckQuorum、ReadIndex+Lease、动态成员变更、分块快照流式传输、日志/磁盘水位保护等生产向特性。测试套件共 **118 条**（Raft 81 + KV 37），含 porcupine 线性化校验、TSan/ASan/UBSan 构建矩阵、进程级并发压测脚本。
+通过 Lab 2（选举/复制/持久化/快照）与 Lab 3（线性一致 KV + 快照）全套用例，并自研 Pre-Vote、CheckQuorum、ReadIndex+Lease、动态成员变更、分块快照流式传输、日志/磁盘水位保护等生产向特性。测试套件共 **121 条**（Raft 84 + KV 37），含 porcupine 线性化校验、TSan/ASan/UBSan 构建矩阵、进程级并发压测脚本。
 
 > **持久化**：Raft 层支持**内存 / 文件双模式**（文件模式默认，崩溃安全写 `tmp→fsync→rename→fsync(dir)`）。详见[持久化模式开关](#持久化模式开关)。
 > **传输层**仍为 labrpc 软件模拟，未接真实网络；KV 测试脚手架当前固定内存模式。
@@ -47,34 +47,15 @@
 
 **工程质量**：异步 RPC + cancel 刹车、动态扩容线程池、T2/T3 崩溃窗口双层防护、`steady_clock` 单调租约、多档构建矩阵（Debug/Release/LTO + TSan/ASan/UBSan）、进程级并发压测 harness。
 
-## 持久化模式开关（内存 / 文件）
-
-开关只有一个参数 `file_backed`：
-
-| 模式 | 落盘 | 怎么开 |
-|---|---|---|
-| 文件模式（**默认**） | ✅ `raft_state.bin` + `snapshot.bin` | `file_backed = true` |
-| 内存模式 | ❌ | `file_backed = false` |
-
-```cpp
-// src/raft/config.h:58
-Config(int n, bool unreliable, bool file_backed = true);  // 改这行默认值即全局切换
-// 单用例覆盖：
-auto cfg = std::make_shared<Config>(servers, false, /*file_backed=*/false);
-```
-
-数据写在 `/tmp/cpp6raft_<pid>_<seq>/node_N/{raft_state.bin, snapshot.bin}`，`Cleanup()` 整树删除；崩溃重启用例 `Copy()` 出目录副本防残留线程改数据。
-
-**落盘失败直接 `std::abort()`（fail-stop）**——持久化成功前不可提交。⚠️ KV 测试脚手架（`kvraft::Config`）暂无 `file_backed` 参数，`StartServer()` 固定内存模式；想让 KV 也走文件需给 `kvraft::Config` 加参数并透传（约 3 处）。
-
 ## 目录结构
 
 ```
 cpp-6.824/
 ├── src/
 │   ├── common/      # 工具：随机/时间/channel/线程跟踪
-│   ├── labrpc/      # 网络仿真（丢包/延迟/乱序/断连）
-│   ├── raft/        # ★ 共识核 raft.h/cpp/config/persister/test_raft.cpp
+│   ├── labrpc/      # RPC 框架 + 可插拔传输（inproc 模拟 / socket 真网络）
+│   ├── raft/        # ★ 共识核 raft.h/cpp/config/test_raft.cpp
+│   ├── persist/     # 持久化域：log_store.h + log/（段文件·内存）+ state/（RaftState）
 │   ├── kvraft/      # KV-Raft 服务（复用 raft.cpp）+ porcupine.cpp
 │   └── tinylsm/     # ⚠️ WIP：LSM 引擎，未接入构建
 ├── doc/             # 设计/差距分析（1-Raft生产化差距清单, 2-快照分块改造清单）
@@ -85,19 +66,50 @@ cpp-6.824/
 
 ## 测试
 
-**共 118 条**：Raft 81（2A 2 / 2B 8 / 2C 8 / 2D 4 / 分块快照 2 / CheckQuorum 7 / ReadIndex 14 / Membership 27 / 文件持久化+磁盘水位 5）+ KV 37（3A 26 / 3B 10 / 调试入口 1）。过滤词 `2*`→raft_test，`3*`→kv_test；不写则都跑。
+**共 117 条**：Raft 80（2A 2 / 2B 8 / 2C 8 / 文件持久化 4 / 磁盘水位·背压 5 / 分块快照 2 / 快照 CRC 1 / 段日志存储 2 / CheckQuorum 7 / ReadIndex 14 / Membership 27）+ KV 37（3A 26 / 3B 10 / 调试入口 1）。
+
+两种跑法：
+
+- `./build.sh <过滤词>`：**单进程跑一遍**，按子串匹配用例名（如 `./build.sh 2B`、`./build.sh CheckQuorum`）。Ext 组用全名做过滤词，否则如 `TestReadIndex` 会误伤其余 9 个同名前缀用例
+- `./test_part.sh <组名>`：**并发压测入口**——组内每条用例各起独立测试进程（某轮 abort 不连坐其余轮次），默认各重复 25 轮、每轮换随机种子（失败可扣种子固定复现），按组最多 4 条同时跑；日志落在 `testdir/<组>-<用例>.log`，结束后自动汇总通过率
+
+| 组名 | 二进制 | 用例数 | 备注 |
+|---|---|---|---|
+| 2A | raft_test | 2 | |
+| 2B | raft_test | 8 | |
+| 2C | raft_test | 12 | 含 4 条文件持久化崩溃恢复（`TestFileBacked*`） |
+| 3A | kv_test | 26 | |
+| 3B | kv_test | 4† | †当前处于调试态：10 条中只启用 4 条（其余 6 条在脚本中注释） |
+| ChunkedSnapshotTransmit | raft_test | 2 | 分块快照 |
+| SegmentLog | raft_test | 2 | 段文件日志存储 + fail-stop 单测 |
+| CheckQuorum | raft_test | 7 | |
+| ReadIndex | raft_test | 14 | |
+| Membership | raft_test | 27 | 成员变更 / Learner 三态 / 27 条全名单 |
+| MaxMessageSize | raft_test | 5 | 消息字节上限、AE 单 RPC 字节封顶、未提交日志背压、磁盘水位 |
 
 ```bash
-./build.sh CheckQuorum    # 只跑某组（按子串匹配用例名）
-./test_part.sh 2B         # 每条并发 25 轮抓稀有竞态（SAN=tsan/asan/ubsan 等环境变量）
-./tsan.sh 2B              # TSan 体检（慢 5~15 倍，唯一能自动抓 data race 的手段）
+./test_part.sh 2B                        # 默认 SAN=none（build/，最快），每条 25 轮，并发 4
+COUNT=100 PARALLEL=2 ./test_part.sh 2C   # 自定义重复轮数与并发度
+SAN=tsan ./test_part.sh 2B               # TSan 版（build-tsan/，慢 5~15 倍，唯一自动抓 data race 的手段）
+SAN=asan,ubsan ./test_part.sh 3A         # ASan+UBSan 组合（build-asan-ubsan/；UBSan 自动 halt_on_error）
+RELEASE=1 OPT=1 ./test_part.sh 2A        # Release(-O3+NDEBUG) + LTO（build-release/）
+BIN=./build-tsan/raft_test ./test_part.sh Membership  # 跳过增量编译，直接用指定已编好的二进制
+SEED=12345 ./build/raft_test TestReadIndex            # 拿日志里的种子固定复现（Ext 组务必用全名）
 ```
 
-> ⚠️ 默认 `build/` 二进制**抓不到 data race**，务必定期 `--tsan` / `tsan.sh`。TSan 下实时窗口测试偶发活性 flake（≈1/250），属调度抖动非正确性 bug。
+环境变量：
+
+| 变量 | 取值 | 说明 |
+|---|---|---|
+| `SAN` | `tsan`（旧 `TSAN=1` 兼容）/ `asan` / `ubsan` / `asan,ubsan` / `none`（默认） | 生成 `build[-release]-<san>/` 区分不同体检组合；TSan 与 ASan 不可同开 |
+| `COUNT` / `PARALLEL` | 整数 | 每条用例重复轮数（默认 25）/ 组内进程级并发度（默认 4；TSan 建议 2~4） |
+| `RELEASE` / `OPT` | `0`/`1` | Release -O3+NDEBUG / 追加 -O2+LTO（Release 下只加 LTO） |
+| `BIN` | 路径 | 显指定二进制时按其目录名反推 sanitizer 配置，跳过编译 |
+| `LABRPC_TRANSPORT` / `LABRPC_PERSIST` | `inproc`/`memory`（默认） | 可插拔后端开关，脚本透传给被测进程；非默认后端会争抢端口/目录，自动 `PARALLEL=1` |
 
 ## 设计要点
 
-- T2/T3 崩溃窗口双层防护：`CondInstallSnapshot` 裁决 + 构造期 `ReadSnapshot()` 兜底
+- T2/T3 崩溃窗口双层防护：snapshot ApplyMsg 的 `index >= last_cmd_index_` 不变式（违例 fail-stop）+ 构造期 `ReadSnapshot()` 兜底
 - 异步 RPC + cancel 刹车（`CallAsync`+`cancel_rpcs_`），避免 `Kill` 后空等
 - 动态扩容线程池，避免阻塞型 handler 饿死心跳
 - exactly-once 去重 `(client_id, seq_id)`；porcupine 线性化校验已强

@@ -51,11 +51,11 @@ struct Op {
   std::string value;
   std::string method;  // "Put" / "Append" / "Get"
   int client_id = 0;
-  int seq_id = 0;
+  int64_t seq_id = 0;
 
   std::string Serialize() const {
     labrpc::Encoder e;
-    e.Bytes(key).Bytes(value).Bytes(method).Int(client_id).Int(seq_id);
+    e.Bytes(key).Bytes(value).Bytes(method).Int(client_id).Zigzag(seq_id);
     return e.Take();
   }
 
@@ -65,7 +65,7 @@ struct Op {
     if (!d.Bytes(value)) return false;
     if (!d.Bytes(method)) return false;
     if (!d.Int(client_id)) return false;
-    if (!d.Int(seq_id)) return false;
+    if (!d.Zigzag(seq_id)) return false;
     return d.Ok();
   }
 };
@@ -76,18 +76,18 @@ struct Op {
 struct GetArgs {
   std::string key;
   int client_id = 0;
-  int seq_id = 0;
+  int64_t seq_id = 0;
 
   std::string Serialize() const {
     labrpc::Encoder e;
-    e.Bytes(key).Int(client_id).Int(seq_id);
+    e.Bytes(key).Int(client_id).Zigzag(seq_id);
     return e.Take();
   }
   bool Deserialize(const std::string& s) {
     labrpc::Decoder d(s);
     if (!d.Bytes(key)) return false;
     if (!d.Int(client_id)) return false;
-    if (!d.Int(seq_id)) return false;
+    if (!d.Zigzag(seq_id)) return false;
     return d.Ok();
   }
 };
@@ -122,11 +122,11 @@ struct PutAppendArgs {
   std::string value;
   std::string op;  // "Put" or "Append"
   int client_id = 0;
-  int seq_id = 0;
+  int64_t seq_id = 0;
 
   std::string Serialize() const {
     labrpc::Encoder e;
-    e.Bytes(key).Bytes(value).Bytes(op).Int(client_id).Int(seq_id);
+    e.Bytes(key).Bytes(value).Bytes(op).Int(client_id).Zigzag(seq_id);
     return e.Take();
   }
   bool Deserialize(const std::string& s) {
@@ -135,7 +135,7 @@ struct PutAppendArgs {
     if (!d.Bytes(value)) return false;
     if (!d.Bytes(op)) return false;
     if (!d.Int(client_id)) return false;
-    if (!d.Int(seq_id)) return false;
+    if (!d.Zigzag(seq_id)) return false;
     return d.Ok();
   }
 };

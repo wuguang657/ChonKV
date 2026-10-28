@@ -64,6 +64,11 @@ class Encoder {
 class Decoder {
  public:
   explicit Decoder(const std::string& s) : buf_(s) {}
+  // 禁止从临时量构造：Decoder 只存【引用】（避免为几 MB 的 payload 再拷一份），
+  // 于是 `Decoder d(MakeBlob());` 会绑到一个语句结束就销毁的临时对象上 ——
+  // 编译通过、运行时读悬空引用，是最难查的一类 bug。
+  // 现在就把它变成编译错误：所有调用点传的都是具名变量，加这条零改动。
+  Decoder(std::string&&) = delete;
 
   bool Bool(bool& v) {
     uint64_t x = 0;

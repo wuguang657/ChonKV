@@ -9,19 +9,6 @@
 //   2. 从 applyCh 读已提交的命令，应用到自己的 kv_store_（状态机）
 //   3. exactly-once 语义：靠 (client_id, seq_id) 去重
 //   4. 日志压缩：raft 状态超过 maxraftstate 就生成快照
-//
-// 【和 Go 版的几处关键差异 —— 都是为了不踩 C++ 的坑】
-//   1. Go 版用 channel 做"等 apply 完成"的通知，配合 select + time.After 实现
-//      超时。C++ 的 Chan 没有超时 Pop，所以改用 mutex + condition_variable 的
-//      wait_for(100ms) 轮询唤醒。
-//      ⚠️ 注意：这里【不】再在轮询时探测"我还是不是 leader"——锁外探测拿到的
-//      只是一个会过期的快照，既不能保证正确性，也拦不住"被隔离却自认为仍是
-//      leader"的少数派旧 leader（它 isLeader 恒为 true，探测根本不触发）。
-//      真正兜底的是 Get / WaitOp 里的 1s 硬超时。
-//   2. 绝不在持有 mu_ 时调用 Raft 的方法（ReadIndex / Snapshot / GetState ...）。
-//      它们内部会抢 raft 的锁，"持 KV 锁跨进 raft 锁"是死锁温床
-//      （config.cpp:178-179 的注释也强调过这一点）。
-//      本实现一律先在锁内收集好数据，释放 mu_ 后再调 Raft。
 
 #pragma once
 
@@ -41,7 +28,7 @@
 
 #include "../common/chan.h"
 #include "../labrpc/labrpc.h"
-#include "../labgob/persister.h"
+#include "../persist/state/persister.h"
 #include "../raft/raft.h"
 #include "common.h"
 
@@ -59,7 +46,7 @@ struct NotifyMsg {
   bool done = false;  // applier 已经处理过这个 index 了
   bool ok = false;    // 身份匹配 → 这条命令确实生效了
   int client_id = 0;
-  int seq_id = 0;
+  int64_t seq_id = 0;
 };
 
 class SessionTable {
@@ -69,14 +56,14 @@ class SessionTable {
                           uint64_t max_idle_index = 100000):
         cap_(cap), max_idle_index_(max_idle_index) {}
 
-    int Get(int cid, uint64_t now_index){
+    int64_t Get(int cid, uint64_t now_index){
       auto it = entries_.find(cid);
       if (it == entries_.end()) return 0;
       Touch(it, now_index);
       return it->second.last_seq;
     }
     // 写入新的最大 seq（apply 了更大 seq 之后调用），并刷新为"刚访问"。
-   void Put(int cid, int seq, uint64_t now_index) {
+   void Put(int cid, int64_t seq, uint64_t now_index) {
       auto it = entries_.find(cid);
       if (it == entries_.end()) {
         SessionEntry e;
@@ -92,7 +79,7 @@ class SessionTable {
   // 快照恢复专用：按给定的 last_index 装载，【不】走 Touch。
   // 调用方必须按快照里的顺序（最旧 -> 最新）依次调用，这样 push_front 重建出的
   // LRU 队列与"从日志逐条 apply 过来"的副本完全一致。
-  void Load(int cid, int seq, uint64_t last_index) {
+  void Load(int cid, int64_t seq, uint64_t last_index) {
     auto it = entries_.find(cid);
     if (it == entries_.end()) {
       SessionEntry e;
@@ -110,7 +97,7 @@ class SessionTable {
   // now_index = 当前 apply 的 command_index，即逻辑时钟的"现在"。
   // on_evict：每淘汰一个 client_id 时回调（KVServer 用它做 fencing），可为空。
   // on_evict 装一个lambda表达式， 例如：[this](int cid) { this->fence(cid); }
-  void Reap(uint64_t now_index, std::function<void(int,int)> on_evict = {}) {
+  void Reap(uint64_t now_index, std::function<void(int,int64_t)> on_evict = {}) {
     // 1) 空闲淘汰：lru_.back() 恒为 last_index 最小者，它不满足就能整段跳出。
     while (!lru_.empty()) {
       auto it = entries_.find(lru_.back());
@@ -159,7 +146,7 @@ class SessionTable {
 
   private:
     struct SessionEntry {
-      int last_seq = 0;
+      int64_t last_seq = 0;
       uint64_t last_index = 0; // 最后一次访问的 index,长时间没访问就淘汰
       std::list<int>::iterator lru_it;  // lru_ 中的迭代器
     };
@@ -169,9 +156,9 @@ class SessionTable {
       lru_.splice(lru_.begin(), lru_, it->second.lru_it);
     }
     void Evict(std::unordered_map<int, SessionEntry>::iterator it,
-             std::function<void(int,int)> on_evict = {}) {
+             std::function<void(int,int64_t)> on_evict = {}) {
       int cid = it->first;
-      int last_seq = it->second.last_seq;   // 淘汰前取出，供墓碑使用
+      int64_t last_seq = it->second.last_seq;   // 淘汰前取出，供墓碑使用
       lru_.erase(it->second.lru_it);
       entries_.erase(it);
       evicted_++;
@@ -203,15 +190,20 @@ class KVServer {
 
   // ---- RPC handler：由网络线程并发调用，内部自己加锁 ----
   void Get(const GetArgs& args, GetReply& reply);
+  // 陈旧读（stale read）：直接读本节点已 apply 的状态机，不走 Raft::ReadIndex、
+  // 不找 leader、不凑多数派、永不返 kWrongLeader。专供少数派/隔离节点（如 2 节点
+  // leader 挂掉后剩的那台）做"尽力而为"的陈旧读。返回的可能落后，调用方需自知。
+  void GetStale(const GetArgs& args, GetReply& reply);
   void PutAppend(const PutAppendArgs& args, PutAppendReply& reply);
 
   // ---- 给测试框架用的访问器 ----
   int me() const { return me_; }
   int LogSize() const { return rf_ ? rf_->LogSize() : 0; }
+  // 全量口径（= raft::Raft::RaftStateSize()）：state blob + 段文件大小。
   int RaftStateSize() const {
-    return persister_ ? persister_->RaftStateSize() : 0;
+    return rf_ ? static_cast<int>(rf_->RaftStateSize()) : 0;
   }
-  int SnapshotIndex() const { return rf_ ? rf_->SnapshotIndex() : 0; }
+  int64_t SnapshotIndex() const { return rf_ ? rf_->SnapshotIndex() : 0; }
   // 直接读状态机（测试校验一致性用）。调用方需要自己保证并发安全，
   // 测试里只在"没有客户端在跑"的时候调。
   std::map<std::string, std::string> SnapshotStore() const;
@@ -224,8 +216,6 @@ class KVServer {
   }
 
   // ---- 会话表淘汰 / fencing 调试用（白盒）----
-  // ⚠️ 这几个都加锁：ApplierLoop 会在另一个线程里并发改 sessions_ / fenced_，
-  //    测试线程无锁直读是 data race（TSan 会报），必须走这里的访问器。
   size_t SessionSizeForTest() const {
     std::lock_guard<std::mutex> lk(mu_);
     return sessions_.Size();
@@ -246,7 +236,7 @@ class KVServer {
   // 读某个被 fencing 的 cid 的【墓碑值】（淘汰那一刻的 last_seq）。
   // 未 fence 返回 false。这条是验证"墓碑 tombstone"正确性的唯一入口：
   // 若 Evict 回调漏传 last_seq、或快照编解码丢 seq，这里就会读到错误的值。
-  bool FenceLastSeqForTest(int cid, int* out_seq) const {
+  bool FenceLastSeqForTest(int cid, int64_t* out_seq) const {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = fenced_.find(cid);
     if (it == fenced_.end()) return false;
@@ -256,9 +246,9 @@ class KVServer {
   // 按 fence_fifo_（淘汰先后）导出整个 fenced_，用于比对【副本间顺序一致性】。
   // 只比对 size 是不够的：若各副本编码/回放顺序不同，封顶 kFenceCap 时会踢掉
   // 不同的 cid → 状态机随时间发散，而 size 恰恰相等。
-  std::vector<std::pair<int, int>> FenceOrderedForTest() const {
+  std::vector<std::pair<int, int64_t>> FenceOrderedForTest() const {
     std::lock_guard<std::mutex> lk(mu_);
-    std::vector<std::pair<int, int>> out;
+    std::vector<std::pair<int, int64_t>> out;
     out.reserve(fence_fifo_.size());
     for (int cid : fence_fifo_) {
       auto it = fenced_.find(cid);
@@ -273,7 +263,7 @@ class KVServer {
     sessions_.SetLimit(cap, max_idle_index);
   }
   // 已应用到状态机的最高 cmd index（逻辑时钟读数），供副本一致性比对。
-  int LastCmdIndexForTest() const {
+  int64_t LastCmdIndexForTest() const {
     std::lock_guard<std::mutex> lk(mu_);
     return last_cmd_index_;
   }
@@ -302,10 +292,14 @@ class KVServer {
   // ---- 以下三个都要求调用方【持有 mu_】（名字以 Locked 结尾）----
   // 把状态机编码成快照字节：kv_store_ + last_seq_
   std::string EncodeSnapshotLocked() const;
-  // 把快照字节装回状态机（幂等，可重复调用）
-  void ApplySnapshotLocked(const std::string& blob);
+  // 把快照字节装回状态机（幂等，可重复调用）。
+  bool ApplySnapshotLocked(const std::string& blob);
   // 判断是否需要生成快照，需要就把数据准备好（在锁内编码）
-  bool PrepareSnapshotLocked(int index, int* snap_index, std::string* blob);
+  bool PrepareSnapshotLocked(int64_t index, int64_t* snap_index, std::string* blob);
+  // 清扫某个 index 上残留的 waiter（调用方持有 mu_）：该下标的内容已被
+  // no-op / conf / 反序列化失败 / 快照 覆盖成"非本命令"，旧 leader 上注册的
+  // waiter 永远等不到 done → 白等满 1s 超时才返回。
+  void ClearWaiterLocked(int64_t index);
   // #2.2 磁盘水位：disk_full 时主动压缩一次（锁内编码 + 锁外 Snapshot）。
   void ForceSnapshotOnDiskFull();
 
@@ -337,22 +331,17 @@ class KVServer {
   // value=淘汰时记录的 last_seq。apply 去重时若会话记录已被擦除，仍可用墓碑
   // 里的 last_seq 去重，堵住"入口 fence 有 TOCTOU、重试滑过、记录擦除后才 apply"
   // 导致的双执行窄窗。受 kFenceCap + fence_fifo_ 约束，内存有界。
-  std::unordered_map<int, int> fenced_;
+  std::unordered_map<int, int64_t> fenced_;
   std::deque<int> fence_fifo_;
   static constexpr size_t kFenceCap = 4 * 1024 * 1024;   // 保证黑名单有界
 
   // applier 已应用到状态机的最高 cmd index。
   // 注意与 raft.last_applied_ 的区别：raft 的在【派发时】推进，
   // 这个在【KVServer 真正 apply 后】更新，两者差 = applyCh 积压。
-  //
-  // ⚠️ 它是 ReadIndex 读路径的关键：Get 拿到线性化点 ri 后，必须等到
-  // last_cmd_index_ >= ri 才允许读本地状态机（见 Get 的实现）。
-  // 因此 applier 的【每一个】分支（普通命令 / no-op / 装快照）都要推进它，
-  // 漏掉任何一个分支都会让 Get 永久卡在那个下标上。
-  int last_cmd_index_ = 0;
+  int64_t last_cmd_index_ = 0;
 
   // index -> 正在等这个 index 被 apply 的请求
-  std::map<int, NotifyMsg> msg_replies_;
+  std::map<int64_t, NotifyMsg> msg_replies_;
 
   std::atomic<bool> dead_{false};
   std::thread applier_;
@@ -382,10 +371,18 @@ inline std::shared_ptr<labrpc::Service> MakeKVServerService(
     kv->PutAppend(a, r);
     return r.Serialize();
   };
+  Service::Handler get_stale = [kv](const std::string& args) -> std::string {
+    GetArgs a;
+    a.Deserialize(args);
+    GetReply r;
+    kv->GetStale(a, r);
+    return r.Serialize();
+  };
   return std::make_shared<Service>(
       "KVServer", std::unordered_map<std::string, Service::Handler>{
                       {"Get", get},
                       {"PutAppend", put_append},
+                      {"GetStale", get_stale},
                   });
 }
 

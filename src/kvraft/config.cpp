@@ -6,22 +6,20 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <thread>
 #include <utility>
 
 #include "../common/util.h"
+#include "../labrpc/transport_factory.h"  // labrpc::MakeTransport：按 LABRPC_TRANSPORT 选后端
+#include "../persist/state/persister_factory.h"  // persist::MakePersister：按 LABRPC_PERSIST 选后端
 #include "../common/thread_tracker.h"
 #include "kv_model.h"
 #include "test_status.h"  // Fatal() / g_failed（让 CheckLinearizability 失败能传到 runner）
 
 namespace kvraft {
 
-// 【修复】端点名必须全局唯一：原先 StartServer / MakeClient 都用 RandString(20)
-// 当端点名，两边可能撞车。一旦重名，Network::Enable 用 endname 当 key，
-// ShutdownServer 里 DisconnectUnlocked(i, All()) 会把 Clerk 的端点一起 Disable，
-// 而重启后的 ConnectAll() 只遍历 endnames_（server 端），被误伤的 clerk 端点
-// 再也没人 Enable —— 客户端永久失联（重试到 60s 放弃 → got < want）。
-// 用全局自增序号打头，server 用 "s"、client 用 "c" 区分，彻底消除碰撞。
+// 端点名必须全局唯一
 namespace {
 std::atomic<int> g_end_seq{0};
 std::string NewEndName(const char* tag) {
@@ -38,14 +36,25 @@ Config::Config(int n, bool unreliable, int maxraftstate, bool linearizability)
     : n_(n),
       maxraftstate_(maxraftstate),
       check_linearizability_(linearizability) {
-  net_ = labrpc::MakeNetwork();
+  net_ = labrpc::MakeTransport();
   kvservers_.assign(n, nullptr);
   saved_.assign(n, nullptr);
   endnames_.assign(n, {});
 
-  // 和 raft 的测试脚手架一样：断连回包随机延迟 0~7000ms。
-  // 这是架构级的防作弊 —— 逼实现必须用异步 RPC，同步等回包必死。
-  net_->LongDelays(true);
+  // 与 persist::MakePersister() 的目录决策保持同一条判据（persister_factory.h）：
+  // LABRPC_PERSIST_DIR 未设/为空 → 工厂自建 /tmp/cpp6raft_<pid>_<seq> 自动目录，
+  // 那种目录 pid 私有，本 Config 负责在 Cleanup 清理掉；设了 → 用户的地盘，
+  // 可能多进程/多轮共享，绝不碰（见 persist_dirs_ 注释）。
+  {
+    const char* d = std::getenv("LABRPC_PERSIST_DIR");
+    persist_auto_dir_ = (d == nullptr || d[0] == '\0');
+  }
+
+  // 注意：不开 LongDelays —— 对齐 Go 版 kvraft/config.go（make_config 只有
+  // Reliable）。Go 注释：“many kv tests require the client to try each server
+  // in fairly rapid succession”——kv 客户端要快速换服重试，0~7000ms 的失败
+  // 延迟会把用例顶爆看门狗（实测 TestSnapshotMultiChunkUnreliable3B 148s>120s）。
+  // longDelays 是 raft config 专属（raft/config.cpp）。
 
   for (int i = 0; i < n_; i++) StartServer(i);
   ConnectAll();
@@ -68,6 +77,22 @@ void Config::Cleanup() {
   // raft::Raft::ApplyLoop）。raft::Config::Cleanup 里有完全相同的一行
   // （raft/config.cpp:552），这里是从 Lab 2 移植时漏掉的。
   raftcpp::ThreadTracker::Instance().WaitAll(10000);
+
+  // 最后清理本 Config 自己造的持久化目录。时机安全：上面 WaitAll 已保证所有
+  // raft 线程退出、ShutdownServer 已 join kv applier → 没有存活写者。
+  // 只清自动目录（pid 私有）；用户指定 LABRPC_PERSIST_DIR 时 persist_dirs_
+  // 根本是空的。清掉的包括每次 Copy 克隆出的 copy_<pid>_N —— 不清理的话
+  // 实测一个 3B 用例就往 /tmp 根漏 35 个克隆目录 + 5 个持久化根。
+  for (const std::string& d : persist_dirs_) {
+    persist::RemoveTree(d);
+  }
+  persist_dirs_.clear();
+}
+
+void Config::TrackPersisterDir(const std::shared_ptr<raft::Persister>& p) {
+  // 内存模式 Dir() 为空；用户目录模式不跟踪（可能被别的进程共享，不能删）
+  if (!persist_auto_dir_ || !p || !p->FileBacked() || p->Dir().empty()) return;
+  persist_dirs_.push_back(p->Dir());
 }
 
 // ===========================================================================
@@ -86,19 +111,19 @@ void Config::ShutdownServer(int i) {
 
   // 换一块"新盘"：内容是旧盘的拷贝。
   // 这样旧实例的残留线程就算还在跑，也改不到新实例要用的数据。
-  if (saved_[i]) saved_[i] = saved_[i]->Copy();
+  if (saved_[i]) {
+    auto old = kvservers_[i];
+    if (old && old->raft_for_test()) {
+      saved_[i] = old->raft_for_test()->CopyPersisterUnderLock();
+    } else {
+      saved_[i] = saved_[i]->Copy();  // 已无存活实例，无并发写盘，直接克隆
+    }
+    TrackPersisterDir(saved_[i]);  // 记账：Cleanup 时统一清理（仅自动目录模式）
+  }
 
   auto kv = std::move(kvservers_[i]);  // kvservers_[i] = nullptr
-  // ⚠️ 延后析构：旧 KVServer（及其 Raft）不在这里立即析构，而是存进 graves_。
-  // 否则旧 Raft 的 mu_ 一析构，它那条 detached 的 ApplyLoop 线程还活着，
-  // 去 lock 已销毁的 mutex → "mutex lock failed: Invalid argument"。
-  // 真正析构发生在 Cleanup() 的 ThreadTracker::WaitAll 之后（见 config.cpp）。
-  // 注意：这里是【拷贝】 push_back（graves_ 和下面 kv 都持有引用），不能
-  // std::move，否则 kv 会变空、下面的 kv->Kill() 不执行 → 旧 Raft 永远不退出。
   graves_.push_back(kv);
 
-  // ⚠️ Kill() 会 join applier 线程，绝不能拿着 mu_ 等，否则死锁
-  // （applier 线程里也要拿 mu_）。
   lk.unlock();
   if (kv) kv->Kill();
 }
@@ -125,8 +150,9 @@ void Config::StartServer(int i) {
     if (saved_[i]) {
       saved_[i] = saved_[i]->Copy();
     } else {
-      saved_[i] = labgob::MakePersister();
+      saved_[i] = persist::MakePersister();
     }
+    TrackPersisterDir(saved_[i]);  // 记账：Cleanup 时统一清理（仅自动目录模式）
     persister = saved_[i];
   }  // ---- 释放锁再建 KVServer（StartKVServer 会起线程）----
 
@@ -198,15 +224,6 @@ void Config::Partition(const std::vector<int>& p1, const std::vector<int>& p2) {
 }
 
 // 自动分区，保证当前 leader 落在少数派（这样多数派能选出新 leader）
-//
-// 这是 Go 版 config.go:339 make_partition() 的移植：p1 固定 n/2+1 台、
-// p2 固定 n/2 台，leader 放进 p2。语义上 **p1 恒为多数派**。
-//
-// ⚠️ 别把它改成"每台抛硬币"：TestOnePartition3A 依赖 p1 是多数派
-//    （它要在 p1 里写入并期望能推进）。曾经误改过一次，随机切出 2v3 时
-//    p1 变成少数派 → Clerk 60s GIVE UP → 用例 122 秒后红。Go 版把
-//    "抛硬币"放在 test_test.go:126 的 partitioner() 里，是另一个函数
-//    （见下面的 MakePartitionRandom）。
 void Config::MakePartition(std::vector<int>* p1, std::vector<int>* p2) {
   int leader = 0;
   Leader(&leader);
@@ -235,11 +252,6 @@ void Config::MakePartition(std::vector<int>* p1, std::vector<int>* p2) {
 //   * 形态 2^n 种、每轮全新随机（MakePartition 是固定 n/2+1 vs n/2）；
 //   * 允许空组（全 0 或全 1）→ 那一轮等价于"全网连通"，是合法扰动；
 //   * leader 落在哪边看运气（约 50% 在多数派）。
-//
-// ⚠️ 之前 GenericTest 的分区线程一直在调 MakePartition（固定 4 vs 3 且
-//    永远把 leader 关进少数派），一个随机数都没有 → 3 轮 iter × 每轮约 4 次
-//    ≈ 12 次几乎一模一样的分区，测不到 1v6 / 全员连通等形态。
-//    这是 C++ 版相对 Go 的覆盖缺口：C++ 过了不代表 Go 的等价场景能过。
 void Config::MakePartitionRandom(std::vector<int>* p1, std::vector<int>* p2) {
   p1->clear();
   p2->clear();
@@ -270,37 +282,13 @@ std::shared_ptr<Clerk> Config::MakeClient(const std::vector<int>& to) {
     }
   }
 
-  // Fisher-Yates 乱序：对齐 Go 版 config.go:204 的 MakeClerk(random_handles(ends))。
-  // 目的 —— Clerk 首次尝试的目标从"固定 0 号"变成随机节点，让"第一跳落在哪台"
-  // 均匀分布，避免所有 client 同时挤向同一台形成伪热点。
-  //
-  // ⚠️⚠️ 只能乱序【交给 Clerk 的那份 ends】，Config 自己留底的 clerk_ends_
-  //    必须保持**原始顺序**（下标 j ↔ server j）。
-  //    原因：ConnectClient(ck, to) 是按下标 j 去 Enable/Disable 的
-  //    （j ∈ to 才连），它说的 j 是 **server id**。留底那份一旦跟着乱序，
-  //    就会"本想连 0 号、实际把 3 号的端点打开" —— 分区彻底错位。
-  //    Go 版同理：cfg.clerks[ck] = endnames（未乱序）,
-  //              MakeClerk(random_handles(ends))（乱序副本）。
-  std::vector<int> order(n_);
-  for (int i = 0; i < n_; i++) order[i] = i;
-  for (int i = 0; i < n_; i++) {
-    int j = raftcpp::RandInt(i + 1);  // [0, i]，等价于 Go 的 rand.Intn(i+1)
-    std::swap(order[i], order[j]);
-  }
-  std::vector<std::shared_ptr<labrpc::ClientEnd>> shuffled_ends(n_);
-  for (int k = 0; k < n_; k++) shuffled_ends[k] = ends[order[k]];
-
-  auto ck = std::make_shared<Clerk>(shuffled_ends);
+  auto ck = std::make_shared<Clerk>(ends);
   {
     std::lock_guard<std::mutex> lk(mu_);
     clerks_[ck.get()] = ck;       // Config 持有 shared_ptr，Clerk 寿命延长到 Config 析构
-    clerk_ends_[ck.get()] = names;  // ⚠️ 原始顺序，不要传 shuffled_names
+    clerk_ends_[ck.get()] = names; 
   }
 
-  // ⚠️ 空 `to` 的语义对齐 Go 版 config.go:191 —— **一台都不连**。
-  //    原先这里写成 ConnectClient(ck, All())（连全部），方向正好相反：
-  //    若哪个用例误传空 vector，分区会被静默抹平，依赖分区才暴露的 bug
-  //    就被掩盖掉了（分区测试形同虚设）。想要"连全部"请显式传 cfg.All()。
   if (!to.empty()) {
     ConnectClient(ck.get(), to);
   }
@@ -361,7 +349,21 @@ int Config::LogSize() const {
   std::lock_guard<std::mutex> lk(mu_);
   int m = 0;
   for (int i = 0; i < n_; i++) {
-    if (saved_[i]) m = std::max(m, saved_[i]->RaftStateSize());
+    // 优先问【活着的】KVServer：它的 RaftStateSize() 是 raft 全量口径
+    // （state blob + raft.log.seg）。file 模式下 saved_[i] 的 persister
+    // 口径只剩标量（恒定 ~8B），直接拿它会让 3B 的三条
+    // "logs were not trimmed"断言恒真 —— 日志真没修剪也测不出来（假绿）。
+    // 停机中的节点（ShutdownServer 已摘）没有活 raft 可问，退回 saved_[i]
+    // 快照口径：少测一台好过没有，且少测只会漏报、不会误报。
+    // 锁序：Config::mu_ → raft::mu_ 单向（同 ShutdownServer 的
+    // CopyPersisterUnderLock），raft 永不回调 KV/Config，无死锁。
+    int sz = 0;
+    if (i < static_cast<int>(kvservers_.size()) && kvservers_[i]) {
+      sz = kvservers_[i]->RaftStateSize();
+    } else if (saved_[i]) {
+      sz = saved_[i]->RaftStateSize();
+    }
+    m = std::max(m, sz);
   }
   return m;
 }
@@ -417,20 +419,11 @@ void Config::End() {
                     .count();
   int nrpc = RpcTotal() - rpcs0_;
 
-  // ⚠️ 修复"假通过"：runner（test_kvraft.cpp:950）只认 g_failed，不认 failed_。
-  // 之前这里只打印 "FAILED" 然后 return，g_failed 仍是 false → 被算成通过。
-  // 改走 Fatal()：主线程抛 TestFailure 被 runner 接住 → bad=true；
-  // 同时 g_failed 翻 true，双保险。cfg->Fail() 设的失败也走这条。
   if (failed_.load()) {
     Fatal(fail_msg_.empty() ? "test failed (cfg->Fail without message)"
                              : fail_msg_);
   }
 
-  // 和 raft 测试脚手架一致的超时保护
-  // ⚠️ 同样走 Fatal() 翻 g_failed，否则超时也算"通过"。
-  // TSan 下插桩慢 5~15×，分区愈合墙钟时间可能暴涨；该死线本是防"真卡死"的兜底，
-  // TSan 模式放宽到 360s（仍远小于全局看门狗 TEST_TIMEOUT_MS），避免把 TSan 调度
-  // 偶发导致的慢愈合误判为 hang。非 TSan 保持 120s 不变（能抓真卡死）。
   const double kEndTimeoutSec =
 #if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
       360.0;
@@ -438,7 +431,10 @@ void Config::End() {
       120.0;
 #endif
   if (secs > kEndTimeoutSec) {
-    Fatal("test took longer than 120 seconds");
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "test took longer than %.0f seconds",
+                  kEndTimeoutSec);
+    Fatal(buf);
   }
 
   // ---- 副本一致性：所有 server 的状态机必须收敛到同一个状态 ----
@@ -447,22 +443,10 @@ void Config::End() {
   // 做线性一致性验证）。但 C++ 这一侧没有 porcupine，客户端 Get 又只能读到
   // leader 的视图 —— 于是"某个 follower 状态机缺数据"这类 bug 是漏网的。
   // 这里补上，相当于给 3A/3B 加一道兜底。
-  //
-  // ⚠️ 两个前提，缺一不可：
-  //   1) 只在【全网连通】时检查。分区期间各副本本来就不一致，那是合法的 ——
-  //      TestOnePartition3A 的前两段就是在分区状态下调 End() 的。
-  //   2) 必须给收敛窗口。刚 heal / 刚重启时，落后副本还在追日志，状态机暂时
-  //      是旧版本 —— 那也是合法的中间态。所以最多重试 2 秒，仍未收敛才算失败。
   if (!partitioned_.load()) {
     std::string err;
     bool consistent = false;
     // 收敛窗口：10 秒（100 × 100ms）。
-    //
-    // ⚠️ 原来是 2 秒（20 × 100ms）。TSan / 3B 快照场景下，刚 heal 或刚重启的
-    //    落后副本要先收 InstallSnapshot 再追日志，2 秒偏紧 → 偶发
-    //    "replicas did not converge" 的假失败，而真因（哪个 key 不一致）反而
-    //    被这条断言盖住。放宽到 10 秒不损失覆盖：真不收敛的话等 10 秒照样失败，
-    //    只是把"慢"和"错"这两件事分开了。
     for (int attempt = 0; attempt < 100 && !consistent; attempt++) {
       if (CheckConsistency(&err)) {
         consistent = true;
@@ -474,7 +458,6 @@ void Config::End() {
       char buf[512];
       std::snprintf(buf, sizeof(buf), "replicas did not converge: %s",
                     err.c_str());
-      // ⚠️ 走 Fatal() 翻 g_failed，否则"副本不收敛"会被算成通过。
       Fatal(buf);
     }
   }
@@ -539,7 +522,6 @@ bool Config::CheckLinearizability() {
   }
 
   if (history.empty()) {
-    // ⚠️ 走 Fatal() 翻 g_failed，否则"无操作记录"也算通过（假通过）。
     Fatal("linearizability: no operations recorded");
   }
 
@@ -585,18 +567,6 @@ bool Config::CheckLinearizability() {
   auto model = MakeKvModel();
   std::printf("[lin] model 创建完成，调 CheckOperations\n");
   std::fflush(stdout);
-  // ⚠️ 这里比 Go 基准严格得多，是有意为之：
-  //    Go 版 kvraft/test_test.go:20 的 linearizabilityCheckTimeout 只有 **1 秒**，
-  //    而且 1 秒搜不完时走的是
-  //      } else if res == porcupine.Unknown {
-  //        fmt.Println("info: linearizability check timed out,
-  //                     assuming history is ok")
-  //      }
-  //    ——也就是**直接假设历史是 OK 的并放行**。15 clients / 7 servers 的 history
-  //    1 秒几乎必然搜不完，所以那两个 ...Linearizable3A/3B 用例在 Go 官方测试里
-  //    基本是空跑的。
-  //    C++ 版给 120 秒、且 Unknown 分支走 Fatal（见下面 case Unknown），
-  //    是刻意改严：不让"没搜完"伪装成"通过了"。
   auto result =
       porcupine::CheckOperations(model, history, std::chrono::seconds(120));
   std::printf("[lin] CheckOperations 返回 result=%d\n", (int)result);
@@ -615,15 +585,6 @@ bool Config::CheckLinearizability() {
       failed_.store(true);
       return false;
     case porcupine::CheckResult::Unknown: {
-      // Go 版（test_test.go:443-445）对 Unknown 只打印一行就放行：
-      //     fmt.Println("info: linearizability check timed out, assuming history is ok")
-      // 但注意 Go 的 linearizabilityCheckTimeout 只有 **1 秒**（test_test.go:20），
-      // 15 clients / 7 servers 的 history 1 秒必然搜不完 —— 所以 Go 那两个
-      // ...Linearizable3A/3B 用例实际是空跑的，Unknown 放行 ≈ 没检查。
-      //
-      // C++ 这边给 120 秒，是真检查。120 秒还搜不完意味着 history 太大或机器太慢，
-      // 与"实现错了"是两回事，所以默认仍判失败（保留严格性），但留一个逃生舱：
-      // KV_UNKNOWN_PASS=1 时退回 Go 语义 —— 只打印、不判失败。
       static const bool unknown_pass = []() {
         const char* p = std::getenv("KV_UNKNOWN_PASS");
         return p != nullptr && p[0] != '\0' && p[0] != '0';
@@ -660,7 +621,6 @@ bool Config::CheckConsistency(std::string* err) {
       for (const auto& p : stores[0]) {
         auto it = stores[i].find(p.first);
         if (it == stores[i].end() || it->second != p.second) {
-          // ⚠️ 排错 dump：每个 server 的 snapIdx/lastApplied/该 key 的值
           {
             std::lock_guard<std::mutex> lk(mu_);
             // std::fprintf(stderr, "[consistency-diverge] key=%s\n", p.first.c_str());

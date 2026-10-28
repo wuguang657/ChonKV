@@ -35,11 +35,14 @@ class Clerk {
 
   // 取一个 key 的值；不存在返回 ""
   std::string Get(const std::string& key);
+  // 陈旧读：对任意可达节点发 GetStale，不要求 leader、不重试换台直到拿到值或超时。
+  // 返回的值可能落后（少数派节点）。不进线性化 history（避免污染 porcupine 判定）。
+  std::string GetStale(const std::string& key);
   Err Put(const std::string& key, const std::string& value);
   Err Append(const std::string& key, const std::string& value);
 
   int client_id() const { return client_id_; }
-  int seq_id() const { return seq_id_; }
+  int64_t seq_id() const { return seq_id_; }
 
   // 本 Clerk 是否曾在 Put/Append 上超时放弃（Get 放弃不算 —— 读不改状态，
   // 少记一条 history 不影响线性一致性判定）。
@@ -68,8 +71,9 @@ class Clerk {
 
   std::vector<std::shared_ptr<labrpc::ClientEnd>> servers_;
   int client_id_ = 0;
-  int seq_id_ = 0;
-  int leader_id_ = 0;  // 上次成功那台的编号，下次优先试它
+  int64_t seq_id_ = 0;
+  // 上次成功那台的编号，下次优先试它。
+  int leader_id_ = 0;
   // 重定向兜底用的 round-robin 游标：保证"一定能遍历到所有节点"。
   // 客户端每次失败都让 rr_ 前移 1，所以即便 hint 全是陈旧的（在 0<->2 之间
   // 互指、绕开真正的 leader），也能靠 rr_ 兜底覆盖到真正的 leader。

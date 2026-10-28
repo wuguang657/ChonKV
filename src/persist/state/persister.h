@@ -1,4 +1,7 @@
-// persister.h —— 模拟磁盘（Go 版 src/raft/persister.go 的移植）
+// persister.h —— RaftState 持久化器（Go 版 src/labgob/persister.go 的移植）
+//
+// 归属 persist/state/（raft state blob 与快照 blob 的持久化域）。
+// 日志持久化在 persist/log/（LogStorage 接口 + 段文件/内存两后端），互不相干。
 //
 // 在真实的 Raft 里，currentTerm / votedFor / log 必须写盘，
 // 断电重启后还在。测试里用一块内存 + 一把锁来假装是磁盘。
@@ -12,7 +15,12 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cerrno>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -21,7 +29,7 @@
 #include <unistd.h>
 #include <dirent.h>
 
-namespace labgob {
+namespace persist {
 // inline关键字：该函数被多次.h包含编译合法
 // mkdir -p：递归创建目录（忽略已存在的 EEXIST）。返回是否成功。
 inline bool MkdirAll(const std::string& path) {
@@ -38,6 +46,36 @@ inline bool MkdirAll(const std::string& path) {
     }
   }
   return ::mkdir(p.c_str(), 0755) == 0 || errno == EEXIST;
+}
+
+// rm -rf 的安全版：递归删除目录树。与 MkdirAll 对称（一建一清）。
+inline void RemoveTree(const std::string& path) {
+  DIR* d = ::opendir(path.c_str());
+  if (!d) return;  // 目录不存在就当没东西可删
+  struct dirent* e;
+  while ((e = ::readdir(d)) != nullptr) {
+    std::string name = e->d_name;
+    if (name == "." || name == "..") continue;
+    std::string full = path + "/" + name;
+    struct stat st;
+    if (::stat(full.c_str(), &st) != 0) {
+      // stat 抓瞎（极罕见）：先 unlink 再 rmdir，只有一个会成功，覆盖文件/目录两种情况，不漏删
+      ::unlink(full.c_str());
+      ::rmdir(full.c_str());
+      continue;
+    }
+    if (S_ISDIR(st.st_mode)) {
+      RemoveTree(full);
+    } else if (::unlink(full.c_str()) != 0 && errno != ENOENT) {
+      std::fprintf(stderr, "persist::RemoveTree: unlink %s failed (%s)\n", full.c_str(),
+                   std::strerror(errno));
+    }
+  }
+  ::closedir(d);
+  if (::rmdir(path.c_str()) != 0 && errno != ENOENT) {
+    std::fprintf(stderr, "persist::RemoveTree: rmdir %s failed (%s)\n", path.c_str(),
+                 std::strerror(errno));
+  }
 }
 
 // 原子写落盘
@@ -117,12 +155,18 @@ inline bool FileExists(const std::string& path) {
 
 // std::abort()：宁可当街崩，也绝不「假装拷贝成功」把节点拉起来。
 inline std::string CopyDir(const std::string& src) {
-  static std::atomic<uint64_t> seq{0};   // 全局自增，保证每次克隆的目录名不撞车
+  static std::atomic<uint64_t> seq{0};   // 进程内自增，配合 pid 保证克隆目录名不撞车
   std::string::size_type slash = src.find_last_of('/');
   std::string parent = (slash == std::string::npos) ? "." : src.substr(0, slash);
   std::string dst;
+  // 名字里必须带 pid：access() 只查不占，两个【并发】进程可能同时选中 copy_1
+  // （各自的 seq 都从 0 开始）→ 两边把各自的克隆写进同一目录 → 互相覆盖，
+  // 造出撕裂的 raft_state/seg → "state diverged" 家族（极具误导性）。
+  // pid 在任一时刻全局唯一，同进程内再由 seq 保证；pid 复用留下的残留
+  // 由下面的 access 循环兜底（换下一个序号）。
   do {
-    dst = parent + "/copy_" + std::to_string(++seq);
+    dst = parent + "/copy_" + std::to_string(::getpid()) + "_" +
+          std::to_string(++seq);
   } while (::access(dst.c_str(), F_OK) == 0);  // 已存在就换下一个序号
   // 建目录失败：后面所有写都会跟着失败，必须立刻报出来
   if (!MkdirAll(dst)) {
@@ -293,13 +337,11 @@ class Persister {
   std::string dir_;
 };
 
-inline std::shared_ptr<Persister> MakePersister() {
-  return std::make_shared<Persister>();
-}
-
 // 文件模式工厂：dir 为每节点独立目录。
+// 注意：无参 MakePersister() 的"按环境变量选后端"版本已迁到 persister_factory.h
+// （对标 transport_factory.h 的 MakeTransport），这里只保留显式指定目录的文件模式。
 inline std::shared_ptr<Persister> MakePersister(const std::string& dir) {
   return std::make_shared<Persister>(dir);
 }
 
-}  // namespace labgob
+}  // namespace persist

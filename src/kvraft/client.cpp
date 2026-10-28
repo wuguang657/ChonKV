@@ -21,32 +21,7 @@ namespace kvraft {
 // ---------------------------------------------------------------------------
 // Clerk 放弃前的总预算
 // ---------------------------------------------------------------------------
-// Go 版 Clerk 是【永不放弃】的（client.go:57-86 / :107-134 的 for 循环没有
-// 任何退出条件）—— 分区期间它就一直重试，直到分区 heal。C++ 这边保留一个兜底
-// 上限，是为了"集群真的全挂了"时不至于把整个测试进程永久挂住。
-//
-// ⚠️ 这个值不能设小了，否则会制造 **Go 基准不会复现的假失败**。算一下账：
-//    发往【断连】节点的 RPC 在网络层会被模拟延迟 rand()%7000 ms 才返回失败
-//    （labrpc.cpp:188-190，与 Go labrpc.go:294-300 逐字一致；kvraft 建网时
-//    开了 LongDelays(true)，config.cpp:31）。
-//    5 台机、断了 3 台时，光走完一圈的上限就是 3×7000 ≈ 21s。
-//    原来给 30s —— 只够一圈多一点，很容易在"集群其实马上就能服务"的时候
-//    提前放弃。给 60s ≈ 2.8 圈余量，正常分区 heal 的时间尺度绰绰有余。
-//
-//    另外注意：超时后 Get 返回 ""、PutAppend 静默 return，而那条命令其实有可能
-//    已经在服务端生效了 —— 客户端以为没做成、状态机里却有，于是 CheckClntAppends
-//    报 want/got 不一致。这类假失败排查起来极具迷惑性，所以放弃时必须打日志
-//    （见 ReportGiveUp），不能真"静默"。
-//
-//    TSan 例外：TSan 插桩让 Raft 事件处理（选举超时处理、RPC 收发、读心跳 quorum
-//    确认）慢 5~15 倍，分区愈合 / 再选举的墙钟时间被同比例拉长。原 60s（≈2.8 圈余量）
-//    在偶发坏调度下会被吃光 → Clerk 误判 GIVE UP → 返回 "" → 测试报 "got []" 假失败。
-//    TestManyPartitionsManyClients3A 等分区用例在 TSan 下偶发中招（同种子既可能过也可能
-//    挂，纯属 TSan 调度方差，非 ReadIndex 逻辑 bug）。故 TSan 下放宽到 300s，恢复同等
-//    相对余量；非 TSan 保持 60s 不变，以免真无主窗口被静默拖长。
-//    注：测试侧已同时缓解（TSan 下 nclients 5→2 + gentlePartitions 让分区间隔/愈合 ×3），
-//    把愈合墙钟压回预算内；这里的 300s 是叠加在测试缓解之上的双保险，确保即便最坏调度
-//    下 clerk 也不会在愈合完成前误判 GIVE UP。
+
 #if defined(__SANITIZE_THREAD__) || \
     (defined(__has_feature) && __has_feature(thread_sanitizer))
 constexpr std::chrono::seconds kClerkGiveUpTimeout{300};
@@ -60,7 +35,7 @@ namespace {
 void ReportGiveUp(const char* op, int64_t client_id, int64_t seq_id,
                   const std::string& key) {
   std::fprintf(stderr,
-               "\n[kv-clerk] ⚠️ GIVE UP: %s(client=%lld seq=%lld key=\"%s\") "
+               "\n[kv-clerk] GIVE UP: %s(client=%lld seq=%lld key=\"%s\") "
                "超过 %llds 未完成，Clerk 主动放弃。\n"
                "           这可能是真的分区不可达；也可能是 window 太窄造成的"
                "假失败 —— 排查时先确认集群当时是否还在正常选主。\n",
@@ -72,33 +47,28 @@ void ReportGiveUp(const char* op, int64_t client_id, int64_t seq_id,
 }  // namespace
 
 int64_t NRand() {
-  // ⚠️ 原来是 `static std::mt19937_64 rng(std::random_device{}())` + 一把 mutex。
-  //    和 test_kvraft.cpp 里那个本地 RandInt 是同一类问题：拿真随机源播种，
-  //    SEED 环境变量【完全管不到】它 —— "固定种子可复现"对 client_id 不成立，
-  //    偶发的去重 bug 复现不出来。
-  //    改走 raftcpp::RandEngine()：splitmix64 派生流 + thread_local 引擎，
-  //    既受 SEED 控制，又顺带省掉了锁。
   std::uniform_int_distribution<int64_t> dist(0, (int64_t(1) << 62) - 1);
   return dist(raftcpp::RandEngine());
 }
 
 Clerk::Clerk(std::vector<std::shared_ptr<labrpc::ClientEnd>> servers)
     : servers_(std::move(servers)) {
-  // ⚠️ 原来是 static_cast<int>(NRand())：NRand 返回 0..2^62-1，截断到 32 位 int
-  //    可能得到【负数】。服务端用 last_seq_[client_id] 做去重，负数当 map key
-  //    虽然也能工作，但取值范围被无谓地砍到一半（碰撞概率翻倍），且看着像 bug。
-  //    这里掩码到非负 31 位。
-  //
-  //    另外注意：client_id 是【服务端去重用的身份】，必须每个 Clerk 唯一。
-  //    不要为了"对齐 Go 的 porcupine ClientId"把它改成 0..nclients-1 ——
-  //    Go 里 porcupine 的 ClientId 是 goroutine 编号（只用于画图，
-  //    porcupine/model.go:6 写着 "optional, unless you want a visualization"），
-  //    与 Clerk 自己的 nrand() 去重 id 是两回事。真改成固定编号的话，
-  //    第 2 轮新建的 Clerk 会复用编号 0 且 seq 从 1 重新计数，撞上第 1 轮残留的
-  //    last_seq_[0]，所有写都被当成重复请求丢弃 —— 那才是灾难。
   client_id_ = static_cast<int>(NRand() & 0x7fffffff);
   seq_id_ = 0;
-  leader_id_ = 0;
+  // 首跳随机化：Config::MakeClient 传的 servers_ 是原始顺序（下标 j ↔ server j，
+  // 保证 hint 回填 reply.leader_id 后 servers_[leader_id] 连到的就是 leader 本身）。
+  // "让所有客户端首跳不挤向同一台"的随机性在这里补 —— 与 Go 版
+  // MakeClerk(random_handles(ends)) 的随机首跳等效，且不分裂下标空间。
+  if (!servers_.empty()) {
+    std::uniform_int_distribution<int> dist(0,
+                                            static_cast<int>(servers_.size()) - 1);
+    int start = dist(raftcpp::RandEngine());
+    leader_id_ = start;
+    rr_ = start;
+  } else {
+    leader_id_ = 0;
+    rr_ = 0;
+  }
 }
 
 // steady_clock::time_point → 纳秒（单调时间）
@@ -106,6 +76,64 @@ static int64_t MonoNs(std::chrono::steady_clock::time_point tp) {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
              tp.time_since_epoch())
       .count();
+}
+
+std::string Clerk::GetStale(const std::string& key) {
+  if (servers_.empty()) return "";
+
+  seq_id_++;
+  GetArgs args;
+  args.key = key;
+  args.client_id = client_id_;
+  args.seq_id = seq_id_;
+
+  // 总超时兜底：防止"集群全挂/全不可达"时永不返回（与 Get 同款防护）。
+  const auto deadline =
+      std::chrono::steady_clock::now() + kClerkGiveUpTimeout;
+
+  int leader = leader_id_;
+  while (true) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      ReportGiveUp("GetStale", client_id_, seq_id_, key);
+      return "";
+    }
+    GetReply reply;
+    // 任一可达节点都能做陈旧读（无需 leader）。节点挂了（!ok）就换下一台轮询。
+    bool ok = servers_[leader]->CallTyped("KVServer.GetStale", args, reply);
+    if (!ok) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      leader = (leader + 1) % static_cast<int>(servers_.size());
+      continue;
+    }
+    // GetStale 服务端只会返回 kOK / kNoKey（server.cpp:326 直读 kv_store_，无
+    // leader/quorum/超时/会话/背压逻辑，构造上不可能返 kWrongLeader/kTimeout/
+    // kBusy/kSessionGone）。节点不可达已由上面的 !ok 分支兜底，这里只处理成功
+    // 返回的两种正常语义；其余枚举值显式分类，避免未来服务端演进时被"沉默吞噬"。
+    switch (reply.err) {
+      case Err::kOK:
+        // 记住这台可达的：GetStale 不承诺 leader 语义，但"最近一次成功
+        // 读到的那台"通常是最佳首跳候选（它活着且已 apply 到较新下标）。
+        // 不更新的话，首跳节点挂掉后每次调用都要从同一台开始空转一轮。
+        leader_id_ = leader;
+        return reply.value;
+      case Err::kNoKey:
+        leader_id_ = leader;
+        return "";
+      case Err::kBusy:
+        // 当前服务端不会返回；若将来 GetStale 加了背压，应与 Get 一致重试【同一台】
+        // （轮询会让请求在节点间空转，甚至触发 GiveUp 丢写），故 leader 不变。
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        continue;  // 重试同一台
+      case Err::kWrongLeader:
+      case Err::kTimeout:
+      case Err::kSessionGone:
+      default:
+        // 这些 GetStale 服务端都不可能返回。退化为换台重试，避免挂死。
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        leader = (leader + 1) % static_cast<int>(servers_.size());
+        continue;
+    }
+  }
 }
 
 std::string Clerk::Get(const std::string& key) {
@@ -234,11 +262,7 @@ Err Clerk::PutAppend(const std::string& key, const std::string& value,
         RecordPutAppend(key, value, op_code, MonoNs(t_call), MonoNs(t_return));
         return Err::kOK;
       case Err::kSessionGone:
-        // 服务端协议兜底触发：本会话已被淘汰。服务端保证"这条命令其实已在状态机
-        // 执行过一次"，所以【绝不重发】它（用新会话重发会二次执行）。正确做法是
-        // 开【新会话】（换 client_id、seq 归零）供后续命令使用，当前这条当作
-        // "结果未知"返回给调用方。这样淘汰窗口内语义是 at-least-once，绝不重复执行。
-        // 注意：不进 history——它的效果已在状态机里，记录与否不影响线性一致性判定。
+        // 服务端协议兜底触发：本会话已被 fence（淘汰）。
         client_id_ = static_cast<int>(NRand() & 0x7fffffff);
         seq_id_ = 0;
         used_hint_ = 0;
@@ -295,7 +319,7 @@ void Clerk::RecordGet(const std::string& key, const std::string& value,
                       int64_t call_time_ns, int64_t return_time_ns) {
   KvOperation op;
   op.client_id = client_id_;
-  op.seq_id = seq_id_;          // 🐞 给 dump 字段加料（去重 bug 排查用）
+  op.seq_id = seq_id_;
   op.input.op = KV_OP_GET;
   op.input.key = key;
   op.input.value = "";
@@ -311,7 +335,7 @@ void Clerk::RecordPutAppend(const std::string& key, const std::string& value,
                             int64_t return_time_ns) {
   KvOperation op;
   op.client_id = client_id_;
-  op.seq_id = seq_id_;          // 🐞 给 dump 字段加料（去重 bug 排查用）
+  op.seq_id = seq_id_;
   op.input.op = op_code;
   op.input.key = key;
   op.input.value = value;

@@ -1,8 +1,8 @@
 // test_raft.cpp —— 所有测试用例（Go 版 src/raft/test_test.go 的移植）
 //
 // ===========================================================================
-// 注：Lab 2D 的 4 个快照测试（TestSnapshot*2D）已并入本文件，登记在 kTests[]
-// 末尾；用 `./raft_test 2D` 可单独跑快照组，`./raft_test -count 10 2D` 可压偶发。
+// 注：原 Lab 2D 的 4 个快照用例已删除——覆盖由分块快照 / 大状态机追平 /
+// blob CRC / 成员重水化等更强用例承接；`./raft_test Snapshot` 可跑快照相关组。
 // ===========================================================================
 
 #include <atomic>
@@ -24,7 +24,8 @@
 #include "../common/watchdog.h"  // 单用例超时看门狗（对齐 go test 的 10min 超时）
 #include "config.h"
 #include "raft.h"
-#include "segment_log_store.h"
+#include "../persist/log_store.h"
+#include "../persist/log/segment_log_store.h"
 
 using namespace raft;
 
@@ -67,6 +68,63 @@ std::thread SafeThread(ThreadErr& err, Fn fn) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// RAII join 守卫：包住"线程已创建、函数后续可能抛异常"的区间
+// ---------------------------------------------------------------------------
+// C++ 标准：joinable 的 std::thread 被析构 = std::terminate。
+// SafeThread 只接【子线程】的异常；主线程在 join 之前抛异常（CheckOneLeader /
+// One / Fatal 等都可抛）时，栈展开会先析构局部 std::thread 对象 → terminate，
+// 症状是 "terminate called after throwing" + 后续 ~60 个用例全丢。
+// 这两个守卫在栈展开时先 join（顺序：守卫晚于线程对象构造 → 早于它析构），
+// 把异常正常传出去。
+//
+// 适用前提：线程体必然有限结束（有限循环 / 内部调用有超时上界）——
+// 否则 guard 的 join 会永久阻塞。无限循环线程（while(!stop)）传 stop 指针，
+// 异常路径先通知退出再 join。
+struct ThreadsJoinGuard {
+  std::vector<std::thread>& ts;
+  std::atomic<bool>* stop = nullptr;
+  explicit ThreadsJoinGuard(std::vector<std::thread>& t,
+                            std::atomic<bool>* s = nullptr)
+      : ts(t), stop(s) {}
+  ~ThreadsJoinGuard() {
+    if (stop) stop->store(true);
+    for (auto& t : ts) {
+      if (t.joinable()) t.join();
+    }
+  }
+};
+
+struct ThreadJoinGuard {
+  std::thread& t;
+  std::atomic<bool>* stop = nullptr;
+  explicit ThreadJoinGuard(std::thread& t_, std::atomic<bool>* s = nullptr)
+      : t(t_), stop(s) {}
+  ~ThreadJoinGuard() {
+    if (stop) stop->store(true);
+    if (t.joinable()) t.join();
+  }
+};
+
+// ---------------------------------------------------------------------------
+// ReadIndex 重试助手（仅【连通】场景使用）
+// ---------------------------------------------------------------------------
+// ReadIndex 的多数派 ack 心跳有 kElectionTimeoutMin（150ms）硬预算
+// （raft.cpp ReadIndex 的 deadline）。满载（多线程 + TSan）下 150ms 可能收不齐
+// 多数派回包 → 单次零重试偶发返回 -1，把"慢"误判成"失败"（假 flaky）。
+// 本助手轮询到成功再返回；【被隔离 / 期望快速失败 -1 的关卡不要用】——
+// 那类场景要的正是"够不到 leader 就立刻拒绝放读"的语义（如
+// TestLearnerReadIndexForwards 关卡 3）。真正的实现缺陷（如傻等所有节点）
+// 在任何重试下都拿不到 >=0，不会被子掩盖。
+static int64_t ReadIndexRetry(const std::shared_ptr<Config>& cfg, int node) {
+  for (int t = 0; t < 100; t++) {
+    int64_t ri = cfg->GetRaft(node)->ReadIndex();
+    if (ri >= 0) return ri;
+    raftcpp::SleepMs(50);
+  }
+  return -1;
+}
+
 static std::string Cmd(int x) { return std::to_string(x); }
 
 // 生成【全局唯一】的命令值：随机前缀 + 单调递增序号（形如 "728341#137"）。
@@ -100,17 +158,17 @@ void TestInitialElection2A() {
 
   // 等一会儿，让 follower 也得知选举结果，再检查大家任期是否一致
   raftcpp::SleepMs(50);
-  int term1 = cfg->CheckTerms();
+  int64_t term1 = cfg->CheckTerms();
   if (term1 < 1) {
     char buf[128];
-    std::snprintf(buf, sizeof(buf), "term is %d, but should be at least 1",
-                  term1);
+    std::snprintf(buf, sizeof(buf), "term is %lld, but should be at least 1",
+                  static_cast<long long>(term1));
     cfg->Fatal(buf);
   }
 
   // 没有故障的话，leader 和任期不该变
   raftcpp::SleepMs(2 * kRaftElectionTimeout);
-  int term2 = cfg->CheckTerms();
+  int64_t term2 = cfg->CheckTerms();
   if (term1 != term2) {
     std::printf("warning: term changed even though there were no failures\n");
   }
@@ -169,10 +227,10 @@ void TestBasicAgree2B() {
 
     // 保证提交的xindex == index
     // One = Start + 轮询等提交 + 校验值相等 + 超时 Fatal。
-    int xindex = cfg->One(Cmd(index * 100), servers, false);
+    int64_t xindex = cfg->One(Cmd(index * 100), servers, false);
     if (xindex != index) {
       char buf[128];
-      std::snprintf(buf, sizeof(buf), "got index %d but expected %d", xindex,
+      std::snprintf(buf, sizeof(buf), "got index %lld but expected %d", static_cast<long long>(xindex),
                     index);
       cfg->Fatal(buf);
     }
@@ -195,10 +253,10 @@ void TestRPCBytes2B() {
   int64_t sent = 0;
   for (int index = 2; index < iters + 2; index++) {
     std::string cmd = raftcpp::RandString(5000); // 放大命令大小，5000字节，确保每个命令的字节数不同
-    int xindex = cfg->One(cmd, servers, false);
+    int64_t xindex = cfg->One(cmd, servers, false);
     if (xindex != index) {
       char buf[128];
-      std::snprintf(buf, sizeof(buf), "got index %d but expected %d", xindex,
+      std::snprintf(buf, sizeof(buf), "got index %lld but expected %d", static_cast<long long>(xindex),
                     index);
       cfg->Fatal(buf);
     }
@@ -268,7 +326,8 @@ void TestFailNoAgree2B() {
   // 即使永远提交不了，leader 也必须立刻分配 index=2 并返回，不能阻塞等提交。
   if (r.index != 2) {
     char buf[128];
-    std::snprintf(buf, sizeof(buf), "expected index 2, got %d", r.index);
+    std::snprintf(buf, sizeof(buf), "expected index 2, got %lld",
+                  static_cast<long long>(r.index));
     cfg->Fatal(buf);
   }
   // 等待2s
@@ -302,7 +361,8 @@ void TestFailNoAgree2B() {
   //    （断连不砍在途 RPC），所以这条 race 在 C++ 侧照样能撞上，只是概率问题。
   if (r2.index < 2 || r2.index > 4) {
     char buf[128];
-    std::snprintf(buf, sizeof(buf), "unexpected index %d", r2.index);
+    std::snprintf(buf, sizeof(buf), "unexpected index %lld",
+                  static_cast<long long>(r2.index));
     cfg->Fatal(buf);
   }
 
@@ -325,10 +385,10 @@ void TestConcurrentStarts2B() {
     int leader = cfg->CheckOneLeader();
     StartResult r0 = cfg->GetRaft(leader)->Start(Cmd(1));
     if (!r0.is_leader) continue;  // leader 换得太快
-    int term = r0.term;
+    int64_t term = r0.term;
 
     int iters = 5;
-    std::vector<int> indices;
+    std::vector<int64_t> indices;
     std::mutex indices_mu;
     // 和 InternalChurn 同理：子线程里的失败要靠它带回主线程。
     ThreadErr err;
@@ -358,7 +418,7 @@ void TestConcurrentStarts2B() {
 
     bool failed = false;
     std::vector<std::string> cmds;
-    for (int index : indices) {
+    for (int64_t index : indices) {
       // 等第 index 号槽位被至少 n 台提交，然后把那一格的值交回给你。
       auto cmd = cfg->Wait(index, servers, term);
       if (!cmd) {
@@ -518,8 +578,8 @@ void TestCount2B() {
     int iters = 10;
     StartResult r0 = cfg->GetRaft(leader)->Start(Cmd(1));
     if (!r0.is_leader) continue;
-    int term = r0.term;
-    int starti = r0.index;
+    int64_t term = r0.term;
+    int64_t starti = r0.index;
 
     bool bail = false;
     std::vector<std::string> cmds;
@@ -549,8 +609,8 @@ void TestCount2B() {
       if (*cmd != cmds[static_cast<size_t>(i) - 1]) {
         char buf[256];
         std::snprintf(buf, sizeof(buf),
-                      "wrong value %s committed for index %d; expected %s",
-                      cmd->c_str(), starti + i,
+                      "wrong value %s committed for index %lld; expected %s",
+                      cmd->c_str(), static_cast<long long>(starti + i),
                       cmds[static_cast<size_t>(i) - 1].c_str());
         cfg->Fatal(buf);
       }
@@ -780,6 +840,10 @@ void TestUnreliableAgree2C() {
 
   ThreadErr err;
   std::vector<std::thread> threads;
+  // 循环内主线程的 One 可抛（此刻线程已创建）：抛了靠本守卫先 join 所有线程
+  // 再传异常，否则 vector 里的 joinable std::thread 析构 → std::terminate
+  // （SafeThread 接不住主线程的异常）。
+  ThreadsJoinGuard tg{threads};
   for (int iters = 1; iters < 50; iters++) {
     for (int j = 0; j < 4; j++) {
       threads.push_back(SafeThread(err, [cfg, iters, j]() {
@@ -877,7 +941,7 @@ void InternalChurn(bool unreliable) {
       // 我这条即使被 Raft 弄丢了，也会被另一个同值的替身救回来 → 漏检。
       // 详见文件顶部 CmdUnique() 的注释。
       std::string x = CmdUnique();
-      int index = -1;
+      int64_t index = -1;
       bool ok = false;
       for (int i = 0; i < servers; i++) {
         auto rf = cfg->GetRaft(i);
@@ -915,6 +979,11 @@ void InternalChurn(bool unreliable) {
   int ncli = 3;
   std::vector<std::vector<std::string>> results(ncli);
   std::vector<std::thread> clients;
+  // churn 窗口（下方 ~14s 的 Start1/Crash1/Disconnect/Connect）内主线程若抛
+  // （bad_alloc / 将来有人加断言），栈展开会先析构 vector 里 3 个 joinable
+  // thread → std::terminate → 后面 ~60 个用例全丢。守卫带 &stop：异常路径
+  // 先通知 client 退出再 join。client 是 while(!stop) 无限循环，必须带 stop。
+  ThreadsJoinGuard clients_guard{clients, &stop};
   for (int i = 0; i < ncli; i++) {
     // 必须走 SafeThread（本文件顶部定义的工具）：client_fn 里会调 NCommitted，
     // 而 Config::Fatal 是 [[noreturn]] throw TestFailure（config.cpp:36）。
@@ -964,7 +1033,7 @@ void InternalChurn(bool unreliable) {
 
   // 同样用唯一值：它会被 Wait() 拉进 really 列表参与比对，若和 client 提交的
   // 某条撞值，就给那条命令的丢失提供了替身。
-  int last_index = cfg->One(CmdUnique(), servers, true);
+  int64_t last_index = cfg->One(CmdUnique(), servers, true);
 
   std::vector<std::string> really;
   for (int index = 1; index <= last_index; index++) {
@@ -988,21 +1057,13 @@ void TestReliableChurn2C() { InternalChurn(false); }
 void TestUnreliableChurn2C() { InternalChurn(true); }
 
 // ===========================================================================
-// 2D：日志压缩 / 快照（InstallSnapshot）—— 标准两段式 + 快照感知状态机
-//
-// 这些用例启用了 config 的"快照感知状态机"（EnableSnapshotCompression）：
-//   * applier 在日志过长时主动调 rf.Snapshot(LastApplied, EncodeKV(state)) 压缩；
-//   * follower 收到 InstallSnapshot RPC 后，由 applier 调 rf.CondInstallSnapshot
-//     确认落地，并把快照 blob（被压缩掉的那段 state）重水化进自己的状态机。
-// 因此既验证 Raft 内部机制（日志截断 / InstallSnapshot 追赶 / 重启恢复），
-// 也验证"状态机能靠快照追平"——这是 Lab 3 日志压缩完整闭环。
-// 注：snapshot_compaction_ 是 per-Config 开关，不会污染上面的 2A/2B/2C 用例。
+// 快照组共用小工具
 // ===========================================================================
 
 // 取【必须在位】的节点句柄。
 //
 // Config::GetRaft 对"已崩溃 / 还没 Start1"的节点返回 nullptr（config.cpp:46-49
-// 只加锁取值，不 Fatal）。2D 这批用例的操作序列里有 Crash1 → Start1，一旦
+// 只加锁取值，不 Fatal）。快照组用例的操作序列里有 Crash1 → Start1，一旦
 // Start1 没成功、或将来有人调整动作顺序，裸 `GetRaft(i)->SnapshotIndex()` 就是
 // 对 nullptr 解引用 → SIGSEGV，一个字都不打印，比普通的用例失败难查得多。
 // 为空时明确报出节点编号，让失败直接指向真正的原因。
@@ -1028,151 +1089,6 @@ static void WaitApplied(std::shared_ptr<Raft> rf, int timeout_ms) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     waited += 10;
   }
-}
-
-// 测试 1：状态机主动压缩能截断日志
-void TestSnapshotTruncatesLog2D() {
-  auto cfg = MakeConfig(3, false);
-  cfg->EnableSnapshotCompaction();
-  cfg->Begin("Test (2D): snapshot truncates log");
-
-  for (int i = 1; i <= 100; i++) {
-    cfg->One("put k" + std::to_string(i) + " v" + std::to_string(i), 1, true);
-  }
-  int leader = cfg->CheckOneLeader();
-  auto rf = GetRaftOrFatal(cfg, leader);
-  WaitApplied(rf, 2000);
-
-  std::cout << "  leader 日志条数(压缩后): " << rf->LogSize()
-            << "  snapshot_index=" << rf->SnapshotIndex() << "\n";
-  if (rf->LogSize() > kSnapshotThreshold + 1) {
-    char buf[128];
-    std::snprintf(buf, sizeof(buf), "log not truncated: %d > %d",
-                  rf->LogSize(), kSnapshotThreshold + 1);
-    cfg->Fatal(buf);
-  }
-  if (rf->SnapshotIndex() <= 0) cfg->Fatal("snapshot_index not advanced");
-  cfg->End();
-}
-
-// 测试 2：落后节点通过 InstallSnapshot 追上，且状态机被带平
-void TestInstallSnapshotCatchUp2D() {
-  auto cfg = MakeConfig(3, false);
-  cfg->EnableSnapshotCompaction();
-  cfg->Begin("Test (2D): install snapshot catch up");
-
-  for (int i = 1; i <= 20; i++)
-    cfg->One("put a v" + std::to_string(i), 1, true);
-
-  int leader = cfg->CheckOneLeader();
-  int follower = (leader + 1) % 3;
-  cfg->Crash1(follower);
-
-  for (int i = 21; i <= 100; i++)
-    cfg->One("put b v" + std::to_string(i), 1, true);
-
-  auto lrf = GetRaftOrFatal(cfg, leader);
-  WaitApplied(lrf, 2000);
-
-  cfg->Start1(follower);
-
-  bool ok = false;
-  for (int t = 0; t < 150; t++) {
-    if (lrf->SnapshotIndex() > 0 &&
-        GetRaftOrFatal(cfg, follower)->SnapshotIndex() >= lrf->SnapshotIndex()) {
-      ok = true;
-      break;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  }
-  if (!ok) cfg->Fatal("follower didn't catch up via InstallSnapshot");
-  WaitApplied(GetRaftOrFatal(cfg, follower), 5000);
-  WaitApplied(GetRaftOrFatal(cfg, follower), 5000);
-
-  auto ls = cfg->GetState(leader);
-  auto fs = cfg->GetState(follower);
-  std::cout << "  follower 快照点追上: "
-            << GetRaftOrFatal(cfg, follower)->SnapshotIndex()
-            << "  leader 快照点: " << lrf->SnapshotIndex()
-            << "  状态条目 leader=" << ls.size() << " follower=" << fs.size()
-            << "\n";
-  if (ls != fs) cfg->Fatal("follower state != leader state after snapshot");
-  cfg->End();
-}
-
-// 测试 3：快照在崩溃重启后仍然存活
-void TestSnapshotRestart2D() {
-  auto cfg = MakeConfig(3, false);
-  cfg->EnableSnapshotCompaction();
-  cfg->Begin("Test (2D): snapshot survives restart");
-
-  for (int i = 1; i <= 30; i++)
-    cfg->One("put k v" + std::to_string(i), 1, true);
-  int leader = cfg->CheckOneLeader();
-  auto lrf = GetRaftOrFatal(cfg, leader);
-  WaitApplied(lrf, 2000);
-
-  int snap_idx = lrf->SnapshotIndex();
-  if (snap_idx <= 0) cfg->Fatal("compaction didn't happen");
-
-  cfg->Crash1(leader);
-  cfg->Start1(leader);
-  if (GetRaftOrFatal(cfg, leader)->SnapshotIndex() != snap_idx) {
-    char buf[128];
-    std::snprintf(buf, sizeof(buf), "snapshot_index lost after restart: %d != %d",
-                  GetRaftOrFatal(cfg, leader)->SnapshotIndex(), snap_idx);
-    cfg->Fatal(buf);
-  }
-
-  std::cout << "  重启后快照点恢复: "
-            << GetRaftOrFatal(cfg, leader)->SnapshotIndex() << "\n";
-
-  cfg->One("put after restart v1", 1, true);
-  cfg->End();
-}
-
-// 测试 4：快照感知状态机 —— 落后节点靠 InstallSnapshot 把整块状态追平
-void TestSnapshotStateMachine2D() {
-  auto cfg = MakeConfig(3, false);
-  cfg->EnableSnapshotCompaction();
-  cfg->Begin("Test (2D): snapshot-aware state machine rehydrates follower");
-
-  for (int i = 1; i <= 100; i++)
-    cfg->One("op" + std::to_string(i), 1, true);
-
-  int leader = cfg->CheckOneLeader();
-  int follower = (leader + 1) % 3;
-  cfg->Crash1(follower);
-
-  for (int i = 101; i <= 150; i++)
-    cfg->One("op" + std::to_string(i), 1, true);
-
-  cfg->Start1(follower);
-
-  // 注意：不能只等 Raft 内部 last_applied_>=commit_index_——CondInstallSnapshot
-  // 一落地就会把两者都跳到快照点(140)，但 follower 的 KV 状态 map(logs_[i]) 要等
-  // applier 线程异步 DecodeKV 快照 + 再 apply 141..150 才填满。必须等"派生状态"就绪。
-  bool ok = false;
-  for (int t = 0; t < 120; t++) {
-    if (cfg->GetState(follower).size() >= 150) {
-      ok = true;
-      break;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  }
-  if (!ok) cfg->Fatal("follower state didn't reach 150 entries via snapshot");
-
-  auto ls = cfg->GetState(leader);
-  auto fs = cfg->GetState(follower);
-  std::cout << "  leader 状态条目: " << ls.size()
-            << "  follower 状态条目: " << fs.size() << "\n";
-  if (ls.size() != 150) {
-    char buf[128];
-    std::snprintf(buf, sizeof(buf), "leader state size %zu != 150", ls.size());
-    cfg->Fatal(buf);
-  }
-  if (ls != fs) cfg->Fatal("follower state machine != leader after rehydrate");
-  cfg->End();
 }
 
 // ===========================================================================
@@ -1201,8 +1117,9 @@ void TestCheckQuorum() {
   // 把 leader 与外界彻底隔离：它发不出去，也收不到
   cfg->Disconnect(leader);
 
-  // 等超过 CheckQuorum 的自查间隔(150ms) —— 给 1 秒足够它发现自己被孤立
-  raftcpp::SleepMs(1000);
+  // 等超过 CheckQuorum 的自查间隔(150ms) —— longDelays(raft config 开) 下失败回包
+  // 0~7000ms 才到，1s 只覆盖 ~14%；8s 覆盖 ~99.9%，让"失败计数"型 CheckQuorum 有时间凑齐
+  raftcpp::SleepMs(8000);
 
   auto st = cfg->GetRaft(leader)->GetState();
   if (st.second) {
@@ -1282,7 +1199,7 @@ void TestCheckQuorumUnreliableIsolated() {
   int leader = cfg->CheckOneLeader();
   cfg->One("x1", servers, true);
   cfg->Disconnect(leader);                // 彻底隔离
-  raftcpp::SleepMs(1000);                 // 远超 150ms 自查间隔
+  raftcpp::SleepMs(8000);                 // longDelays 下失败回包 0~7000ms，远超 150ms 自查间隔
   auto st = cfg->GetRaft(leader)->GetState();
   if (st.second) {
     cfg->Fatal("不可靠网络下被隔离 leader 仍自称 leader：CheckQuorum 太宽松");
@@ -1359,13 +1276,6 @@ void TestCheckQuorumMinorityPartitionKeepsLeadership5() {
 }
 
 // ===== CheckQuorum 反向（采样强化版）：少数派分区期间 leader 必须【持续】稳定 =====
-// 这是 TestCheckQuorumMinorityPartitionKeepsLeadership 的【采样强化】版：那条只在
-// 断开 ~1s 后采【一次】 isLeader/term。若实现有"leader 间歇性退位又重选"或
-// "term 偶发抖动"的闪烁 bug，单次采样可能正好落在稳定窗口而漏掉。这条改为每
-// ~300ms 采样一次（共 5 次，约 1.5s），断言【每次】都 isLeader 且 term == st0.first。
-// ★ 关键修正：必须是【少数派分区】（leader 仍连多数派）。全分区下被隔离节点收不到
-//   票会合法地反复自荐、term 一直涨 —— 那种场景断言 term 不变是错的。term 稳定
-//   只在"leader 仍能联系多数派"时成立，所以本用例用断 1 follower 的少数派分区。
 void TestCheckQuorumSustainedMinorityStable() {
   int servers = 3;
   auto cfg = MakeConfig(servers, false);
@@ -1401,14 +1311,6 @@ void TestCheckQuorumSustainedMinorityStable() {
 }
 
 // ===== 退位后不再服务线性一致读（CheckQuorum 的生产目标：防脏读）=====
-// 【已删除 TestCheckQuorumStaleReadPrevented】
-// 原用例与本文件里的 TestReadIndexNoStale 完全重复：两者都是
-//   「Disconnect(leader) → sleep(1000) → ReadIndex() 必须返回 -1」。
-// 而 sleep 1000ms 之后 CheckQuorum（150ms 自查一次）早已把它退位，走的是
-// "不是 leader → 返回 -1" 这条平凡分支，readIndex 的多数派确认根本没被走到
-// （变异测试实证：把 ReadIndex 改成直接返回 commit_index_，两条照样全过）。
-// 保留 TestReadIndexNoStale 一份即可：它还多了"隔离之前读必须成功"的前提断言。
-// 真正有牙的是 TestReadIndexPartitionImmediate（断开后不 sleep 立刻读）。
 
 // ---------------------------------------------------------------------------
 // ReadIndex：线性一致读的基本契约。
@@ -1425,16 +1327,16 @@ void TestReadIndex() {
   int leader = cfg->CheckOneLeader();
 
   // (1) leader 上读成功，且 readIndex 至少追平最新提交的下标
-  int idx = cfg->One("v1", servers, true);
-  int ri = cfg->GetRaft(leader)->ReadIndex();
+  int64_t idx = cfg->One("v1", servers, true);
+  int64_t ri = ReadIndexRetry(cfg, leader);
   if (ri < 0) {
     cfg->Fatal("leader 上 ReadIndex 应当成功（返回 >= 0）");
   }
   if (ri < idx) {
     char buf[160];
     std::snprintf(buf, sizeof(buf),
-                  "ReadIndex=%d 落后于最新已提交下标 %d —— 照它读会读到旧值",
-                  ri, idx);
+                  "ReadIndex=%lld 落后于最新已提交下标 %lld —— 照它读会读到旧值",
+                  static_cast<long long>(ri), static_cast<long long>(idx));
     cfg->Fatal(buf);
   }
 
@@ -1442,26 +1344,27 @@ void TestReadIndex() {
   // raft 层只验证 read_index 这个“读点”的合法性与本地可追平；端到端值一致性
   // 由 KV 层 TestKVSessionsFollowerRead 覆盖。
   int follower = (leader + 1) % servers;
-  int ri_f = cfg->GetRaft(follower)->ReadIndex();
+  int64_t ri_f = ReadIndexRetry(cfg, follower);
   if (ri_f < 0) {
     cfg->Fatal("follower 上 ReadIndex 应当通过转发成功（返回 >= 0）");
   }
   if (ri_f < idx) {
     char buf[160];
     std::snprintf(buf, sizeof(buf),
-                  "follower ReadIndex=%d 落后于已知已提交下标 %d", ri_f, idx);
+                  "follower ReadIndex=%lld 落后于已知已提交下标 %lld", static_cast<long long>(ri_f), static_cast<long long>(idx));
     cfg->Fatal(buf);
   }
   // 关键：leader 变量是 (1) 段早期 CheckOneLeader() 抓的，到这步之间若发生换主，
   // 旧 leader 的 commit 已是过期值，用它做上界会造成“理论 flaky”的误判。
   // 这里重新抓当前 leader，保证 leader_commit 与 ri_f 同属一个权威任期。
   int cur = cfg->CheckOneLeader();
-  int leader_commit = cfg->GetRaft(cur)->CommitIndex();
+  int64_t leader_commit = cfg->GetRaft(cur)->CommitIndex();
   if (ri_f > leader_commit) {
     char buf[160];
     std::snprintf(buf, sizeof(buf),
-                  "follower ReadIndex=%d 超过 leader commit=%d（转发值不应放大）",
-                  ri_f, leader_commit);
+                  "follower ReadIndex=%lld 超过 leader commit=%lld（转发值不应放大）",
+                  static_cast<long long>(ri_f),
+                  static_cast<long long>(leader_commit));
     cfg->Fatal(buf);
   }
   // follower 本地必须能追平到该读点，否则照它读会陈旧。
@@ -1477,7 +1380,7 @@ void TestReadIndex() {
   // (3) 安全关：follower 与集群隔离后够不到 leader，ReadIndex 必须返回 -1，
   // 不允许在无法确认 leader 合法性的情况下放读（杜绝陈旧读）。
   cfg->Disconnect(follower);
-  int ri_iso = cfg->GetRaft(follower)->ReadIndex();
+  int64_t ri_iso = cfg->GetRaft(follower)->ReadIndex();
   if (ri_iso >= 0) {
     cfg->Fatal("被隔离的 follower 仍返回 ReadIndex>=0 —— 转发失败时应拒绝放读");
   }
@@ -1511,7 +1414,7 @@ void TestReadIndexNoStale() {
 
   // 此刻它必须读失败 —— 要么已退位（不是 leader），
   // 要么还挂着 leader 名头但心跳确认攒不够多数派，超时返回 -1。
-  int ri = cfg->GetRaft(leader)->ReadIndex();
+  int64_t ri = cfg->GetRaft(leader)->ReadIndex();
   if (ri >= 0) {
     cfg->Fatal("被隔离的旧 leader 竟然还能提供读服务 —— 这就是脏读！");
   }
@@ -1521,13 +1424,6 @@ void TestReadIndexNoStale() {
 }
 
 // ===== 并发 ReadIndex：证明 active_read_ 单例合并下多条读互不踩踏 =====
-// 旧的单槽位设计（read_index_/read_ack_count_/read_index_term_ 全局共享）在并发下
-// 会把多条读的票混在一起：后到的读覆盖 read_index_、重置 read_ack_count_，导致先到的
-// 读永远凑不齐多数派 → 超时返回 -1；或者计票泄漏、term 戳错位。新设计用 active_read_
-// 单例把并发读合并成【一轮】：同一任期内的并发读挂入同一个 active_read_、共享同一个 ctx
-// 与 read_index，只广播一次心跳；每轮独立的 acked_ 去重表 + waiters 引用计数隔离账目，
-// 回包按 reply.read_ctx 精确归因。合并（而非"每条读独立 ctx"）才是互不踩踏的真正机制，
-// 故健康集群里应全部成功、互不干扰。
 void TestReadIndexConcurrent() {
   int servers = 3;
   auto cfg = MakeConfig(servers, false);
@@ -1544,7 +1440,7 @@ void TestReadIndexConcurrent() {
   for (int t = 0; t < nthreads; t++) {
     ts.emplace_back([&]() {
       for (int i = 0; i < ncalls; i++) {
-        int ri = cfg->GetRaft(leader)->ReadIndex();
+        int64_t ri = cfg->GetRaft(leader)->ReadIndex();
         if (ri >= 0)
           ok.fetch_add(1);
         else
@@ -1593,7 +1489,7 @@ void TestReadIndexFollowerConcurrent() {
 
   int leader = cfg->CheckOneLeader();
   // 先写一批已提交命令建立基线（不可靠网下 One 内部重试到成功）
-  int idx = cfg->One("seed", servers, true);
+  int64_t idx = cfg->One("seed", servers, true);
   for (int i = 0; i < 3; ++i) cfg->One("c" + std::to_string(i), servers, true);
 
   std::atomic<int> ok{0}, neg{0}, bad{0};
@@ -1605,7 +1501,7 @@ void TestReadIndexFollowerConcurrent() {
         // 各线程轮询不同目标：leader / follower 混合压，走「RPC转发 + leader
         // active_read_ 合并」
         int target = (leader + t + i) % servers;
-        int ri = cfg->GetRaft(target)->ReadIndex();
+        int64_t ri = cfg->GetRaft(target)->ReadIndex();
         if (ri < 0) {
           neg++;
           continue;  // -1=重定向/丢包，预期可接受
@@ -1620,27 +1516,60 @@ void TestReadIndexFollowerConcurrent() {
   }
   for (auto& th : ts) th.join();
 
-  // 不可靠网下允许大量 -1（重定向/重试信号，靠上层 Clerk 重试），但转发路径必须
-  // "活着"：至少有若干次成功读，且绝不出现非法读点（bad==0 才是真正确性约束）。
-  // 注：raft 层裸调 ReadIndex 没有 Clerk 重试层，单次成功率在不可靠网+高并发下本就低，
-  // 故不能用 1/3 这种激进阈值（会误杀）；只要偶有成功即证明路径可用。
-  // ⚠️ TSan 让线程调度非确定：实测同种子 ok 在 18~274 间剧烈抖动，liveness 计数
-  // 不可复现，卡绝对值会偶发误杀正确代码。故 TSan 下只做【观测】不 Fatal，
-  // 真正硬的安全约束始终是下面的 bad==0。
-  const int kMinOk = 5;
-#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
-  (void)kMinOk;
-  fprintf(stderr,
-          "[G2@TSan] soft liveness: ok=%d neg=%d（TSan 下不卡阈值，仅观测）\n",
-          ok.load(), neg.load());
-#else
-  if (ok.load() < kMinOk)
-    cfg->Fatal("不可靠网 leader+follower 混合并发转发几乎全失败: ok=" +
-               std::to_string(ok.load()) + " neg=" + std::to_string(neg.load()));
-#endif
+  // ---------------------------------------------------------------------------
+  // 并发压测阶段只断言【正确性】（bad==0），不把 ok 计数当 liveness 判据。
+  //
+  // 为什么：raft 层裸调 ReadIndex 没有 Clerk 重试层，而 leader 侧的读轮 deadline
+  // 就是 kElectionTimeoutMin（≈150ms）。当机器被"全套件 4 路并发 × 每个测试进程
+  // 各自的 server 线程 + 最多 512 的 worker 池"压满时，这个 deadline 会被【稳定】
+  // 错过 —— 实测出现过 320 次读全 -1（ok=0 neg=320，每次约 180ms 超时），而同时
+  // 段里 bad 恒为 0、集群也一直有 leader。旧判据 ok>=5 因此在纯负载因素下误杀，
+  // 与协议正确性无关（同一份二进制单跑 30/30、ReadIndex PART 4 路 25/25 全过）。
+  // ---------------------------------------------------------------------------
   if (bad.load() > 0)
     cfg->Fatal("出现低于已提交基线的非法 read_index（疑似合并/陈旧）: bad=" +
                std::to_string(bad.load()));
+  fprintf(stderr, "[G2] 并发压测观测: ok=%d neg=%d bad=0（只观测；liveness 见静默探测）\n",
+          ok.load(), neg.load());
+
+  // ---------------------------------------------------------------------------
+  // liveness 探测（这才是本用例的"转发路径必须活着"硬约束）：
+  // 并发线程已 join，机器喘过来了；用一个【会重试的读者】（等价 Clerk 的语义）
+  // 在 5s 预算内各探一次：
+  //   ① leader 本地路径（多数派确认自己仍是 leader）
+  //   ② follower 转发路径（RPC 转给 leader 拿 read_index —— 本用例的主体）
+  // 两条路径任一条彻底不通，才是真 bug；偶发的单次 -1（丢包/超时）由重试吸收。
+  // ---------------------------------------------------------------------------
+  int cur_leader = cfg->CheckOneLeader();
+  auto probe = [&](int target, const char* what) -> int64_t {
+    int64_t last = -1;
+    for (int k = 0; k < 200; ++k) {           // 200 × 25ms ≈ 5s 预算
+      last = cfg->GetRaft(target)->ReadIndex();
+      if (last >= 0) return last;
+      raftcpp::SleepMs(25);
+    }
+    cfg->Fatal(std::string("ReadIndex liveness 失败：") + what + "（节点 " +
+               std::to_string(target) + "）5s 内 200 次全 -1");
+    return last;  // 不可达（Fatal 是 [[noreturn]]），仅为消除告警
+  };
+  if (probe(cur_leader, "leader 本地路径") < idx)
+    cfg->Fatal("leader 本地 ReadIndex 读点低于已提交基线");
+  // 挑一个【确认当前不是 leader】的节点来验转发路径：CheckOneLeader 返回的是
+  // "最高 term 的那位 leader"，不排除还存在旧任期的僵尸 leader（它对自己仍是
+  // leader 的认知尚未被新任期覆盖）。若随手挑 (leader+1)%n，可能正好挑中僵尸
+  // leader —— 它走本地路径就能返回 >=0，等于没测转发（变异实证：把 follower
+  // 转发整段短路掉，本用例照样过）。所以这里必须先看 GetState().second。
+  int follower = -1;
+  for (int i = 0; i < servers; ++i) {
+    if (i == cur_leader) continue;
+    if (!cfg->GetRaft(i)->GetState().second) {
+      follower = i;
+      break;
+    }
+  }
+  if (follower < 0) cfg->Fatal("liveness 探测找不到 follower（全员自认 leader？）");
+  if (probe(follower, "follower 转发路径") < idx)
+    cfg->Fatal("follower 转发 ReadIndex 读点低于已提交基线");
   cfg->End();
 }
 
@@ -1662,7 +1591,7 @@ void TestReadIndexIsolatedFollowerStable() {
   // 以 100ms 间隔反复读 ~2s，每次都必须 -1
   bool all_neg = true;
   for (int t = 0; t < 20; ++t) {
-    int ri = cfg->GetRaft(follower)->ReadIndex();
+    int64_t ri = cfg->GetRaft(follower)->ReadIndex();
     if (ri >= 0) {
       all_neg = false;
       break;
@@ -1692,7 +1621,7 @@ void TestReadIndexPartitionImmediate() {
   // ★ 故意【不 sleep】：此刻它多半仍是 leader（CheckQuorum ~150ms 才自查一次），
   //   但心跳已收不到多数派回包。真做了多数派确认 → 等超时返回 -1；
   //   偷懒直接返回 commit_index_ → 返回 >= 0，被这条抓住。
-  int ri = cfg->GetRaft(leader)->ReadIndex();
+  int64_t ri = cfg->GetRaft(leader)->ReadIndex();
   if (ri >= 0) {
     cfg->Fatal("分区后 ReadIndex 仍返回 " + std::to_string(ri) +
                " —— 它根本没做多数派确认，只是把旧 commitIndex 给了调用方（脏读）");
@@ -1724,8 +1653,10 @@ void TestReadIndexMajorityToleratesMinorityFailure() {
   cfg->Disconnect(down1);
   cfg->Disconnect(down2);
 
-  // 立刻读：验证它不会傻等那两个失联节点（否则会拖到超时返回 -1）
-  int ri = cfg->GetRaft(leader)->ReadIndex();
+  // 立刻读：验证它不会傻等那两个失联节点（否则会拖到超时返回 -1）。
+  // 用重试助手只为吸收满载下的调度抖动：多数派（3/5）仍在线，真正的
+  // "傻等所有节点"缺陷在任何重试下都拿不到 >=0，不会被掩盖。
+  int64_t ri = ReadIndexRetry(cfg, leader);
   if (ri < 0) {
     cfg->Fatal("5 节点挂了 2 个（仍有 3 票多数派）时 ReadIndex 应当成功，却返回 " +
                std::to_string(ri) + " —— 多半是傻等所有节点回包");
@@ -1742,15 +1673,6 @@ void TestReadIndexMajorityToleratesMinorityFailure() {
 // 并把 active_read_.ctx 塞进 snap_args.read_ctx；follower 原样回显；leader 在
 // 快照回包里调 RecordReadAckLocked —— 这是 AppendEntries 心跳之外的【第二条
 // 读确认通道】。
-//
-// 【变异实证：这一条"无牙"，别把它当安全网】
-// 把快照通道的 ctx 掐掉（发端 snap_args.read_ctx=0 / 收端 reply.read_ctx=0），
-// 本条照样全绿 —— 因为落后者对 leader 的广播心跳也会回包，而且 AppendEntries
-// handler 是无条件回显 read_ctx 的（raft.cpp:646），一致性检查失败也回。
-// 也就是说：在当前实现下，落后者的那一票【不依赖】快照通道，快照通道是冗余补充。
-// 想让快照票成为"唯一票源"必须让 follower 只回快照不回心跳，labrpc 下构造不出来。
-// 所以这条的定位是【集成回归】：证明"装快照 + 并发读"两条路径互不破坏，
-// 而不是"少了快照 ctx 就会挂"。快照通道真正有牙的验收在下面 NoDoubleCount。
 // ---------------------------------------------------------------------------
 
 // 正向：健康 3 节点里，follower 装快照期间的并发读必须全部成功。
@@ -1795,7 +1717,7 @@ void TestReadIndexSnapshotCatchUp() {
   for (int t = 0; t < nthreads; t++) {
     ts.emplace_back([&]() {
       for (int i = 0; i < ncalls; i++) {
-        int ri = cfg->GetRaft(leader)->ReadIndex();
+        int64_t ri = cfg->GetRaft(leader)->ReadIndex();
         if (ri >= 0)
           ok.fetch_add(1);
         else
@@ -1914,7 +1836,7 @@ void TestReadIndexUnreliable() {
   cfg->Begin("Test (Ext): 不可靠网络下 ReadIndex 不脏读且基本可用");
 
   // 先提交一个已知下标，作为"已提交"的硬基准（commit_index 只增不减）
-  int idx = cfg->One("prime", servers, true);
+  int64_t idx = cfg->One("prime", servers, true);
   int leader = cfg->CheckOneLeader();
   (void)leader;
 
@@ -1923,7 +1845,8 @@ void TestReadIndexUnreliable() {
   // 多 leader" Fatal），放进读热路径会拖慢并误判。PickLeaderFast 挑 term 最大且
   // 自称 leader 的节点。
   auto PickLeaderFast = [&]() -> int {
-    int best = -1, best_term = -1;
+    int best = -1;
+    int64_t best_term = -1;
     for (int i = 0; i < servers; i++) {
       auto rf = cfg->GetRaft(i);
       if (!rf) continue;
@@ -1944,7 +1867,7 @@ void TestReadIndexUnreliable() {
   const int kRetrySleepMs = 20;
   int ok = 0, fail = 0, stale = 0;
   for (int i = 0; i < n; i++) {
-    int ri = -1;
+    int64_t ri = -1;
     for (int attempt = 0; attempt <= kMaxRetry && ri < 0; attempt++) {
       int l = cur_leader;
       if (l >= 0) ri = cfg->GetRaft(l)->ReadIndex();
@@ -1996,17 +1919,23 @@ void TestReadIndexDuringReelection() {
   int leader = cfg->CheckOneLeader();
 
   // 后台线程：对旧 leader 持续发起 ReadIndex（覆盖"飞行中易主"窗口）
+  // 走 SafeThread：GetRaft/ReadIndex 理论路径上也可能 throw（与另两处口径统一，
+  // 且主线程后续不能在 reader 存活时 Fatal——会踩析构中的 cfg）。
   std::atomic<bool> disconnected{false};
   std::atomic<bool> stop{false};
-  std::vector<int> results;
+  std::vector<int64_t> results;
   std::vector<int> epoch;   // 0 = 易主前发起，1 = 易主后发起/在途
-  std::thread reader([&]() {
+  ThreadErr err;
+  std::thread reader = SafeThread(err, [&]() {
     while (!stop.load()) {
-      int ri = cfg->GetRaft(leader)->ReadIndex();
+      int64_t ri = cfg->GetRaft(leader)->ReadIndex();
       results.push_back(ri);
       epoch.push_back(disconnected.load() ? 1 : 0);
     }
   });
+  // reader 是无限循环（while(!stop)）：守卫带 stop 指针，异常路径先通知退出
+  // 再 join。覆盖下方 CheckOneLeader 等一切主线程可抛点。
+  ThreadJoinGuard reader_guard{reader, &stop};
 
   // 阶段一：易主前，旧 leader 合法，读应成功
   raftcpp::SleepMs(100);
@@ -2019,9 +1948,13 @@ void TestReadIndexDuringReelection() {
   raftcpp::SleepMs(250);
 
   // 确认易主真的发生了（新 leader 在另两台之间选出）
+  // CheckOneLeader 自身可抛（选不出 leader / 多 leader，config.cpp:419/425），
+  // 但 reader_guard 会先停 reader + join 再把异常传出，不会 terminate。
   int new_leader = cfg->CheckOneLeader();
   if (new_leader == leader) {
-    cfg->Fatal("易主未发生：断开旧 leader 后仍未选出新 leader（网络隔离未生效？）");
+    // 不在此处 Fatal：reader 线程还在跑，主线程 throw → cfg 析构 → 线程 UAF。
+    // 记下来等 join 完再报。
+    err.Set("易主未发生：断开旧 leader 后仍未选出新 leader（网络隔离未生效？）");
   }
 
   // 从此刻起，读结果标为"易主后"
@@ -2032,6 +1965,7 @@ void TestReadIndexDuringReelection() {
 
   stop.store(true);
   reader.join();
+  if (err.Has()) cfg->Fatal(err.Get());
 
   // 断言 (a)：旧 leader 被废之后发起/在途的读，绝不允许返回"成功"（任何 >=0 的值）
   //   —— 否则就是旧 leader 把过期 commitIndex 当线性化点吐出（脏读回归）
@@ -2087,7 +2021,7 @@ void TestReadIndexSnapshotUnreliable() {
   cfg->Crash1(laggard);
   for (int i = 41; i <= 110; i++)
     cfg->One("put b" + std::to_string(i) + " v" + std::to_string(i), servers - 1, true);
-  int idx = cfg->One("boundary", servers - 1, true);   // 已知已提交下标硬基准
+  int64_t idx = cfg->One("boundary", servers - 1, true);   // 已知已提交下标硬基准
 
   // 重启落后节点：此刻 leader 给它发的是 InstallSnapshot，而不是普通心跳/日志
   cfg->Start1(laggard);
@@ -2097,7 +2031,8 @@ void TestReadIndexSnapshotUnreliable() {
   // （不能用 CheckOneLeader()：它每轮先睡 450ms，且会对"同 term 多 leader" Fatal，
   //   放进读热路径既拖慢又会引入误判。）
   auto PickLeaderFast = [&]() -> int {
-    int best = -1, best_term = -1;
+    int best = -1;
+    int64_t best_term = -1;
     for (int i = 0; i < servers; i++) {
       auto rf = cfg->GetRaft(i);
       if (!rf) continue;
@@ -2121,7 +2056,7 @@ void TestReadIndexSnapshotUnreliable() {
   for (int t = 0; t < nthreads; t++) {
     ts.emplace_back([&]() {
       for (int i = 0; i < ncalls; i++) {
-        int ri = -1;
+        int64_t ri = -1;
         for (int attempt = 0; attempt <= kMaxRetry && ri < 0; attempt++) {
           int l = cur_leader.load();
           if (l >= 0) ri = cfg->GetRaft(l)->ReadIndex();
@@ -2258,21 +2193,14 @@ void TestReadIndexIgnoresNonVoterAcks() {
 // ===========================================================================
 // ReadIndex × 失多数派超时契约（行为契约测试；【变异有牙】）
 //
-// 稳定 leader 失去多数派时，ReadIndex 必须在有限时间内返回 -1（不永久阻塞调用方）。
-// 生产线索：raft.cpp:2133-2146 用 deadline = Now()+kElectionTimeoutMin 等待多数派
-// 确认，超时（L2146 remain<=0 break）即跳出循环返回 -1；同时 raft.cpp:2093/2143
-// 在 leader 退位（CheckQuorum 每 ~150ms 自查 / pending_stepdown_ 事件驱动）时也返回 -1。
+// 稳定 leader 失去多数派时，ReadIndex 必须在有限时间内返回 -1（不永久阻塞）：
+// raft.cpp:2133-2146 用 deadline 等多数派确认，超时 break（L2146）即返回 -1；
+// leader 退位（CheckQuorum ~150ms 自查 / pending_stepdown_）时同样返回 -1。
 //
-// 变异实证【有牙】（与早期猜测相反，已实测坐实）：
-//   删掉 raft.cpp:2146 的超时 break 后，循环不会因 remain<=0 跳出，而是落到
-//   read_cv_.wait_for(lk, remain) —— 此时 remain 已过期为负，wait_for 按 0 超时
-//   立即返回，于是循环在持有 mu_（L2136 的 unique_lock 贯穿整个循环）的前提下
-//   busy-spin。CheckQuorum 的退位逻辑同样需要 mu_（raft.cpp:296/303/394 均持锁），
-//   被这条 read 循环饿死，state_/pending_stepdown_ 永远改不了 → L2143/L2144 永真不了
-//   → ReadIndex 永久阻塞。实测：本用例挂起到单用例看门狗（TEST_TIMEOUT_MS）触发
-//   "判定为死锁/永久阻塞，强制 abort"（raw_exit=134）。即：超时 break 是【持锁不死锁】
-//   的关键——它让循环在持锁状态下也能按时退出，放行 CheckQuorum 退位。本用例锁的就是
-//   这条"持位但失多数派 → 有限时间内返回 -1"的契约；删超时即挂死，被 CI 看门狗捕获。
+// 变异实证【有牙】：删掉 L2146 的超时 break 后，循环落到 read_cv_.wait_for(remain)，
+// remain 已过期为负 → wait_for 按 0 立即返回 → 持 mu_ busy-spin，把同样需要 mu_ 的
+// CheckQuorum 退位逻辑饿死 → ReadIndex 永久阻塞（实测看门狗 abort，raw_exit=134）。
+// 即超时 break 是【持锁不死锁】的关键。本用例锁「持位但失多数派 → 有限时间 -1」。
 // ===========================================================================
 void TestReadIndexTimesOutWithoutQuorum() {
   int servers = 3;
@@ -2291,7 +2219,7 @@ void TestReadIndexTimesOutWithoutQuorum() {
   // 同步调用：干净实现应在 ~kElectionTimeoutMin(150ms) 内超时返回 -1；
   // 若删掉超时（raft.cpp:2146 的 remain<=0 break），ReadIndex 永久阻塞 → 本用例挂起，
   // 被 CI 单用例超时捕获。这正是该超时契约不可删的铁证。
-  int ri = cfg->GetRaft(leader)->ReadIndex();
+  int64_t ri = cfg->GetRaft(leader)->ReadIndex();
   if (ri >= 0) {
     cfg->Fatal("leader 失去多数派时 ReadIndex 竟返回 >=0（" + std::to_string(ri) +
                "）—— 应当因凑不齐读 quorum 而超时/退位返回 -1");
@@ -2411,42 +2339,95 @@ void TestSingleNodeConfChange() {
   // 旧实现这里是无断言的"空壳"（只验不崩溃），两种失败结局都放行 → 假绿。
   // 正确断言：第二次变更【不应】被追加成新日志条目（否则两个未提交配置重叠 → 脑裂）。
   // 用 LastLogIndex 做"是否追加了新条目"的可观测探针——不依赖最终成员态的竞态。
-  int leader3 = cfg->CheckOneLeader();
-  int idx_before = cfg->GetRaft(leader3)->LastLogIndex();
-  // 第一次：追加一条 conf 条目，pending_conf_index_ 被置位
-  StartResult r1 = cfg->GetRaft(leader3)->ProposeConfChange(2, false);
-  if (!r1.is_leader || r1.index != idx_before + 1) {
-    cfg->Fatal("单飞保护前置失败：第一条变更未成功追加为日志条目");
+  // 第一次：追加一条 conf 条目，pending_conf_index_ 被置位。
+  // 【前提就绪重试】直接一次成败有两个"未就绪"来源，都是前提问题而非单飞失效：
+  //  ① leader 切换：CheckOneLeader 是 ~500ms 前的快照，返回到提案之间微秒级窗口内
+  //     leader 可能刚被推翻（与 step 2 :2461-2473 修过的同类竞态同源）；
+  //  ② step 2 的 readd 尚未 apply：One("after-readd") 只保证命令 commit——Raft 顺序
+  //     提交蕴含 readd 已 commit，但 commit ≠ apply（applier 异步），pending_conf_index_
+  //     可能还挂着上一条 readd → 闸门正确拒绝 r1（index=-1）→ 旧断言把"闸门正确工作"
+  //     报成"前置失败"。
+  // 轮询直到前提就绪（沿用 step 2 模式：逐节点查 GetState().second，不用
+  // CheckOneLeader——它对无主/多主直接 Fatal 且每次自睡 ~500ms）。失败的提案
+  // 不会入日志（index=-1），重试不污染日志；idx_before 每轮随轮到的 leader 重读。
+  StartResult r1;
+  int leader3 = -1;
+  int64_t idx_before = -1;
+  bool premise_ok = false;
+  for (int t = 0; t < 40 && !premise_ok; t++) {
+    for (int i = 0; i < servers; i++) {
+      if (cfg->GetRaft(i)->GetState().second) { leader3 = i; break; }
+    }
+    if (leader3 < 0) { raftcpp::SleepMs(50); continue; }
+    idx_before = cfg->GetRaft(leader3)->LastLogIndex();
+    r1 = cfg->GetRaft(leader3)->ProposeConfChange(2, false);
+    if (r1.is_leader && r1.index == idx_before + 1) {
+      premise_ok = true;
+    } else {
+      leader3 = -1;
+      raftcpp::SleepMs(50);  // 等新 leader 就位 / 等上一条 readd apply 完
+    }
   }
-  // 立刻再提一次：上一条还没 apply，pending 未清 ⇒ 必须被拒（不追加新条目）。
-  // 确定性探针：直接读返回值。单飞闸门（raft.cpp:1768）命中时返回
-  // {is_leader==true, index==-1}——index 保持默认 -1 表示"未追加任何条目"。
+  if (!premise_ok) {
+    cfg->Fatal("单飞保护前提始终未就绪：40 轮内第一条变更未能追加为日志条目"
+               "（leader 始终未就位，或 pending_conf_index_ 始终未清 → 若为后者即是真 bug）");
+  }
+  // 立刻再提一次：上一条还没 apply、pending 未清 ⇒ 必须被拒（不追加新条目）。
+  // 确定性探针：直接读返回值。单飞闸门命中时返回 {is_leader==true, index==-1}
+  // ——index 保持默认 -1 表示"未追加任何条目"。
+  // 【时序修正】"放行"≠"失效"：r1 提案内部 PersistLocked（raft.cpp:2409，file 模式
+  // 释放 mu_ 等落盘）的窗口内，AE 复制+提交+apply 可全部并发完成（applier 被
+  // AE handler 的 apply_cv_.notify_all 唤醒），r1 返回时 pending_conf_index_
+  // 可能已清零（唯一清零点 raft.cpp:1714，在 apply 路径上）——此时 r2 被接受
+  // 是【正确行为】：单飞保护防的是"两个未提交配置重叠"，不是"第二条永不被接受"。
+  // 旧断言把"必须被拒"当确定性（注释里"apply 需过一轮 RPC 故不会误杀"的论证
+  // 不成立：apply 不必过 RPC，本地 applier 在 PersistLocked 窗口内就能跑完），
+  // SEED=7 单跑实测 23% 假红。判据改为两分支：
+  //   r2 被拒（index<0）⇒ 无重叠；
+  //   r2 放行（index>=0）⇒ 必须 r1 已 apply（LastApplied >= r1.index），
+  // 后者用 raft.h:538 的 LastApplied() 独立复核——r2 能放行本就意味着 pending
+  // 已清，此复核的真正作用是：闸门条件未来若被改坏（放行但 r1 未 apply）仍能抓住。
   StartResult r2 = cfg->GetRaft(leader3)->ProposeConfChange(2, true);
-  if (!r2.is_leader || r2.index != -1) {
-    cfg->Fatal("单飞保护失效：第二条并发变更未被拒绝"
-               "（pending_conf_index_ 闸门漏了 → 两个未提交配置重叠 → 脑裂风险）");
+  bool r2_appended = r2.is_leader && r2.index >= 0;
+  if (r2_appended) {
+    if (cfg->GetRaft(leader3)->LastApplied() < r1.index) {
+      cfg->Fatal("单飞保护失效：第二条被追加但第一条尚未 apply"
+                 "（pending_conf_index_ 闸门漏了 → 两个未提交配置重叠 → 脑裂风险）");
+    }
   }
-  // 冗余保险：确认日志长度确实没增长（与上面的返回值断言互为印证）。
-  // 注：此 idx_after 比较依赖"第一条 conf 在两次调用之间尚未 apply"的时序前提；
-  // 生产实现下两条语句纳秒级紧挨、apply 需过一轮 RPC，故不会误杀。主钉是上面的
-  // 返回值断言（r2.index==-1，确定性、零时序依赖）。
-  int idx_after = cfg->GetRaft(leader3)->LastLogIndex();
-  if (idx_after != idx_before + 1) {
+  // 冗余保险：确认日志长度符合预期（与上面的返回值断言互为印证）。
+  // r2 被拒 ⇒ 日志停在 idx_before+1；r2 放行 ⇒ idx_before+2（第二条也已入日志，
+  // 且上面已验证第一条已 apply，两个配置不重叠）。
+  int64_t idx_after = cfg->GetRaft(leader3)->LastLogIndex();
+  int64_t expect_after = r2_appended ? idx_before + 2 : idx_before + 1;
+  if (idx_after != expect_after) {
     cfg->Fatal("单飞保护失效：第二条变更也被追加成新日志条目"
                "（pending_conf_index_ 没挡住并发变更 → 两个未提交配置重叠 → 脑裂风险）");
   }
   // 收尾：让这条移除真正 apply（pending 清空），节点2 最终落到 kRemoved
+  // 收尾：让最后一条 conf 真正 apply。期望终态取决于 r2 是否被放行：
+  //   被拒 ⇒ 日志止于 remove(2) ⇒ 节点2 最终 kRemoved；
+  //   放行 ⇒ 日志是 remove(2)+readd(2) 且已验证 r1 已 apply（不重叠）
+  //          ⇒ apply 按序执行完，节点2 最终 kVoter。
+  const int expect_final =
+      r2_appended ? static_cast<int>(MemberRole::kVoter)
+                  : static_cast<int>(MemberRole::kRemoved);
   bool ok3 = false;
   for (int t = 0; t < 100; t++) {
     raftcpp::SleepMs(100);
-    bool all_removed = true;
+    bool all_final = true;
     for (int i = 0; i < servers; i++) {
-      if (cfg->GetRaft(i)->MembershipView()[2] !=
-          static_cast<int>(MemberRole::kRemoved)) { all_removed = false; break; }
+      if (cfg->GetRaft(i)->MembershipView()[2] != expect_final) {
+        all_final = false;
+        break;
+      }
     }
-    if (all_removed) { ok3 = true; break; }
+    if (all_final) { ok3 = true; break; }
   }
-  if (!ok3) cfg->Fatal("单飞保护收尾失败：移除条目未最终 apply");
+  if (!ok3) {
+    cfg->Fatal("单飞保护收尾失败：最后一条 conf 条目未最终 apply（期望 role=" +
+               std::to_string(expect_final) + "）");
+  }
 
   cfg->End();
 }
@@ -2580,13 +2561,13 @@ void TestLearnerCatchup() {
   cfg->One("learner-2", 3, false);
 
   ok = false;
-  int node3_idx = -1;
-  int voters_max = -1;
+  int64_t node3_idx = -1;
+  int64_t voters_max = -1;
   for (int t = 0; t < 100; t++) {
     raftcpp::SleepMs(100);
-    int mx = 0;
+    int64_t mx = 0;
     for (int i = 0; i < servers - 1; i++) {  // 0..2 是 voter
-      int idx = cfg->GetRaft(i)->LastLogIndex();
+      int64_t idx = cfg->GetRaft(i)->LastLogIndex();
       if (idx > mx) mx = idx;
     }
     voters_max = mx;
@@ -2645,7 +2626,7 @@ static bool TryAgreement(Config* cfg, const std::string& cmd, int expected,
   auto deadline = std::chrono::steady_clock::now() +
                   std::chrono::milliseconds(timeout_ms);
   while (std::chrono::steady_clock::now() < deadline) {
-    int index = -1;
+    int64_t index = -1;
     for (int si = 0; si < cfg->n(); si++) {
       if (!cfg->Connected(si)) continue;
       auto rf = cfg->GetRaft(si);
@@ -2835,7 +2816,7 @@ void TestMembershipPersistAcrossRestart() {
 
   // 2) 移除节点 2（conf 条目此刻落在日志里）
   StartResult r = cfg->GetRaft(leader)->ProposeConfChange(2, false);
-  int conf_idx = r.index;
+  int64_t conf_idx = r.index;
   bool ok = false;
   for (int t = 0; t < 100; t++) {
     raftcpp::SleepMs(100);
@@ -2980,7 +2961,7 @@ void TestLearnerPersistAcrossRestart() {
 
   // 把节点 3 降为 learner（conf 条目此刻落在日志里）
   StartResult r = cfg->GetRaft(leader)->ProposeConfChangeTo(3, MemberRole::kLearner);
-  int conf_idx = r.index;
+  int64_t conf_idx = r.index;
   bool ok = false;
   for (int t = 0; t < 100; t++) {
     raftcpp::SleepMs(100);
@@ -3152,7 +3133,7 @@ void TestInstallSnapshotRestoresMembership() {
 
   // 把节点 2 降为 learner
   auto conf_res = cfg->GetRaft(leader)->ProposeConfChangeTo(2, MemberRole::kLearner);
-  int conf_idx = conf_res.index;  // 这条 learner 变更条目的下标（事后确认快照覆盖了它）
+  int64_t conf_idx = conf_res.index;  // 这条 learner 变更条目的下标（事后确认快照覆盖了它）
   bool ok = false;
   for (int t = 0; t < 100; t++) {
     raftcpp::SleepMs(100);
@@ -3187,7 +3168,7 @@ void TestInstallSnapshotRestoresMembership() {
 
   // 小修：显式确认节点2 是【走 InstallSnapshot 重水化】拿到 learner 角色，
   // 而非靠普通日志追平（否则本用例退化为普通追平检验，对快照 bool 编码 bug 漏检）。
-  int snap_idx = cfg->GetRaft(2)->SnapshotIndex();
+  int64_t snap_idx = cfg->GetRaft(2)->SnapshotIndex();
   if (snap_idx <= conf_idx) {
     cfg->Fatal("InstallSnapshot 未覆盖成员变更条目：节点2 的 SnapshotIndex(" +
                std::to_string(snap_idx) + ") <= conf_idx(" + std::to_string(conf_idx) +
@@ -3232,9 +3213,18 @@ void TestConcurrentConfChangeLinearizable() {
   //   ・"不丢/不重"的真正把关是下面那段【全量已提交日志审计】+
   //     Wait(idx, servers) 要求 3 台都补齐，复制完整性并未被削弱。
   const int kStableServers = servers - 1;
-  std::thread writer([&]() {
+  // 必须走 SafeThread（本文件 L58 定义）：writer 里调 Config::One，失败即
+  // [[noreturn]] throw TestFailure（config.cpp:36 Fatal）。裸 std::thread 没人接
+  // 这个异常 → std::terminate() → 整个 raft_test 进程 abort，后面 ~60 个用例
+  // 全跑不成，且只留一行 "terminate called after throwing"。
+  // （本文件 L919-923 对同类问题立过纪律，这几处历史遗漏一并补齐。）
+  // ThreadJoinGuard 再兜一层：writer 是有限 K 次循环（One 内部有超时，必然
+  // 结束），异常路径下先 join 再传异常，避免 joinable thread 析构 terminate。
+  ThreadErr err;
+  std::thread writer = SafeThread(err, [&]() {
     for (int i = 0; i < K; i++) cfg->One(cmds[i], kStableServers, false);
   });
+  ThreadJoinGuard writer_guard{writer};
 
   // 主线程在写入进行中穿插一次成员变更（移除节点2 + 加回）
   raftcpp::SleepMs(150);
@@ -3244,16 +3234,20 @@ void TestConcurrentConfChangeLinearizable() {
     if (cfg->GetRaft(2)->MembershipView()[2] ==
         static_cast<int>(MemberRole::kRemoved)) break;
   }
+  // （writer 有限 K 次循环，必然结束）再把异常传出，不会 terminate。
   StartResult r_add = cfg->GetRaft(cfg->CheckOneLeader())->ProposeConfChange(2, true);
-  if (r_add.index < 0) cfg->Fatal("加回节点2 的提案被拒（index<0）—— 无法断言并发变更下的单飞保护");
+  // 不在此处 Fatal：writer 线程还在跑，主线程 throw → cfg 开始析构 → 线程 UAF。
+  // 记下来等 join 完再报（SafeThread 已保证 writer 的异常不会 terminate）。
+  if (r_add.index < 0) err.Set("加回节点2 的提案被拒（index<0）—— 无法断言并发变更下的单飞保护");
   bool back = false;
   for (int t = 0; t < 100; t++) {
     raftcpp::SleepMs(100);
     if (cfg->GetRaft(2)->MembershipView()[2] ==
         static_cast<int>(MemberRole::kVoter)) { back = true; break; }
   }
-  if (!back) cfg->Fatal("加回节点2 后 10s 内未回到 kVoter —— 用例前提不成立");
+  if (!back) err.Set("加回节点2 后 10s 内未回到 kVoter —— 用例前提不成立");
   writer.join();
+  if (err.Has()) cfg->Fatal(err.Get());
 
   // 角色断言：变更必须完整回滚（节点2 回到 voter）
   if (cfg->GetRaft(2)->MembershipView()[2] !=
@@ -3263,7 +3257,7 @@ void TestConcurrentConfChangeLinearizable() {
 
   // ★ 真·不丢/不重审计（修复假绿）
   // 扫描整段已提交日志，只统计我们真发过的命令，断言恰好各出现一次。
-  int last = cfg->GetRaft(cfg->CheckOneLeader())->LastLogIndex();
+  int64_t last = cfg->GetRaft(cfg->CheckOneLeader())->LastLogIndex();
   std::map<std::string, int> seen;
   for (int idx = 1; idx <= last; idx++) {
     auto v = cfg->Wait(idx, servers, -1);
@@ -3315,7 +3309,11 @@ void TestLearnerCatchupWithChurn() {
   if (!ok) cfg->Fatal("降级失败：is_member_[3] 未切换为 kLearner");
 
   const int M = 40;
-  std::thread churn([&]() {
+  // 同 TestConcurrentConfChangeLinearizable：churn 里调 Config::One 失败会
+  // [[noreturn]] throw，必须 SafeThread 接住，否则 terminate 掉整个进程
+  // （后面 ~60 个用例全跑不成）。见本文件 L919-923 纪律。
+  ThreadErr err;
+  std::thread churn = SafeThread(err, [&]() {
     for (int i = 0; i < M; i++) {
       if (i % 3 == 0) cfg->Disconnect(3);
       else if (i % 3 == 1) cfg->Connect(3);
@@ -3326,6 +3324,7 @@ void TestLearnerCatchupWithChurn() {
     cfg->Connect(3);  // 收尾确保连通，让 learner 最终追平
   });
   churn.join();
+  if (err.Has()) cfg->Fatal(err.Get());
 
   // 最终 learner 必须追平：所有命令在 learner 也 apply（要求 4 节点都提交）
   for (int i = 0; i < M; i++)
@@ -3547,12 +3546,19 @@ void TestMembershipConsistencyAtQuiescence() {
   // 这样若某节点漏 apply 了节点3 的 learner 角色（"自身角色不自更新"那类 bug），
   // 它的视图会与「节点3=learner」的正确终态分叉 → 下面的完全一致断言抓到（齿变尖）。
   int leader = cfg->CheckOneLeader();
+  // 收敛提案必须检查返回值：被单飞/退位闸门拒绝（index<0）时"节点3 终态=
+  // learner"的前提就不成立，下面的一致性断言会退化成无牙版本（voter 恰是
+  // 默认态）——正是本用例声称要防的假绿模式。
   if (cfg->GetRaft(leader)->MembershipView()[2] !=
-      static_cast<int>(MemberRole::kVoter))
-    cfg->GetRaft(leader)->ProposeConfChange(2, true);
+      static_cast<int>(MemberRole::kVoter)) {
+    if (cfg->GetRaft(leader)->ProposeConfChange(2, true).index < 0)
+      cfg->Fatal("收敛提案被拒：节点2 恢复 voter 未进入日志");
+  }
   if (cfg->GetRaft(leader)->MembershipView()[3] !=
-      static_cast<int>(MemberRole::kLearner))
-    cfg->GetRaft(leader)->ProposeConfChangeTo(3, MemberRole::kLearner);  // 确保终态=learner
+      static_cast<int>(MemberRole::kLearner)) {
+    if (cfg->GetRaft(leader)->ProposeConfChangeTo(3, MemberRole::kLearner).index < 0)
+      cfg->Fatal("收敛提案被拒：节点3 降级 learner 未进入日志");
+  }
   raftcpp::SleepMs(600);  // 静默期，让所有节点把最后的 conf 都 apply 一致
 
   // 不变式：所有节点 MembershipView 完全相等
@@ -3588,7 +3594,7 @@ void TestReadIndexDuringConfChange() {
 
   // 基线：4 voter → quorum 3，全在线，ReadIndex 应能返回（>=0）
   cfg->One("v1", servers, false);
-  int ri_base = cfg->GetRaft(leader)->ReadIndex();
+  int64_t ri_base = ReadIndexRetry(cfg, leader);
   if (ri_base < 0)
     cfg->Fatal("基线 ReadIndex 失败（4 节点全在线应可线性一致读）");
 
@@ -3625,7 +3631,7 @@ void TestReadIndexDuringConfChange() {
 
   // ReadIndex 重试几次：高负载下偶发 ack 超时返回 -1 属瞬态，需与
   // 「旧配置导致持续 -1」区分——后者任何重试都拿不到 >=0。
-  int ri = -1;
+  int64_t ri = -1;
   for (int attempt = 0; attempt < 5; attempt++) {
     ri = cfg->GetRaft(leader2)->ReadIndex();
     if (ri >= 0) break;
@@ -3638,7 +3644,7 @@ void TestReadIndexDuringConfChange() {
 
   // 再写一条（2 个 voter 即可提交），ReadIndex 必须看到更新的 commit（证明读随配置/日志推进）
   cfg->One("v2", 2, false);
-  int ri2 = -1;
+  int64_t ri2 = -1;
   for (int attempt = 0; attempt < 5; attempt++) {
     ri2 = cfg->GetRaft(leader2)->ReadIndex();
     if (ri2 >= 0) break;
@@ -3758,7 +3764,7 @@ void TestPromoteLaggingLearnerSafe() {
 
   // 安全断言：所有此前已提交的命令（base* + lag*）在集群已提交日志里各出现恰好一次。
   // 用扫描已提交日志的方式核对（exact-once 审计，同 ⑮）。
-  int last = cfg->GetRaft(cfg->CheckOneLeader())->LastLogIndex();
+  int64_t last = cfg->GetRaft(cfg->CheckOneLeader())->LastLogIndex();
   std::set<std::string> expected;
   for (int i = 0; i < BASE; i++) expected.insert("base" + std::to_string(i));
   for (int i = 0; i < 10; i++) expected.insert("lag" + std::to_string(i));
@@ -3831,7 +3837,7 @@ void TestStartRejectedForNonVoter() {
 
   // 限时确认这两条命令从未进入已提交日志
   raftcpp::SleepMs(500);
-  int last = cfg->GetRaft(cfg->CheckOneLeader())->LastLogIndex();
+  int64_t last = cfg->GetRaft(cfg->CheckOneLeader())->LastLogIndex();
   for (int idx = 1; idx <= last; idx++) {
     // 注意：不要求 3 节点都拥有每条（Q2 下 removed/learner 节点不再收新日志，
     // 仅剩 voter 数可能 < 3）。只要"被提交的命令里出现非 voter 来源"即判失败——
@@ -3864,7 +3870,7 @@ void TestInstallSnapshotRestoresRemovedRole() {
 
   // 把节点 2 降为 removed（用 removed，而非 ⑪ 的 learner）
   auto conf_res = cfg->GetRaft(leader)->ProposeConfChange(2, false);
-  int conf_idx = conf_res.index;  // 这条 removed 变更条目的下标
+  int64_t conf_idx = conf_res.index;  // 这条 removed 变更条目的下标
   bool ok = false;
   for (int t = 0; t < 100; t++) {
     raftcpp::SleepMs(100);
@@ -3893,7 +3899,7 @@ void TestInstallSnapshotRestoresRemovedRole() {
   }
   if (!ok) {
     int role2 = cfg->GetRaft(2)->MembershipView()[2];
-    int ll = cfg->GetRaft(2)->LastLogIndex();
+    int64_t ll = cfg->GetRaft(2)->LastLogIndex();
     cfg->Fatal("removed 节点未保持冻结+removed：role=" + std::to_string(role2) +
                " LastLogIndex=" + std::to_string(ll) +
                "（应为 kRemoved 且 LastLogIndex <= conf_idx=" +
@@ -3922,13 +3928,13 @@ void TestRemovedNodeStopsReceivingReplication() {
 
   // 移除节点 2，记录冻结点（它作为 voter 收到的最后一条 = 移除配置条目）
   auto r = cfg->GetRaft(leader)->ProposeConfChange(2, false);
-  int conf_idx = r.index;
+  int64_t conf_idx = r.index;
   for (int t = 0; t < 100; t++) {
     raftcpp::SleepMs(100);
     if (cfg->GetRaft(2)->MembershipView()[2] ==
         static_cast<int>(MemberRole::kRemoved)) break;
   }
-  int frozen = cfg->GetRaft(2)->LastLogIndex();
+  int64_t frozen = cfg->GetRaft(2)->LastLogIndex();
   if (frozen < conf_idx)
     cfg->Fatal("节点2 冻结点异常：LastLogIndex(" + std::to_string(frozen) +
                ") < conf_idx(" + std::to_string(conf_idx) + ")");
@@ -3938,7 +3944,7 @@ void TestRemovedNodeStopsReceivingReplication() {
     cfg->One("put z" + std::to_string(i) + " v" + std::to_string(i), 2, false);
 
   raftcpp::SleepMs(500);
-  int after = cfg->GetRaft(2)->LastLogIndex();
+  int64_t after = cfg->GetRaft(2)->LastLogIndex();
   if (after != frozen) {
     cfg->Fatal("Q2 失效：removed 节点2 日志仍在前进（" + std::to_string(frozen) +
                " -> " + std::to_string(after) + "），应被冻结在移除点");
@@ -3974,7 +3980,7 @@ void TestRemovedNodeStaysQuiescentAfterRemoval() {
   }
 
   // 移除后写机密数据，只要求 2 个 voter 提交
-  int idx = cfg->One("put SECRET-post-removal", 2, false);
+  int64_t idx = cfg->One("put SECRET-post-removal", 2, false);
   raftcpp::SleepMs(500);
 
   // 这条机密命令应【只】在 2 个 voter 上提交；removed 节点 2 绝不该拥有它。
@@ -4176,7 +4182,7 @@ void TestLearnerReadIndexForwards() {
   auto cfg = MakeConfig(servers, false);
   cfg->Begin("Test: a learner forwards ReadIndex to leader and succeeds (>= 0)");
   int leader = cfg->CheckOneLeader();
-  int idx1 = cfg->One("v1", servers, false);
+  int64_t idx1 = cfg->One("v1", servers, false);
 
   // 把节点 3 降为 learner
   cfg->GetRaft(leader)->ProposeConfChangeTo(3, MemberRole::kLearner);
@@ -4188,8 +4194,17 @@ void TestLearnerReadIndexForwards() {
   }
   if (!ok) cfg->Fatal("降级失败：节点3 未切换为 kLearner");
 
+  // ReadIndex 需要多数派 ack 心跳确认，预算硬编码 kElectionTimeoutMin（150ms，
+  // raft.cpp:2829-2841）。满载（多路并行 + TSan）下 150ms 可能收不齐多数派 ack
+  // → 单次调用零重试偶发返回 -1，把"慢"误判成"失败"（假 flaky）。
+  // 这里轮询到成功再断言，与 TestReadIndexUnreliable 等用例的重试口径一致。
+  // 注意：仅用于【连通】场景；被隔离场景（下方关卡 3）期望快速失败 -1，不能重试。
+  auto read_index_retry = [&](int node) {
+    return ReadIndexRetry(cfg, node);
+  };
+
   // 关卡 1（翻转）：learner 经转发应拿到合法读点（非 voter 非 leader 也能服务线性一致读）
-  int ri = cfg->GetRaft(3)->ReadIndex();
+  int64_t ri = read_index_retry(3);
   if (ri < 0) {
     cfg->Fatal("learner 调 ReadIndex 应经转发成功（返回 >= 0），实际 " +
                std::to_string(ri));
@@ -4201,8 +4216,8 @@ void TestLearnerReadIndexForwards() {
 
   // 关卡 2（翻转）：再写一条已提交命令后，learner 仍应转发成功
   // （不因“本地有 commit 值”走捷径、也不该被拒）
-  int idx2 = cfg->One("v2", servers, false);
-  int ri2 = cfg->GetRaft(3)->ReadIndex();
+  int64_t idx2 = cfg->One("v2", servers, false);
+  int64_t ri2 = read_index_retry(3);
   if (ri2 < 0) {
     cfg->Fatal("learner 在已有提交后仍应转发成功 ReadIndex，实际 " +
                std::to_string(ri2));
@@ -4215,7 +4230,7 @@ void TestLearnerReadIndexForwards() {
   // 新增安全关：隔离 learner 后够不到 leader，必须返回 -1
   // （不放大本地 commit 放读——转发失败即不放行）
   cfg->Disconnect(3);
-  int ri_iso = cfg->GetRaft(3)->ReadIndex();
+  int64_t ri_iso = cfg->GetRaft(3)->ReadIndex();
   if (ri_iso >= 0) {
     cfg->Fatal("被隔离的 learner 仍返回 ReadIndex>=0 —— 转发失败时应拒绝放读");
   }
@@ -4223,7 +4238,7 @@ void TestLearnerReadIndexForwards() {
 
   // 对称正例：voter leader 的 ReadIndex 仍正常（证明我们没把 ReadIndex 整坏）
   int leader2 = cfg->CheckOneLeader();
-  int ri3 = cfg->GetRaft(leader2)->ReadIndex();
+  int64_t ri3 = ReadIndexRetry(cfg, leader2);
   if (ri3 < 0) cfg->Fatal("对照：voter leader 的 ReadIndex 不应失败");
 
   cfg->End();
@@ -4296,7 +4311,7 @@ void TestRemovedFreezeCoversBothSources() {
   {
     std::vector<MemberRole> is_member = {MemberRole::kVoter, MemberRole::kVoter,
                                          MemberRole::kVoter};  // 尚未切换
-    std::vector<int> cap = {-1, -1, 7};                        // 已记冻结点
+    std::vector<int64_t> cap = {-1, -1, 7};                        // 已记冻结点
     if (!IsRemovedFrozen(is_member, cap, 2)) {
       cfg->Fatal("冻结判据错：仅有冻结点(7)时应冻结（提案→apply 窗口会漏数据）");
     }
@@ -4307,7 +4322,7 @@ void TestRemovedFreezeCoversBothSources() {
   {
     std::vector<MemberRole> is_member = {MemberRole::kVoter, MemberRole::kVoter,
                                          MemberRole::kRemoved};
-    std::vector<int> cap = {-1, -1, -1};  // 快照截断，扫不到 conf
+    std::vector<int64_t> cap = {-1, -1, -1};  // 快照截断，扫不到 conf
     if (!IsRemovedFrozen(is_member, cap, 2)) {
       cfg->Fatal("冻结判据错：仅配置视图为 kRemoved 时也应冻结（快照恢复场景会漏数据）");
     }
@@ -4317,7 +4332,7 @@ void TestRemovedFreezeCoversBothSources() {
   {
     std::vector<MemberRole> is_member = {MemberRole::kVoter, MemberRole::kVoter,
                                          MemberRole::kVoter};
-    std::vector<int> cap = {-1, -1, -1};
+    std::vector<int64_t> cap = {-1, -1, -1};
     if (IsRemovedFrozen(is_member, cap, 2)) {
       cfg->Fatal("冻结判据错：未移除节点被误冻结（加回后收不到日志）");
     }
@@ -4327,7 +4342,7 @@ void TestRemovedFreezeCoversBothSources() {
   {
     std::vector<MemberRole> is_member = {MemberRole::kVoter, MemberRole::kVoter,
                                          MemberRole::kLearner};
-    std::vector<int> cap = {-1, -1, -1};
+    std::vector<int64_t> cap = {-1, -1, -1};
     if (IsRemovedFrozen(is_member, cap, 2)) {
       cfg->Fatal("冻结判据错：learner 被误冻结（learner 必须继续接收日志）");
     }
@@ -4337,7 +4352,7 @@ void TestRemovedFreezeCoversBothSources() {
   {
     std::vector<MemberRole> is_member = {MemberRole::kVoter, MemberRole::kVoter,
                                          MemberRole::kRemoved};
-    std::vector<int> cap = {-1, -1, -1};
+    std::vector<int64_t> cap = {-1, -1, -1};
     if (IsRemovedFrozen(is_member, cap, -1) ||
         IsRemovedFrozen(is_member, cap, 99)) {
       cfg->Fatal("冻结判据错：越界下标被判为冻结");
@@ -4397,7 +4412,7 @@ void TestMaxUncommittedBackpressure() {
                " 超过上限 " + std::to_string(limit));
   }
   // 背压是"拒绝"，不是"丢弃"：日志里必须恰好只多出 accepted 条，一条不多。
-  int uncommitted = cfg->GetRaft(leader)->UncommittedCount();
+  int64_t uncommitted = cfg->GetRaft(leader)->UncommittedCount();
   if (uncommitted > limit) {
     cfg->Fatal("未提交条目数 " + std::to_string(uncommitted) + " 突破上限 " +
                std::to_string(limit));
@@ -4511,22 +4526,18 @@ void TestRpcMaxMessageBytes() {
 // ===========================================================================
 // C5 被移除节点主动退场 —— apply 到"移除自己"的配置条目后必须停止参选
 //
-// 现状说明（重要，避免误判为"从零新增"）：不起选 / 不投票 / 拒绝写入这三件事
-// 本来就被 IsVoter 守卫覆盖了（raft.cpp:460/557/774）。真正缺的是【入口处主动
-// 静默 + 可观测】：原来要"进了 StartElection() 才被拦"，白跑一趟 Pre-Vote 广播，
-// 而且没有任何证据能区分"主动静默"和"碰巧没超时"。
+// 不起选 / 不投票 / 拒绝写入这三件事 IsVoter 守卫已覆盖（raft.cpp:460/557/774）；
+// 真正缺的是【入口处主动静默 + 可观测】：原来要进了 StartElection() 才被拦，
+// 白跑一趟 Pre-Vote 广播，且无法区分"主动静默"和"碰巧没超时"。故断言新增的
+// ElectionSuppressedCount()——只在"定时器已超时、但因自己被移除而放弃"时自增。
 //
-// 因此本用例断言的是新增的 ElectionSuppressedCount() —— 它只在"选举定时器已
-// 超时、但因自己已被移除而主动放弃"时自增。
+// ⚠️ 必须断开 victim：removed 节点仍会收到心跳（raft.cpp:1146 设计如此，它要靠
+//    心跳推进 commit_index_ 才能 apply 到移除自己的 conf）；不断开则定时器永不
+//    超时 → 计数器恒 0 → 用例假失败。
 //
-// ⚠️ 必须断开 victim：removed 节点【仍会收到心跳】（raft.cpp:1146 明确这么设计，
-//    它要靠心跳推进 commit_index_ 才能 apply 到移除自己的那条 conf）。不断开则
-//    last_heartbeat_ 一直被刷新，定时器永不超时 → 计数器恒为 0 → 用例假失败。
-//
-// 变异检验：
-//   · 删掉选举定时器里的 IsRemovedSelf() 判断 → 计数器恒为 0 → 本用例失败
-//     （注意：删掉后集群行为仍然正确，因为 StartElection 里的 !IsVoter 兜底
-//       还在 —— 所以必须用计数器断言，用"它是不是 leader"断言会假通过）
+// 变异检验：删掉选举定时器里的 IsRemovedSelf() → 计数器恒 0 → 本用例失败
+//   （删后集群行为仍正确——StartElection 的 !IsVoter 兜底还在——所以必须用
+//    计数器断言，用"是不是 leader"断言会假通过）。
 // ===========================================================================
 void TestRemovedNodeQuiesces() {
   int servers = 5;  // 移除 1 台后剩 4 台，多数派 3，留足余量
@@ -4593,10 +4604,10 @@ void TestChunkedSnapshotTransmit() {
   const int kValSize = 400;  // 每条约 400B → blob ≈ 8000*(4+4+400) ≈ 3.2MB
   labrpc::Encoder enc;
   enc.Int(kEntries);
-  std::map<int, std::string> expected;
+  std::map<int64_t, std::string> expected;
   for (int i = 1; i <= kEntries; i++) {
     std::string v(kValSize, static_cast<char>('a' + (i % 26)));
-    enc.Int(i).Bytes(v);
+    enc.Zigzag(i).Bytes(v);
     expected[i] = v;
   }
   std::string blob = enc.Take();
@@ -4607,7 +4618,7 @@ void TestChunkedSnapshotTransmit() {
     auto cfg = MakeConfig(1, false);  // 单节点：无 leader 主动发快照干扰
     cfg->Begin("Test (§2.1): chunked snapshot transmit — " + tag);
     auto rf = GetRaftOrFatal(cfg, 0);
-    int term = rf->GetState().first;  // 用节点当前 term，避免被当成过期快照拒收
+    int64_t term = rf->GetState().first;  // 用节点当前 term，避免被当成过期快照拒收
     const int last_included_index = kEntries;
     const int last_included_term = 1;
 
@@ -4648,7 +4659,7 @@ void TestChunkedSnapshotTransmit() {
       a.term = term; a.leader_id = 0;
       a.last_included_index = last_included_index;
       a.last_included_term = last_included_term;
-      a.offset = static_cast<int>(off);
+      a.offset = static_cast<int64_t>(off);
       a.chunk_size = static_cast<int>(len);
       a.done = is_last;
       a.crc = corrupt_crc ? (crc ^ 0x5A5A5A5A) : crc;
@@ -4696,13 +4707,13 @@ void TestChunkedSnapshotTransmit() {
   // ---- 档2 epoch 硬化：旧快照的迟到残片不得冲掉新快照在途缓冲 ----
   // 两类：① 不同身份快照 A→B，A 的迟到残片必须被忽略；② 同一快照 epoch 重试必须
   // 正确 reset 重来，且更旧 epoch 残片被忽略。
-  auto mk_blob = [](int n) -> std::pair<std::string, std::map<int, std::string>> {
+  auto mk_blob = [](int n) -> std::pair<std::string, std::map<int64_t, std::string>> {
     labrpc::Encoder e;
     e.Int(n);
-    std::map<int, std::string> m;
+    std::map<int64_t, std::string> m;
     for (int i = 1; i <= n; i++) {
       std::string v(20, 'x');
-      e.Int(i).Bytes(v);
+      e.Zigzag(i).Bytes(v);
       m[i] = v;
     }
     return std::make_pair(e.Take(), m);
@@ -4711,7 +4722,7 @@ void TestChunkedSnapshotTransmit() {
     auto cfg = MakeConfig(1, false);
     cfg->Begin("Test (§2.1): epoch hardening — " + tag);
     auto rf = GetRaftOrFatal(cfg, 0);
-    int term = rf->GetState().first;
+    int64_t term = rf->GetState().first;
 
     auto blobA = mk_blob(2), blobB = mk_blob(2);
     int crcA = raft::Crc32(blobA.first.data(), blobA.first.size()), crcB = raft::Crc32(blobB.first.data(), blobB.first.size());
@@ -4722,7 +4733,7 @@ void TestChunkedSnapshotTransmit() {
       InstallSnapshotArgs a;
       a.term = term; a.leader_id = 0;
       a.last_included_index = idx; a.last_included_term = snap_term;
-      a.offset = static_cast<int>(off); a.chunk_size = static_cast<int>(len);
+      a.offset = static_cast<int64_t>(off); a.chunk_size = static_cast<int>(len);
       a.done = done; a.crc = (idx == 200 ? crcB : crcA);
       a.epoch = epoch;
       a.data = blob.substr(off, len);
@@ -4747,9 +4758,6 @@ void TestChunkedSnapshotTransmit() {
       send(blobA.first, 100, 1, 1, 0, false);
       send(blobA.first, 100, 1, 2, 0, false);
       // epoch=1 旧残片在传输途中(offset>0)迟到 → 更旧 → 忽略（不 reset 不写）。
-      // ⚠️ 必须在 epoch=2 完成(done)【之前】发，才能命中 epoch 去重分支；
-      //    若等快照装完再发，会走「已安装→幂等 ok_install=true」分支（这是正确行为，
-      //    不是 bug，详见 raft.cpp:1876 注释），断言就写反了。
       InstallSnapshotReply rOld =
           send(blobA.first, 100, 1, 1, blobA.first.size() / 2, false);
       if (rOld.ok_install) cfg->Fatal(tag + ": 旧 epoch 残片不应安装");
@@ -4774,7 +4782,7 @@ void TestChunkedSnapshotTransmit() {
 // ===========================================================================
 // §2.1 分块快照：集成测试（大状态机端到端追平）
 // ---------------------------------------------------------------------------
-// 对齐 TestInstallSnapshotCatchUp2D，但把单条命令的 value 放大到 16KiB，使 KV 状态
+// 大状态机端到端追赶：把单条命令的 value 放大到 16KiB，使 KV 状态
 // 机涨到数 MB（远超单 chunk 512KiB），让落后 follower 真正通过「多 chunk」InstallSnapshot
 // 追平。验收点：造大状态机 → 能稳定分块传完并 install → 状态机与 leader 一致。
 // ===========================================================================
@@ -4812,11 +4820,7 @@ void TestChunkedSnapshotLargeStateMachine() {
   bool ok = false;
   for (int t = 0; t < 400; t++) {
     auto frf = GetRaftOrFatal(cfg, follower);
-    // ⚠️ 关键修正：不能只等 raft 层 last_applied_ 指针。raft 的 last_applied_ 是「派发」
-    // 语义(ApplyLoop 把条目 push 进 apply_ch_ 后即推进)，而真正写进状态机 map 的是
-    // applier 线程(异步消费 apply_ch_)。TSan 下 applier 被严重减速，会出现
-    // 「last_applied_ 已=128、但状态机 map 还停在快照点 120」的窗口；若只等指针就会被
-    // 拿去比对 → 误报 follower=120。故最终判定必须看状态机 map size 真正追平 leader。
+    
     if (lrf->SnapshotIndex() > 0 &&
         frf->SnapshotIndex() >= lrf->SnapshotIndex() &&
         static_cast<int>(cfg->GetState(follower).size()) >=
@@ -4831,9 +4835,11 @@ void TestChunkedSnapshotLargeStateMachine() {
     char buf[192];
     std::snprintf(buf, sizeof(buf),
                   "large-state follower didn't fully catch up: "
-                  "snap(leader=%d,follower=%d) applied(leader=%d,follower=%d)",
-                  lrf->SnapshotIndex(), frf->SnapshotIndex(),
-                  lrf->LastApplied(), frf->LastApplied());
+                  "snap(leader=%lld,follower=%lld) applied(leader=%lld,follower=%lld)",
+                  static_cast<long long>(lrf->SnapshotIndex()),
+                  static_cast<long long>(frf->SnapshotIndex()),
+                  static_cast<long long>(lrf->LastApplied()),
+                  static_cast<long long>(frf->LastApplied()));
     cfg->Fatal(buf);
   }
 
@@ -4872,7 +4878,7 @@ void TestSnapshotBlobCrc() {
   // 断言：解码必须失败，且 corrupt 必须等于期望值。
   auto expect_reject = [](const std::string& what, const std::string& blob,
                           bool want_corrupt) {
-    int idx = -1, term = -1;
+    int64_t idx = -1, term = -1;
     std::string raw;
     bool corrupt = false;
     const bool ok = DecodeSnapshotBlob(blob, &idx, &term, &raw, &corrupt);
@@ -4888,12 +4894,12 @@ void TestSnapshotBlobCrc() {
 
   // ① 正常 round-trip：头 24 字节，index/term/payload 原样还原，且不报 corrupt。
   const std::string blob = EncodeSnapshotBlob(120, 7, payload);
-  if (blob.size() != kSnapHeaderSize + payload.size()) {
-    throw TestFailure("头长度应为 24，实际 " +
+  if (blob.size() != kSnapHeaderSizeV3 + payload.size()) {
+    throw TestFailure("头长度应为 32，实际 " +
                       std::to_string(blob.size() - payload.size()));
   }
   {
-    int idx = 0, term = 0;
+    int64_t idx = 0, term = 0;
     std::string raw;
     bool corrupt = true;
     if (!DecodeSnapshotBlob(blob, &idx, &term, &raw, &corrupt))
@@ -4906,7 +4912,7 @@ void TestSnapshotBlobCrc() {
   // ② 翻转 payload 中间 1 个 bit（模拟 bit rot）→ 必须判损坏。
   {
     std::string bad = blob;
-    const size_t p = kSnapHeaderSize + 100;
+    const size_t p = kSnapHeaderSizeV3 + 100;
     bad[p] = static_cast<char>(bad[p] ^ 0x01);
     expect_reject("payload 翻转 1 bit", bad, true);
   }
@@ -4941,13 +4947,42 @@ void TestSnapshotBlobCrc() {
     put32(v1, 2);
     put32(v1, 3);
     v1.append("abc");
-    int idx = 0, term = 0;
+    int64_t idx = 0, term = 0;
     std::string raw;
     bool corrupt = true;
     if (!DecodeSnapshotBlob(v1, &idx, &term, &raw, &corrupt))
       throw TestFailure("V1 老格式应被兼容读取，却解码失败");
     if (idx != 5 || term != 2 || raw != "abc" || corrupt)
       throw TestFailure("V1 老格式解码内容 / corrupt 标志不符");
+  }
+
+  // ⑦ V2 老格式（int32 头 + CRC）必须仍可读：V3 升位后的向前兼容，且不判损坏。
+  {
+    std::string hdr2;
+    hdr2.append("RAFTSNP2", 8);
+    auto put32 = [](std::string& s, int32_t v) {
+      const uint32_t u = static_cast<uint32_t>(v);
+      for (int i = 0; i < 4; ++i)
+        s.push_back(static_cast<char>((u >> (i * 8)) & 0xFFu));
+    };
+    put32(hdr2, 6);
+    put32(hdr2, 3);
+    const std::string payload2 = "hello-v2";
+    put32(hdr2, static_cast<int32_t>(payload2.size()));
+    // crc 覆盖「头 20 字节 + payload」（与 V2 编码端同口径；CRC 是流式的，
+    // 拼接后一次算与分段算等价）。
+    const uint32_t c = raft::Crc32((hdr2 + payload2).data(),
+                                   hdr2.size() + payload2.size());
+    std::string v2 = hdr2;
+    put32(v2, static_cast<int32_t>(c));
+    v2.append(payload2);
+    int64_t idx = 0, term = 0;
+    std::string raw;
+    bool corrupt = true;
+    if (!DecodeSnapshotBlob(v2, &idx, &term, &raw, &corrupt))
+      throw TestFailure("V2 老格式应被兼容读取，却解码失败");
+    if (idx != 6 || term != 3 || raw != payload2 || corrupt)
+      throw TestFailure("V2 老格式解码内容 / corrupt 标志不符");
   }
 }
 
@@ -5036,7 +5071,7 @@ void TestRaftStateDiskQuota() {
     cfg->Fatal("disk_full 触发但 RaftStateSize < 阈值，逻辑矛盾");
 
   // 上层触发快照压缩（模拟 KVServer 在 apply 后调 Snapshot()）
-  int commit_idx = rf->LastApplied();
+  int64_t commit_idx = rf->LastApplied();
   rf->Snapshot(commit_idx, "snapshot-blob-" + std::to_string(commit_idx));
 
   // 压缩后 raft state 应下降，且能继续提交
@@ -5148,7 +5183,7 @@ void TestFileBackedCrashAfterSnapshot() {
   int leader = cfg->CheckOneLeader();
   auto lrf = GetRaftOrFatal(cfg, leader);
   // 对 leader 做快照：截断其日志到 LastApplied（模拟 KVServer 调 Snapshot 压缩）
-  int snap_idx = lrf->LastApplied();
+  int64_t snap_idx = lrf->LastApplied();
   lrf->Snapshot(snap_idx, "snapshot-blob-" + std::to_string(snap_idx));
 
   // 快照后再提交几条（快照 + 残余日志混合场景）
@@ -5295,24 +5330,35 @@ static bool RaftUnitTestSegmentLogStore(std::string* err) {
                "ResetFromLogs 漂移重建未生效（双写不变式破坏）"))
       return false;
   }
-  // ---- G4) len 字段损坏（非法长度）→ 安全丢弃全部，仅剩哨兵（非 abort）----
+  // ---- G4) 尾部坏头（len 非法且 off+8==sz）→ 静默截断，保留前面的正常记录 ----
+  //
+  // 语义边界（与 persist/log/segment_log_store.cpp Rebuild 的判据对齐）：
+  //   · off+8 < sz  → 头之后还有字节 = 中段损坏 → abort（fail-stop，见 #seg-abort 用例）
+  //   · off+8 == sz → 坏头就是文件最后 8 字节   → break + ftruncate（尾部半截，静默丢）
+  // 旧版 G4 翻第 1 条 len 构造的其实是"中段"场景，那时 Rebuild 会把整段静默删光
+  // （已被证伪的 bug）；abort 修复合入后该构造必然 SIGABRT，故改造成尾部场景。
   {
     cleanup();
     mkdirs();
     auto s = SegmentLogStorage::Open(dir);
     for (int i = 1; i <= 3; i++) s->Append(mkentry(1, i, "l" + std::to_string(i)));
     s->Sync(true);
-    // 翻转第一条记录 len 字段最高字节（offset 3，LE 高位）使其 > 256MB → 非法长度
+    // 在文件末尾（紧跟第 3 条）追加一个 8 字节坏头：len=0xFFFFFFFF。
+    // 模拟"下一条记录只写了 8 字节头就断电，且头里的 len 是垃圾值"。
     std::string path = dir + "/raft.log.seg";
-    FILE* f = std::fopen(path.c_str(), "r+b");
-    if (!f) { *err = "fopen seg for len-corrupt"; return false; }
-    std::fseek(f, 3, SEEK_SET);
-    std::fputc(0xFF, f);  // MSB of record1 len → huge → 非法长度
+    FILE* f = std::fopen(path.c_str(), "ab");
+    if (!f) { *err = "fopen seg for tail-corrupt"; return false; }
+    const unsigned char bad_hdr[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0};
+    if (std::fwrite(bad_hdr, 1, 8, f) != 8) {
+      *err = "fwrite tail bad hdr";
+      std::fclose(f);
+      return false;
+    }
     std::fclose(f);
-    auto s2 = SegmentLogStorage::Open(dir);  // Rebuild: 非法长度 → 安全丢弃全部
+    auto s2 = SegmentLogStorage::Open(dir);  // off=102, sz=110, off+8==sz → break → ftruncate(102)
     std::vector<LogEntry> logs = s2->Replay(0, 0);
-    if (!check(logs.size() == 1 && logs[0].index == 0,
-               "len 损坏非法长度未安全丢弃（应仅剩哨兵）"))
+    if (!check(logs.size() == 4 && logs.back().index == 3 && logs[3].command == "l3",
+               "尾部坏头未安全截断（应保留哨兵+前 3 条）"))
       return false;
   }
   cleanup();
@@ -5438,11 +5484,6 @@ static const TestCase kTests[] = {
     {"TestFigure8Unreliable2C", TestFigure8Unreliable2C},
     {"TestReliableChurn2C", TestReliableChurn2C},
     {"TestUnreliableChurn2C", TestUnreliableChurn2C},
-
-    {"TestSnapshotTruncatesLog2D", TestSnapshotTruncatesLog2D},
-    {"TestInstallSnapshotCatchUp2D", TestInstallSnapshotCatchUp2D},
-    {"TestSnapshotRestart2D", TestSnapshotRestart2D},
-    {"TestSnapshotStateMachine2D", TestSnapshotStateMachine2D},
 
     // §2.1 分块快照流式传输（etcd snap.Message 语义：offset/done/crc/chunk_size）
     {"TestChunkedSnapshotTransmit", TestChunkedSnapshotTransmit},
@@ -5664,6 +5705,18 @@ int main(int argc, char** argv) {
     for (const auto& n : failed_names) std::printf("    - %s\n", n.c_str());
   }
   std::printf("========================================\n");
+
+  if (passed == 0 && failed == 0) {
+    if (!filter.empty()) {
+      std::printf(
+          "  错误：过滤词 \"%s\" 没有匹配到任何用例 —— 这不是\"通过\"，"
+          "是一个用例都没跑。\n",
+          filter.c_str());
+    } else {
+      std::printf("  错误：kTests[] 里没有任何用例 —— 一个用例都没跑。\n");
+    }
+    return 2;
+  }
 
   return failed == 0 ? 0 : 1;
 }

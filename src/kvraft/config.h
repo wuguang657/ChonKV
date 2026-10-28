@@ -14,7 +14,7 @@
 #include <vector>
 
 #include "../labrpc/labrpc.h"
-#include "../labgob/persister.h"
+#include "../persist/state/persister.h"
 #include "client.h"
 #include "server.h"
 
@@ -42,9 +42,6 @@ class Config {
   void Partition(const std::vector<int>& p1, const std::vector<int>& p2);
   // 对应 Go 版 config.go:339 make_partition()：p1 固定 n/2+1 台（多数派），
   // p2 固定 n/2 台，并把当前 leader 放进 p2。
-  // ⚠️ TestOnePartition3A 依赖"p1 一定是多数派、能在里面推进"这个语义，
-  //    （实测：换成随机版会切出 2v3，p1 变少数派 → 写不进去 → 用例红）
-  //    所以这里必须保持固定比例，不要改成抛硬币。
   void MakePartition(std::vector<int>* p1, std::vector<int>* p2);
   // 对应 Go 版 test_test.go:126 partitioner()：每台 server 独立 50%，
   // 形态随机（2^n 种），且允许空组（全 0 / 全 1 → 那一轮等价于全网连通）。
@@ -52,7 +49,7 @@ class Config {
   void MakePartitionRandom(std::vector<int>* p1, std::vector<int>* p2);
 
   // ---- 客户端 ----
-  // ⚠️ `to` 为空表示【一台都不连】（对齐 Go 版 config.go:191 makeClient 的语义
+  //  `to` 为空表示【一台都不连】（对齐 Go 版 config.go:191 makeClient 的语义
   //    —— 早期版本写成"连所有"，方向正好相反，会让误传空 vector 的分区用例
   //    形同虚设）。想要"连所有"必须显式传 cfg.All()。
   std::shared_ptr<Clerk> MakeClient(const std::vector<int>& to = {});
@@ -90,7 +87,6 @@ class Config {
   std::vector<int> All() const;
 
   // 仅供测试用：直接拿第 i 台 KVServer 实例（白盒断言 reply.err / leader_id 用）。
-  // ⚠️ 生产代码绝不该这么拿；这是测试脚手架的逃生舱口。
   std::shared_ptr<KVServer> kvserver(int i) const {
     return (i >= 0 && i < static_cast<int>(kvservers_.size())) ? kvservers_[i]
                                                                : nullptr;
@@ -112,10 +108,12 @@ class Config {
   void DisconnectUnlocked(int i, const std::vector<int>& from);
   // client 级断开（参数区别于上面的 server 级：这里传 Clerk* 而不是 server id）
   void DisconnectClientUnlocked(Clerk* ck, const std::vector<int>& from);
+  // 把新 persister 的落盘目录记账（仅【自动目录模式】+ 文件后端，见 persist_dirs_ 注释）
+  void TrackPersisterDir(const std::shared_ptr<raft::Persister>& p);
 
   mutable std::mutex mu_;
 
-  std::shared_ptr<labrpc::Network> net_;
+  std::shared_ptr<labrpc::Transport> net_;  // 可插拔：默认 in-proc，可切真实 socket
   int n_ = 0;
   int maxraftstate_ = 0;
   bool check_linearizability_ = false;
@@ -129,6 +127,9 @@ class Config {
   std::vector<std::shared_ptr<KVServer>> graves_;
   std::vector<std::shared_ptr<raft::Persister>> saved_;
   std::vector<std::vector<std::string>> endnames_;
+
+  std::vector<std::string> persist_dirs_;
+  bool persist_auto_dir_ = false;
 
   // Clerk* -> 它那组 ClientEnd 的端点名（用于 ConnectClient 时 Enable/Disable）
   // 注意必须存 shared_ptr，否则 Clerk 会随测试栈帧析构，End() 里访问

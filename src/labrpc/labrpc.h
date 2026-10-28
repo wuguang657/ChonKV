@@ -1,29 +1,15 @@
-// labrpc.h —— 模拟网络（Go 版 src/labrpc/labrpc.go 的 C++ 移植）
+// labrpc.h —— RPC 框架（Go 版 src/labrpc/labrpc.go 的 C++ 移植）
 //
-// 这个网络能做的事（和 Go 版一一对应）：
-//   * 丢请求 / 丢回复（Reliable(false) 时各 10% 概率）
-//   * 延迟消息（不可靠模式随机 0~27ms；断连时随机 0~7000ms）
-//   * 乱序（LongReordering(true) 时，2/3 概率把回复延迟 200~2200ms）
-//   * 整机断网 / 恢复（Enable(endname, false/true)）
-//   * 统计：总 RPC 次数、总字节数、每台的入站 RPC 次数
+// 这里放的是【传输无关】的框架部分，被两个传输后端共用：
+//   * ClientEnd：一个"发信端点"，Raft 通过它给别的 server 发 RPC；
+//   * Service / Server：一组可被 RPC 调用的方法 / 一个网络节点；
+//   * ReqMsg / ReplySlot：一封"信"和同步调用的"收件箱"。
 //
-// ---------------------------------------------------------------------------
-// 【和 Go 版的实现差异，务必先读这段】
-//
-// Go 版给每个 RPC 开一个 goroutine，阻塞、睡觉都很便宜。C++ 不能这么干
-// （一秒钟几千个 RPC，开几千个 std::thread 会爆内存）。所以这里用两个线程池：
-//
-//   1) 定时器线程（1 个）：管"什么时候该做下一步"。
-//      内部是一个按时间排序的最小堆（std::multimap）。
-//      —— 它只做瞬时动作，绝不阻塞。
-//
-//   2) 工作线程池（N 个）：真正执行 server 的 RPC handler。
-//      handler 会抢 Raft 的锁，可能阻塞一小会儿，所以放在独立线程里。
-//
-// 一个 RPC 的生命周期：
-//
-//   Call() ──► SendReq()（计数、决定是否可用）──► 定时器线程（到点了）
-//        ──► 工作线程执行 handler ──► 定时器线程（延迟后）──► 唤醒 Call()
+// 传输后端（都实现 transport.h 的 Transport 抽象）：
+//   * inproc/network.{h,cpp}：同进程模拟网络（丢包/延迟/乱序/断网），默认后端；
+//   * socket/socket_transport.{h,cpp}：真实 TCP（默认 127.0.0.1 loopback）。
+// 选择哪一个由 transport_factory.h 的 MakeTransport() 决定（读环境变量
+// LABRPC_TRANSPORT），上层（raft::Config / kvraft::Config）只依赖 Transport。
 //
 // ---------------------------------------------------------------------------
 // 【C++ 知识点】
@@ -47,6 +33,7 @@
 
 #include "../common/util.h"
 #include "codec.h"
+#include "transport.h"  // 传输层抽象基类：ClientEnd 持有 Transport*，具体后端见 inproc/ 与 socket/
 
 namespace labrpc {
 
@@ -70,16 +57,15 @@ struct ReqMsg {
   std::shared_ptr<ReplySlot> slot;   // 同步调用：回信投递到这儿
   ReplyCallback cb;                  // 异步调用：直接回调（slot 为 null）
   std::atomic<bool>* cancel = nullptr;  // 紧急刹车（Raft::Kill 时置 true）
+  std::atomic<bool> delivered{false};  // socket 后端：保证 DeliverResult 恰好一次（防并发失败路径双投）
 };
-
-class Network;
 
 // ---------------------------------------------------------------------------
 // ClientEnd：一个"发信端点"，Raft 通过它给别的 server 发 RPC
 // ---------------------------------------------------------------------------
 class ClientEnd {
  public:
-  ClientEnd(Network* net, std::string endname)
+  ClientEnd(Transport* net, std::string endname)
       : net_(net), endname_(std::move(endname)) {}
 
   // 发一个 RPC，阻塞等回复。
@@ -87,8 +73,9 @@ class ClientEnd {
   //
   // cancel：可选的"紧急刹车"。Go 版靠随时可丢弃的 goroutine 天然不会卡住；
   // C++ 的线程必须能自己醒来退出，否则 Kill() 之后线程可能还要等 7 秒
-  // （断连时网络会随机延迟 0~7000ms）。传入一个 atomic<bool>，
-  // 把它置 true 就能让所有在途的 Call() 在 50ms 内返回 false。
+  // （断连是立即失败，但"端点仍通、目标 server 已删"的失败回包会随机延迟
+  //   0~7000ms，见 labrpc.cpp 的 SendReq——config 里开着 LongDelays）。
+  // 传入一个 atomic<bool>，把它置 true 就能让所有在途的 Call() 在 50ms 内返回 false。
   bool Call(const std::string& svc_meth, const std::string& args,
             std::string& reply, std::atomic<bool>* cancel = nullptr);
 
@@ -112,9 +99,9 @@ class ClientEnd {
   // ---------------------------------------------------------------------
   // 为什么必须用异步？
   //   Go 版到处是 `go sendRPC(...)`，一个 RPC 卡住不影响下一个心跳。
-  //   如果用同步 Call，往"已断连节点"发的 RPC 会被模拟网络拖住 0~7000ms
-  //   （config 里开了 LongDelays），整条复制线程就卡死了 —— 节点重连后
-  //   要等最多 7 秒才收得到心跳。TestReElection2A 就是专门抓这个的。
+  //   如果用同步 Call，往"端点仍通但 server 已删"的节点发的 RPC 会被模拟网络
+  //   拖住 0~7000ms（config 里开了 LongDelays），整条复制线程就卡死了 —— 节点
+  //   重连后要等最多 7 秒才收得到心跳。TestReElection2A 就是专门抓这个的。
   //   C++ 又不能像 Go 那样随便开几万个 goroutine，所以：
   //   等待不占线程（挂在定时器队列里），回信时才占用一个池线程跑回调。
   void CallAsync(const std::string& svc_meth, std::string args,
@@ -140,7 +127,7 @@ class ClientEnd {
   const std::string& name() const { return endname_; }
 
  private:
-  Network* net_;  // 裸指针即可：Network 的生命周期长于所有 ClientEnd
+  Transport* net_;  // 裸指针即可：Transport 的生命周期长于所有 ClientEnd
   std::string endname_;
 };
 
@@ -155,7 +142,17 @@ class Service {
   Service(std::string name, std::unordered_map<std::string, Handler> methods)
       : name_(std::move(name)), methods_(std::move(methods)) {}
 
+  // Dispatch：找不到方法就 std::abort() —— 适合【本方代码】直接调用的场景
+  // （方法名是编译期常量，写错了就是程序 bug，早点炸出来最好）。
   std::string Dispatch(const std::string& method, const std::string& args);
+
+  // TryDispatch：找不到方法只返回 false，不 abort。
+  // 【专供传输层使用】——socket 后端的方法名是从网线上读出来的【远程输入】
+  // （可能来自别的进程/机器，也可能因极端帧错位变成垃圾）。远程输入绝不能让
+  // 进程 std::abort()：那等于任何人连上端口发 30 字节就能杀掉整个测试/服务进程
+  // （实测复现：一帧 "Echo.NoSuchMethod" → SIGABRT 134）。
+  bool TryDispatch(const std::string& method, const std::string& args,
+                   std::string* reply);
   const std::string& name() const { return name_; }
 
  private:
@@ -169,8 +166,12 @@ class Service {
 class Server {
  public:
   void AddService(std::shared_ptr<Service> svc);
-  // svc_meth 形如 "Raft.AppendEntries"，args 是编码后的参数
+  // svc_meth 形如 "Raft.AppendEntries"，args 是编码后的参数。
+  // Dispatch：未知 service / 方法名不含 '.' → std::abort()（本方调用用）。
   std::string Dispatch(const std::string& svc_meth, const std::string& args);
+  // TryDispatch：同上但【不 abort】，不认识就返回 false（传输层用，见 Service::TryDispatch）。
+  bool TryDispatch(const std::string& svc_meth, const std::string& args,
+                   std::string* reply);
   int GetCount() const;
 
  private:
@@ -179,9 +180,6 @@ class Server {
   int count_ = 0;
 };
 
-// ---------------------------------------------------------------------------
-// Network：整个模拟网络
-// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // C3 生产加固：单条 RPC 消息字节上限
 // ---------------------------------------------------------------------------
@@ -196,138 +194,5 @@ class Server {
 // 默认 64MiB 是刻意放宽的：lab 的快照用例远小于此，现有 67 个用例零行为变更；
 // 生产部署或测试可用 SetMaxMessageBytes() 收紧。
 constexpr size_t kMaxRpcMessageBytesDefault = 64u * 1024u * 1024u;  // 64 MiB
-
-// 中央交换机
-class Network {
- public:
-  Network();
-  ~Network();
-
-  Network(const Network&) = delete;
-  Network& operator=(const Network&) = delete;
-
-  // 建一个发信端点（默认禁用，要先 Connect 再 Enable）
-  std::shared_ptr<ClientEnd> MakeEnd(const std::string& endname);
-  void AddServer(int servername, std::shared_ptr<Server> srv);
-  void DeleteServer(int servername);
-  void Connect(const std::string& endname, int servername);
-  void Enable(const std::string& endname, bool enabled);
-  // 注销一个发信端点（从 enabled_/connections_ 移除）。
-  // 对齐 Go 版 labrpc 的 Network.Remove(endname)，由 config.deleteClient 调用：
-  // 一个 client 被删除后，它那组 ClientEnd 不再存在于网络里，发往它们的
-  // RPC 一律找不到目标而失败。仅删这两项即可（network 不持有 ClientEnd 本体，
-  // 它的 shared_ptr 随调用方释放而析构）。
-  void RemoveClientEnd(const std::string& endname);
-
-  void Reliable(bool yes);
-  void LongReordering(bool yes);
-  void LongDelays(bool yes);
-
-  int GetCount(int servername);   // 某台的入站 RPC 数
-  int GetTotalCount() const;      // 全网发出的 RPC 总数
-  int64_t GetTotalBytes() const;  // 全网传输的总字节数
-
-  // ---- C3 单条消息字节上限 ----
-  // 设置单条 RPC 请求的字节上限（0 表示不限制）。默认 kMaxRpcMessageBytesDefault。
-  void SetMaxMessageBytes(size_t n);
-  size_t MaxMessageBytes() const;
-  // 因超过字节上限而被拒收的消息条数（观测/测试用：证明闸门真的在拦，
-  // 而不是"碰巧没发出去"）。
-  int64_t OversizedDropped() const;
-
-  void Cleanup();  // 停线程、唤醒所有还在等的人
-
-  // ---- 以下给 ClientEnd 用 ----
-  void SendReq(std::shared_ptr<ReqMsg> req);
-  bool IsStopped() const { return stopped_.load(); }
-
- private:
-  enum class EventKind { kDispatch, kDeliverReply }; // 投递请求还是投递回包
-
-  struct TimerEvent {
-    EventKind kind = EventKind::kDispatch;
-    std::shared_ptr<ReplySlot> slot;
-    ReplyCallback cb;
-    std::atomic<bool>* cancel = nullptr;
-
-    // kDispatch 用
-    std::string endname;
-    std::string svc_meth;
-    std::string args;
-    int servername = -1;
-    std::shared_ptr<Server> server;
-    bool reliable = true;
-    bool longreordering = false;
-
-    // kDeliverReply 用
-    bool ok = false;
-    std::string reply;
-  };
-
-  void TimerLoop();
-  void WorkerLoop();
-  // 新建一个 worker 线程。调用前必须持有 mu_。
-  void SpawnWorkerLocked();
-  void Schedule(std::shared_ptr<TimerEvent> e, int64_t delay_ms);
-  // 收尾：同步调用填 slot，异步调用把回调丢进线程池
-  void Finish(std::shared_ptr<TimerEvent> e);
-  bool IsServerDead(const TimerEvent& e);
-  // 把一个任务丢进线程池（服务器端的 handler、客户端的回信回调都走这儿）
-  void Post(std::function<void()> task);
-  struct EndInfo;
-  EndInfo ReadEndInfo(const std::string& endname);
-
-  mutable std::mutex mu_;
-
-  // 网络属性
-  bool reliable_ = true;
-  bool long_delays_ = false;
-  bool long_reordering_ = false;
-
-  std::map<std::string, bool> enabled_;             // endname -> 是否通
-  std::map<std::string, int> connections_;          // endname -> servername
-  std::unordered_map<int, std::shared_ptr<Server>> servers_;
-
-  std::atomic<int> count_{0};
-  std::atomic<int64_t> bytes_{0};
-
-  // ---- C3 单条消息字节上限 ----
-  // 运行期可改（默认 kMaxRpcMessageBytesDefault），故用 atomic 而非 constexpr，
-  // 这样测试能把闸门压到很小来断言"超限被拒"，而不必改代码重编译。
-  std::atomic<size_t> max_message_bytes_{kMaxRpcMessageBytesDefault};
-  // 被字节闸门拒收的消息条数。
-  std::atomic<int64_t> oversized_dropped_{0};
-
-  // 定时器线程
-  std::multimap<raftcpp::TimePoint, std::shared_ptr<TimerEvent>> timers_;
-  std::condition_variable timer_cv_;
-
-  // 工作线程池：跑"需要占用线程"的活儿
-  //   * 服务端：执行 RPC handler（会抢 Raft 的锁，所以不能放在定时器线程里）
-  //   * 客户端：执行 CallAsync 的回信回调
-  //
-  // ⚠️ 池子必须能【动态扩容】，不能是定长。原因：handler 是同步执行的，
-  // 而 KV 层的 Get/PutAppend 会阻塞等待 raft 提交（最长 1 秒，见
-  // kvraft/server.cpp 的 WaitOp）。定长池（哪怕 16 个）在 20 个客户端并发时
-  // 会被这类阻塞型 handler 全部占满 —— 心跳、日志复制的 handler 就排不进
-  // 队列，而它们恰恰是让那些阻塞的 handler 得以返回的前提 → 整个集群停摆。
-  //
-  // Go 版没这个问题：它每个 RPC handler 各跑一个 goroutine，阻塞不占线程。
-  // C++ 要等价于"每 handler 一线程"的语义，就用"全忙即扩容"来逼近。
-  // 详见 doc/06-Lab3-KV服务与测试.md 的「线程池饥饿」一节。
-  std::deque<std::function<void()>> tasks_;
-  std::condition_variable task_cv_;
-  size_t busy_workers_ = 0;   // 正在执行任务（含阻塞）的 worker 数
-  size_t total_workers_ = 0;  // 已创建的 worker 总数
-  static constexpr size_t kMaxWorkers = 512;
-
-  std::vector<std::thread> threads_;
-  std::atomic<bool> stopped_{false};
-  bool cleaned_ = false;
-};
-
-inline std::shared_ptr<Network> MakeNetwork() {
-  return std::make_shared<Network>();
-}
 
 }  // namespace labrpc

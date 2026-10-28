@@ -26,30 +26,29 @@ KVServer::KVServer(std::vector<std::shared_ptr<labrpc::ClientEnd>> peers, int me
 
   // ======== T2/T3 修复 · 第 2 层：重启恢复 ========
   // 详见文件头注释。没有这一行，崩在"raft 已落盘 / KV 未安装"之间就会永久丢数据。
-  // 【顺序必须早于 rf_->Start()】这是 3B 偶发丢数据的根因：Start() 一起后台线程，
-  // ApplyLoop 立刻就能把 index > snapshot_index_ 的条目推进 apply_ch_，
-  // ApplierLoop 在【kv_store_ 还是空】的状态下执行了这批 Put/Append；
-  // 紧接着才用快照整体替换 kv_store_，把这批刚写进去的修改回滚掉，
-  // 而 last_applied_ 已经推过去不会重放 → 表现为 key 消失 / got []。
   if (persister_) {
-    // ⚠️ 必须走 raft 的 GetSnapshotData()，不要再直接 persister_->ReadSnapshot()：
-    //   盘上存的是【带 index/term 头的磁盘格式】，而且可能是"阶段1 已落盘、
-    //   阶段2 未提交"的 blob。raft 已经剥头并校验过"是否已提交"，这里拿到
-    //   的才是可信的裸状态机数据。
     std::string snap = rf_->GetSnapshotData();
-    int snap_idx = rf_->SnapshotIndex();
+    int64_t snap_idx = rf_->SnapshotIndex();
     // 判据必须是 snap_idx > 0，不能是 snap 非空：
     //   若 blob 被判为未提交而丢弃，snap 会是空，但 last_cmd_index_ 仍必须
     //   推到 snap_idx —— 否则 ReadIndex 路径（等 last_cmd_index_ >= ri）
     //   会永久卡住，因为快照覆盖的下标永远不会再被 apply 上来。
     if (snap_idx > 0) {
       std::lock_guard<std::mutex> lk(mu_);
-      if (!snap.empty()) ApplySnapshotLocked(snap);
+      if (!snap.empty() && !ApplySnapshotLocked(snap)) {
+        // ---- fail-stop：快照解码失败不许继续 ----
+        std::fprintf(stderr,
+            "[kvraft] FATAL: server=%d 启动恢复快照解码失败(snap_idx=%lld)："
+            "状态机仍为空却要把边界推到 %lld → [1, %lld] 区间数据永久缺失\n",
+            me_, static_cast<long long>(snap_idx),
+            static_cast<long long>(snap_idx), static_cast<long long>(snap_idx));
+        std::abort();
+      }
       last_cmd_index_ = snap_idx;
     }
   }
 
-  rf_->Start();  // ✅ 状态机恢复完毕，才允许 Raft 派发新条目
+  rf_->Start();  // 状态机恢复完毕，才允许 Raft 派发新条目
 }
 
 KVServer::~KVServer() {
@@ -87,90 +86,78 @@ void KVServer::Kill() {
 
 // 格式：[kv 条数][k,v]*  [会话条数][cid,seq,last_index]*  [fence 条数][cid,last_seq]*
 // 全部用 length-prefixed 的 Bytes，value 里含任意字节都不会解析错。
-// ⚠️ 两条确定性硬约束（状态机可重现、副本间不发散的前提）：
-//   (1) 顺序确定：会话按 LRU（ForEach）编码、fence 按 fence_fifo_（插入序）编码，
-//       绝不能遍历 unordered_map 的哈希序 —— 哈希序不确定会让"快照恢复"与"日志
-//       回放"两条路径的 fence_fifo_ 顺序分歧 → kFenceCap 封顶时踢掉不同 cid →
-//       fenced_ 发散 → apply 查墓碑结果不同 → 状态机发散。
-//   (2) 字段完整：会话必须带 last_index（不只 last seq），否则 InstallSnapshot 后
-//       lastApplied 推进与日志回放不一致。
 std::string KVServer::EncodeSnapshotLocked() const {
   labrpc::Encoder e;
   e.Int(static_cast<int>(kv_store_.size()));
   for (const auto& p : kv_store_) {
     e.Bytes(p.first).Bytes(p.second);
   }
-  // 会话表必须按 LRU 顺序（ForEach）编码，不能按 entries_ 哈希序 —— 见上方 ⚠️(1)。
-  // last_index 一并持久化（见 ⚠️(2)）。
+
   e.Int(static_cast<int>(sessions_.Size()));
-  sessions_.ForEach([&](int cid, int seq, uint64_t last_index) {
-    e.Int(cid).Int(seq).Varint(last_index);
+  sessions_.ForEach([&](int cid, int64_t seq, uint64_t last_index) {
+    e.Int(cid).Zigzag(seq).Varint(last_index);
   });
   // fencing 集合（cid + 墓碑 last_seq）也要持久化，重启 / InstallSnapshot 后不丢，
   // 否则一个在旧 leader 上被淘汰的会话换节点后迟到重试会被当成新命令重执行。
-  //
-  // ⚠️ 必须按 fence_fifo_（插入顺序）编码，不能按 unordered_map 的哈希序遍历：
-  //    哈希序不确定 → "从快照恢复"的副本 fence_fifo_ 顺序与"从日志回放"的副本
-  //    不一致 → 将来 kFenceCap 封顶时会踢掉不同的 cid → 副本间 fenced_ 内容发散
-  //    → apply 查墓碑的结果不同（一边去重、一边执行）→ 状态机发散。
-  //    （与 sessions_ 用 ForEach 按 LRU 顺序编码是同一条确定性原则。）
-  std::vector<std::pair<int, int>> fence_recs;
+  std::vector<std::pair<int, int64_t>> fence_recs;
   fence_recs.reserve(fence_fifo_.size());
   for (int cid : fence_fifo_) {
     auto it = fenced_.find(cid);
     if (it != fenced_.end()) fence_recs.push_back({cid, it->second});
   }
   e.Int(static_cast<int>(fence_recs.size()));
-  for (const auto& fr : fence_recs) { e.Int(fr.first); e.Int(fr.second); }
+  for (const auto& fr : fence_recs) { e.Int(fr.first); e.Zigzag(fr.second); }
   return e.Take();
 }
 
 // 幂等：整体替换，重复 apply 同一个 blob 结果完全一样。
 // 解码中途失败就整体丢弃（保留当前状态机），绝不让半截数据污染。
-void KVServer::ApplySnapshotLocked(const std::string& blob) {
+bool KVServer::ApplySnapshotLocked(const std::string& blob) {
   labrpc::Decoder d(blob);
 
   int n = 0;
-  if (!d.Int(n) || n < 0) return;
+  if (!d.Int(n) || n < 0) return false;
   std::map<std::string, std::string> store;
   for (int i = 0; i < n; i++) {
     std::string k, v;
-    if (!d.Bytes(k) || !d.Bytes(v)) return;
+    if (!d.Bytes(k) || !d.Bytes(v)) return false;
     store[k] = v;
   }
 
   int m = 0;
-  if (!d.Int(m) || m < 0) return;
+  if (!d.Int(m) || m < 0) return false;
   struct SessRec {
     int cid;
-    int seq;
+    int64_t seq;
     uint64_t last_index;
   };
   std::vector<SessRec> seqs;
   seqs.reserve(m > 0 && m < 1000000 ? static_cast<size_t>(m) : 0);
   for (int i = 0; i < m; i++) {
-    int cid = 0, sid = 0;
+    int cid = 0;
+    int64_t sid = 0;
     uint64_t li = 0;
-    if (!d.Int(cid) || !d.Int(sid) || !d.Varint(li)) return;
+    if (!d.Int(cid) || !d.Zigzag(sid) || !d.Varint(li)) return false;
     seqs.push_back(SessRec{cid, sid, li});
   }
 
   // 恢复 fencing 集合（与会话表同序、确定性恢复；封顶由运行期 Reap 维护）。
   int f = 0;
-  if (!d.Int(f) || f < 0) return;
+  if (!d.Int(f) || f < 0) return false;
   struct FenceRec {
     int cid;
-    int seq;  // 墓碑：淘汰时记录的 last_seq，必须与 cid 配对读写
+    int64_t seq;  // 墓碑：淘汰时记录的 last_seq，必须与 cid 配对读写
   };
   std::vector<FenceRec> fenced;
   fenced.reserve(f > 0 && f < 1000000 ? static_cast<size_t>(f) : 0);
   for (int i = 0; i < f; i++) {
-    int cid = 0, seq = 0;
-    if (!d.Int(cid) || !d.Int(seq)) return;
+    int cid = 0;
+    int64_t seq = 0;
+    if (!d.Int(cid) || !d.Zigzag(seq)) return false;
     fenced.push_back(FenceRec{cid, seq});
   }
 
-  if (!d.Ok()) return;
+  if (!d.Ok()) return false;
 
   kv_store_ = std::move(store);
   // 严格按编码顺序（最旧 -> 最新）装载，重建出与日志回放路径一致的 LRU 队列。
@@ -181,21 +168,19 @@ void KVServer::ApplySnapshotLocked(const std::string& blob) {
   for (const auto& fr : fenced) {
     if (fenced_.insert({fr.cid, fr.seq}).second) fence_fifo_.push_back(fr.cid);
   }
+  return true;
 }
 
 // 在 KV 锁内判断要不要压缩、并把快照字节编码好。
 // 【为什么必须在锁内编码】否则编码到一半状态机被 applier 改了，
 // 编出来的快照就是一个"撕裂"的中间状态。
-//
-// 对齐 Go 版 kvraft server.go 的 saveSnapshot：
-//   只在 Raft 状态大小超过阈值时才真正生成快照（控制落盘频率）。
-//   raft 的 snapshot_index_（lastIncludedIndex）始终由已【应用】的命令推进，
-//   与是否落盘无关——这点由 Raft::Snapshot 的 index 参数保证。
-bool KVServer::PrepareSnapshotLocked(int index, int* snap_index,
+bool KVServer::PrepareSnapshotLocked(int64_t index, int64_t* snap_index,
                                      std::string* blob) {
   if (maxraftstate_ == -1) return false;               // 关闭快照
   if (!persister_) return false;
-  if (persister_->RaftStateSize() < maxraftstate_) return false;   // 阈值门控
+  if (!rf_) return false;
+  // raft state + raft log
+  if (rf_->RaftStateSize() < static_cast<size_t>(maxraftstate_)) return false;
 
   *snap_index = index;
   *blob = EncodeSnapshotLocked();
@@ -234,7 +219,7 @@ void KVServer::ForceSnapshotOnDiskFull() {
     // 当prev还等于last_forced_snap_ns_时，将now_ns写入last_forced_snap_ns_
     if (last_forced_snap_ns_.compare_exchange_weak(prev, now_ns,
             std::memory_order_relaxed)) {
-      int snap_index;
+      int64_t snap_index;
       std::string blob;
       {
         std::lock_guard<std::mutex> lk(mu_);
@@ -270,7 +255,7 @@ std::map<std::string, std::string> KVServer::SnapshotStore() const {
 void KVServer::Get(const GetArgs& args, GetReply& reply) {
 // 线性化点：leader 直接验身份、follower 经 RPC 向 leader 索取，二者都返回经多数派
 // 确认的"已提交下标"ri（>=0 才能读）。连不上 leader / 凑不齐多数派返回 -1，让 Clerk 换台。
-  int ri = rf_->ReadIndex();
+  int64_t ri = rf_->ReadIndex();
   if (ri < 0) {
     // 非 leader：把认知到的 leader 编号回填，供 Clerk 重定向直连。
     // 但若是"自认为是 leader 却被隔离"（ri<0 仅因凑不齐多数派），GetLeaderId()
@@ -284,8 +269,6 @@ void KVServer::Get(const GetArgs& args, GetReply& reply) {
   std::unique_lock<std::mutex> lk(mu_);
 
   const auto kPoll = std::chrono::milliseconds(100);
-  // ⚠️ 总超时：被隔离在少数派的旧 leader 仍认为自己是 leader，但 ReadIndex 永远
-  // 凑不齐多数派 → ri 之后的状态机永不推进 → Get 会死等，客户端 RPC 永不返回。
   // 1s 超时即视为"我不是有效 leader"，返回 WrongLeader 让 Clerk 换台机器重试。
   const auto kWaitTimeout = std::chrono::milliseconds(1000);
   auto wait_start = std::chrono::steady_clock::now();
@@ -321,6 +304,31 @@ void KVServer::Get(const GetArgs& args, GetReply& reply) {
       return;
     }
   }
+}
+
+void KVServer::GetStale(const GetArgs& args, GetReply& reply) {
+  // 陈旧读：直接读本节点已 apply 的状态机，【绝不】调 rf_->ReadIndex()、
+  // 【绝不】找 leader、【绝不】凑多数派、不检查会话/背压。构造上只可能返回
+  // kOK / kNoKey，绝不返回 kWrongLeader / kTimeout / kBusy / kSessionGone
+  //（那 4 个是 Get 线性化读专属的语义，GetStale 刻意绕过它们）。
+  // 安全性依据：kv_store_ 仅在持 mu_ 时被 applier 改写/读取（见 Get 的持锁直读），
+  // 这里同样持 mu_ 读，与 applier 互斥，无 data race，且读到的是自洽的已 apply 前缀。
+  // 代价：返回的值可能落后（本节点落在少数派 / 与 leader 断开时不再推进），
+  // 调用方必须接受"可能陈旧"这一前提。
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = kv_store_.find(args.key);
+    if (it != kv_store_.end()) {
+      reply.value = it->second;
+      reply.err = Err::kOK;
+    } else {
+      reply.value.clear();
+      reply.err = Err::kNoKey;
+    }
+  }  // ---- 先释放 KV 锁 ----
+  // 仅供观测：回填本节点认知的 leader 编号（不触发重定向，因为 err 不是 kWrongLeader）。
+  // 少数派节点这里可能指向已死的旧 leader，纯信息用途。
+  reply.leader_id = rf_->GetLeaderId();
 }
 
 void KVServer::PutAppend(const PutAppendArgs& args, PutAppendReply& reply) {
@@ -397,9 +405,6 @@ Err KVServer::WaitOp(const Op& op, int* out_leader_id) {
   msg_replies_[r.index] = NotifyMsg{false, false, op.client_id, op.seq_id};
 
   const auto kPoll = std::chrono::milliseconds(100);
-  // ⚠️ 总超时：被隔离在少数派的"旧 leader"仍认为自己是 leader（isLeader 一直
-  // 为 true），但它提交的日志永远凑不齐多数派 → 命令永不 apply → WaitOp 会死等、
-  // 客户端 RPC 永不返回，分区用例（3A progress-in-majority / 3B partition）直接卡死。
   // 1s 超时即视为"我不是有效 leader"，返回 WrongLeader 让 Clerk 换台机器重试
   // （连多数派的新 leader 就能成功）。正常命令几十 ms 内 commit+apply，远小于 1s。
   const auto kWaitTimeout = std::chrono::milliseconds(1000);
@@ -422,6 +427,7 @@ Err KVServer::WaitOp(const Op& op, int* out_leader_id) {
       // 返回 WrongLeader 让 Clerk 换台重试。
       bool ok = it->second.ok;
       msg_replies_.erase(it);
+      lk.unlock();  // ---- 先释放 KV 锁：GetLeaderId 内部抢 raft 锁 ----
       if (ok) return Err::kOK;
       // 被新 leader 覆盖了：把新 leader 编号回填，客户端重定向直连。
       // 同样加自环守卫（见上方 !r.is_leader 分支），避免把"自己"当重定向地址。
@@ -432,12 +438,22 @@ Err KVServer::WaitOp(const Op& op, int* out_leader_id) {
       return Err::kWrongLeader;
     }
 
-    // ⚠️ 总超时（见上方说明）：被隔离的旧 leader 上 WaitOp 不能无限等。
+    // 总超时（见上方说明）：被隔离的旧 leader 上 WaitOp 不能无限等。
     if (std::chrono::steady_clock::now() - wait_start > kWaitTimeout) {
       msg_replies_.erase(r.index);
       return Err::kWrongLeader;
     }
     // 没超时，继续等下一轮
+  }
+}
+
+void KVServer::ClearWaiterLocked(int64_t index) {
+  auto wit = msg_replies_.find(index);
+  if (wit != msg_replies_.end() && !wit->second.done) {
+    wit->second.done = true;
+    // ok=false 是唯一安全选择：内容已被覆盖，无 op 身份可校验（快照 blob
+    // 也拆不出单条 op，同理）。客户端重试后由 sessions 去重保证最终正确。
+    wit->second.ok = false;
   }
 }
 
@@ -450,11 +466,10 @@ void KVServer::ApplierLoop() {
     if (m.command_valid) {
       // no-op 空条目：raft 新 leader 上任提交的占位命令，本身不写状态机，
       // 只用来推进 commitIndex。
-      // ⚠️ 但必须照样推进 last_cmd_index_：ReadIndex() 返回的线性化点 ri 可能
+      // 但必须照样推进 last_cmd_index_：ReadIndex() 返回的线性化点 ri 可能
       // 正好落在 no-op 的下标上，若这里直接跳过，Get 的"等 last_cmd_index_ >= ri"
       // 就会永远差 1 卡死（实测 lci=836 / ri=837，恰好差一个 no-op）。
       // 安全性：no-op 不写状态机，不存在"下标已推进但 kv_store_ 还没改"的窗口。
-      // E7-hardening：用 ApplyMsg.entry_type 显式分流，不再靠「空串=no-op」隐式判断。
       switch (m.entry_type) {
         case raft::EntryType::kNoOp:
         case raft::EntryType::kConfChange:
@@ -469,7 +484,11 @@ void KVServer::ApplierLoop() {
           // 不唤醒 msg_replies_：conf 走 ProposeConfChangeTo，KV 层不为其注册 waiter。
           {
             std::lock_guard<std::mutex> lk(mu_);
-            last_cmd_index_ = m.command_index;
+            // 单调推进：FIFO 保证 m.command_index 必然 > last_cmd_index_；
+            // 加守卫是防御未来的通道改动（乱序时跳过而非回退边界）。
+            // 619-621 的快照门控防的正是"边界回退"，两个分支必须对称。
+            if (m.command_index > last_cmd_index_) last_cmd_index_ = m.command_index;
+            ClearWaiterLocked(m.command_index);
           }
           apply_cv_.notify_all();
           continue;
@@ -482,19 +501,21 @@ void KVServer::ApplierLoop() {
       // 走到这里只可能是 kNormal（no-op / conf 已在上面 switch 里 continue）。
       if (!op.Deserialize(m.command)) {
         std::fprintf(stderr,
-            "[kvraft] WARN: command_index=%d 反序列化失败(应为 kNormal)，"
+            "[kvraft] WARN: command_index=%lld 反序列化失败(应为 kNormal)，"
             "按契约违例处理：推进 last_cmd_index_ 并跳过，可能丢失该条命令\n",
-            m.command_index);
+            static_cast<long long>(m.command_index));
         {
           std::lock_guard<std::mutex> lk(mu_);
-          last_cmd_index_ = m.command_index;
+          // 单调推进（同 no-op 分支）：反序列化失败已是契约违例路径，
+          if (m.command_index > last_cmd_index_) last_cmd_index_ = m.command_index;
+          ClearWaiterLocked(m.command_index);
         }
         apply_cv_.notify_all();
         continue;
       }
 
       bool need_snap = false;
-      int snap_index = 0;
+      int64_t snap_index = 0;
       std::string snap_blob;
 
       {
@@ -507,7 +528,7 @@ void KVServer::ApplierLoop() {
         // 会话淘汰必须基于它，绝不能用墙上时钟（理由见 SessionTable 注释）。
         uint64_t now_index =
             m.command_index > 0 ? static_cast<uint64_t>(m.command_index) : 0;
-        int existing = sessions_.Get(op.client_id, now_index);
+        int64_t existing = sessions_.Get(op.client_id, now_index);
         if (existing == 0) {                          // 记录已擦除 → 查墓碑
           auto fit = fenced_.find(op.client_id);
           if (fit != fenced_.end()) existing = fit->second;
@@ -531,16 +552,20 @@ void KVServer::ApplierLoop() {
         // 被淘汰的 client_id 登记进 fencing 集合 —— 它后续的迟到重试将被 RPC 入口
         // 拒绝（见 PutAppend handler），不会被重复执行。
         
-        sessions_.Reap(now_index, [this](int cid, int last_seq) {
-          // 被踢时执行
-          auto pr = fenced_.insert({cid, last_seq});   // 墓碑：cid -> last_seq
-          if (pr.second) {
+        sessions_.Reap(now_index, [this](int cid, int64_t last_seq) {
+          // 墓碑：cid -> last_seq（被淘汰会话的最后 seq）。
+          // 必须"存在则刷新、不存在才插入"
+          auto it = fenced_.find(cid);
+          if (it == fenced_.end()) {
+            fenced_.emplace(cid, last_seq);
             fence_fifo_.push_back(cid);
             if (fence_fifo_.size() > kFenceCap) {
               int old = fence_fifo_.front();
               fence_fifo_.pop_front();
               fenced_.erase(old);
             }
+          } else {
+            it->second = last_seq;  // 刷新墓碑，堵住"复活后再淘汰"的重复执行窗口
           }
         });
         // ---- 通知等待者 ----
@@ -557,14 +582,14 @@ void KVServer::ApplierLoop() {
         need_snap =
             PrepareSnapshotLocked(m.command_index, &snap_index, &snap_blob);
 
-        // ⚠️ 必须放在状态机突变【之后】：ReadIndex 路径靠它判定"已追上线性化点"，
+        // 必须放在状态机突变【之后】：ReadIndex 路径靠它判定"已追上线性化点"，
         // 顺序反了会让 Get 读到旧值。
-        last_cmd_index_ = m.command_index;
+        // 单调推进（同 no-op 分支）：FIFO 下必然大于旧值，守卫防御未来通道乱序。
+        if (m.command_index > last_cmd_index_) last_cmd_index_ = m.command_index;
       }  // ---- 释放 KV 锁 ----
 
       apply_cv_.notify_all();
 
-      // ⚠️ 锁外再调 Raft：避免"持 KV 锁跨进 raft 锁"
       if (need_snap) {
         rf_->Snapshot(snap_index, snap_blob);
       }
@@ -578,24 +603,40 @@ void KVServer::ApplierLoop() {
       {
         std::lock_guard<std::mutex> lk(mu_);
         if (m.snapshot_index >= last_cmd_index_) {
-          ApplySnapshotLocked(m.snapshot);
+          if (!ApplySnapshotLocked(m.snapshot)) {
+            // ---- fail-stop：安装失败不许推进边界 ----
+            std::fprintf(stderr,
+                "[kvraft] FATAL: server=%d InstallSnapshot(idx=%lld) 解码失败："
+                "状态机仍是旧的(last_cmd_index_=%lld)，而 raft last_applied_ 已推到 %lld "
+                "→ (%lld, %lld] 区间永不重放，数据永久缺失\n",
+                me_, static_cast<long long>(m.snapshot_index),
+                static_cast<long long>(last_cmd_index_),
+                static_cast<long long>(m.snapshot_index),
+                static_cast<long long>(last_cmd_index_),
+                static_cast<long long>(m.snapshot_index));
+            std::abort();
+          }
           last_cmd_index_ = m.snapshot_index;
 
-          // ---- C5：装快照会「吞掉」(旧 last_cmd_index_, snapshot_index] 这段日志 ----
-          // 这段里的命令再也不会走 ApplierLoop 的正常分支，msg_replies_ 里等着它们的
-          // waiter 永远等不到 done=true，只能靠 WaitOp 的 1s 总超时才返回 kWrongLeader
-          // —— 每装一次快照，被覆盖区间上的客户端就白白多等 1s（快照越频繁越明显）。
-          // 处理：把这些被覆盖区间的 waiter 显式置 done=true / ok=false，WaitOp 下一轮
-          // 轮询（100ms）即可返回，客户端马上换台重试，不必干等超时。
-          // ok=false 语义正确：这些下标的命令确实【没有】经由本节点 apply —— 它们是被
-          // 快照整体替代的（可能由旧 leader 提交、也可能已被新 leader 覆盖），与
-          // 「身份不匹配」走同一条重试路径，不会误报成功。
+          // ---- 装快照会「吞掉」(旧 last_cmd_index_, snapshot_index] 这段日志 ----
+          // 清理掉留在msg_replies_里的消息（不清也会1s超时返回）
           for (auto it = msg_replies_.begin(); it != msg_replies_.end(); ++it) {
-            if (it->first <= m.snapshot_index) {
+            if (it->first <= m.snapshot_index && !it->second.done) {
               it->second.done = true;
               it->second.ok = false;
             }
           }
+        } else {
+          // ---- 契约违例（fail-stop）：拒绝即故障，绝不许静默跳过 ----
+          std::fprintf(stderr,
+              "[kvraft] FATAL: server=%d InstallSnapshot(idx=%lld) < "
+              "last_cmd_index_(%lld)，不变式破坏；静默跳过将导致 (%lld, %lld] "
+              "区间数据永久缺失\n",
+              me_, static_cast<long long>(m.snapshot_index),
+              static_cast<long long>(last_cmd_index_),
+              static_cast<long long>(last_cmd_index_),
+              static_cast<long long>(m.snapshot_index));
+          std::abort();
         }
       }
       // 与 no-op / command 分支保持一致：装快照同样可能让某条 ReadIndex 读成立。
